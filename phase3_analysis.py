@@ -1,10 +1,12 @@
 """
-PHASE 3: Feature Analysis
-==========================
+PHASE 3: Feature Analysis with Detailed EDA
+===========================================
 1. Overall feature coverage (how often each feature is present vs unknown in Derm-1M)
 2. Derm-1M vs SCIN feature availability comparison
 3. Disease class-wise feature importance (chi-square + mutual information)
 4. Generates questionnaire priority ranking per disease cluster
+5. DETAILED EDA: Feature distribution, disease-wise distribution, top features,
+   disease-wise feature occurrence, correlation analysis
 
 Run after phase2_bulk_extraction.py
 """
@@ -15,8 +17,13 @@ import json
 from pathlib import Path
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.preprocessing import LabelEncoder
+from scipy.stats import chi2_contingency
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+# Set style for better plots
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_palette("husl")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DERM_FEATURES_CSV = "derm1m_features.csv"
@@ -24,9 +31,10 @@ SCIN_CSV          = "SCIN-dataset/dataset_scin_cases.csv"
 SCHEMA_PATH       = "feature_schema.json"
 OUTPUT_DIR        = Path("analysis_outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+EDA_DIR           = OUTPUT_DIR / "eda"
+EDA_DIR.mkdir(exist_ok=True)
 
 # SCIN column → our canonical feature name (matches phase2 output columns)
-# Updated to match the new schema from phase1/phase2
 SCIN_TO_CANONICAL = {
     # Textures
     "textures_raised_or_bumpy":                     "texture_raised",
@@ -268,6 +276,206 @@ def generate_questionnaire_for_cluster(
     return questionnaire
 
 # ──────────────────────────────────────────────────────────────────────────────
+# DETAILED EDA FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_feature_distribution(coverage_df: pd.DataFrame, top_n: int = 50):
+    """Plot distribution of feature informativeness across all features."""
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # 1. Top N most informative features
+    top = coverage_df.head(top_n)
+    ax1 = axes[0, 0]
+    x = range(len(top))
+    ax1.bar(x, top["pct_present"], label="Present (1)", color="#2196F3")
+    ax1.bar(x, top["pct_absent"], bottom=top["pct_present"],
+           label="Absent (0)", color="#90CAF9")
+    ax1.bar(x, top["pct_unknown"],
+           bottom=top["pct_present"] + top["pct_absent"],
+           label="Unknown (2)", color="#E0E0E0")
+    ax1.set_xticks(list(x))
+    ax1.set_xticklabels(top["feature"], rotation=45, ha="right", fontsize=6)
+    ax1.set_ylabel("% of records")
+    ax1.set_title(f"Top {top_n} Most Informative Features")
+    ax1.legend()
+    
+    # 2. Informativeness histogram
+    ax2 = axes[0, 1]
+    ax2.hist(coverage_df["informativeness"], bins=30, color="#1976D2", edgecolor="white")
+    ax2.set_xlabel("Informativeness (%)")
+    ax2.set_ylabel("Number of features")
+    ax2.set_title("Distribution of Feature Informativeness")
+    ax2.axvline(coverage_df["informativeness"].mean(), color="red", linestyle="--",
+               label=f"Mean: {coverage_df['informativeness'].mean():.1f}%")
+    ax2.legend()
+    
+    # 3. Present vs Unknown scatter
+    ax3 = axes[1, 0]
+    ax3.scatter(coverage_df["pct_present"], coverage_df["pct_unknown"],
+               alpha=0.6, c=coverage_df["informativeness"], cmap="viridis")
+    ax3.set_xlabel("% Present")
+    ax3.set_ylabel("% Unknown")
+    ax3.set_title("Present vs Unknown by Feature")
+    plt.colorbar(ax3.collections[0], ax=ax3, label="Informativeness")
+    
+    # 4. Feature category breakdown (if category info available)
+    ax4 = axes[1, 1]
+    # Extract category from feature name
+    categories = []
+    for feat in coverage_df["feature"]:
+        if feat.startswith("symptom_"):
+            categories.append("symptoms")
+        elif feat.startswith("location_"):
+            categories.append("location")
+        elif feat.startswith("texture_") or feat.startswith("color_"):
+            categories.append("morphology")
+        elif feat.startswith("trigger_"):
+            categories.append("triggers")
+        elif feat.startswith("treatment_"):
+            categories.append("treatments")
+        else:
+            categories.append("other")
+    
+    coverage_df_copy = coverage_df.copy()
+    coverage_df_copy["category"] = categories
+    cat_stats = coverage_df_copy.groupby("category")["informativeness"].mean().sort_values(ascending=False)
+    cat_stats.plot(kind="bar", ax=ax4, color="#1565C0")
+    ax4.set_xlabel("Feature Category")
+    ax4.set_ylabel("Mean Informativeness (%)")
+    ax4.set_title("Informativeness by Feature Category")
+    ax4.tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig(EDA_DIR / "feature_distribution_overview.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved feature distribution overview to {EDA_DIR / 'feature_distribution_overview.png'}")
+
+
+def plot_disease_wise_feature_heatmap(df: pd.DataFrame, feature_cols: list[str], 
+                                       top_diseases: int = 20, top_features: int = 30):
+    """Create heatmap of feature prevalence by disease."""
+    # Get top diseases by count
+    disease_counts = df["label_name"].value_counts().head(top_diseases)
+    top_disease_names = disease_counts.index.tolist()
+    
+    # Get top features by overall informativeness
+    feature_prev = {}
+    for feat in feature_cols:
+        feature_prev[feat] = (df[feat] == 1).mean()
+    top_feature_names = sorted(feature_prev, key=feature_prev.get, reverse=True)[:top_features]
+    
+    # Create prevalence matrix
+    prevalence_matrix = []
+    for disease in top_disease_names:
+        disease_df = df[df["label_name"] == disease]
+        row = []
+        for feat in top_feature_names:
+            prev = (disease_df[feat] == 1).mean() * 100
+            row.append(prev)
+        prevalence_matrix.append(row)
+    
+    prevalence_df = pd.DataFrame(prevalence_matrix, 
+                                  index=top_disease_names,
+                                  columns=[f.replace("_", " ") for f in top_feature_names])
+    
+    fig, ax = plt.subplots(figsize=(20, 12))
+    sns.heatmap(prevalence_df, annot=True, fmt=".0f", cmap="YlOrRd", 
+                cbar_kws={"label": "Prevalence (%)"}, ax=ax, linewidths=0.5)
+    ax.set_title(f"Feature Prevalence by Disease (Top {top_diseases} Diseases, Top {top_features} Features)")
+    ax.set_xlabel("Features")
+    ax.set_ylabel("Diseases")
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(EDA_DIR / "disease_feature_heatmap.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved disease-feature heatmap to {EDA_DIR / 'disease_feature_heatmap.png'}")
+
+
+def plot_top_features_by_disease(df: pd.DataFrame, feature_cols: list[str], 
+                                  disease: str, top_n: int = 15):
+    """Plot top features for a specific disease."""
+    disease_df = df[df["label_name"] == disease]
+    if len(disease_df) == 0:
+        return
+    
+    feature_prev = []
+    for feat in feature_cols:
+        prev = (disease_df[feat] == 1).mean() * 100
+        feature_prev.append((feat, prev))
+    
+    feature_prev.sort(key=lambda x: x[1], reverse=True)
+    top_features = feature_prev[:top_n]
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    feats = [f[0].replace("_", " ") for f in top_features]
+    prevs = [f[1] for f in top_features]
+    
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(feats)))
+    ax.barh(range(len(feats)), prevs, color=colors)
+    ax.set_yticks(range(len(feats)))
+    ax.set_yticklabels(feats)
+    ax.set_xlabel("Prevalence (%)")
+    ax.set_title(f"Top {top_n} Features for {disease} (n={len(disease_df)})")
+    ax.invert_yaxis()
+    
+    plt.tight_layout()
+    safe_name = disease.replace("/", "_").replace(" ", "_")[:50]
+    plt.savefig(EDA_DIR / f"top_features_{safe_name}.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def generate_eda_summary_tables(df: pd.DataFrame, feature_cols: list[str], coverage_df: pd.DataFrame):
+    """Generate summary tables for EDA."""
+    
+    # 1. Overall feature statistics
+    stats = {
+        "total_records": len(df),
+        "total_features": len(feature_cols),
+        "total_diseases": df["label_name"].nunique(),
+        "mean_informativeness": coverage_df["informativeness"].mean(),
+        "median_informativeness": coverage_df["informativeness"].median(),
+        "features_with_>50%_informativeness": (coverage_df["informativeness"] > 50).sum(),
+        "features_with_<10%_informativeness": (coverage_df["informativeness"] < 10).sum(),
+    }
+    
+    with open(EDA_DIR / "eda_summary_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"  Saved EDA summary stats to {EDA_DIR / 'eda_summary_stats.json'}")
+    
+    # 2. Top 20 most informative features
+    top_20 = coverage_df.head(20)[["feature", "pct_present", "pct_unknown", "informativeness"]]
+    top_20.to_csv(EDA_DIR / "top_20_informative_features.csv", index=False)
+    print(f"  Saved top 20 features to {EDA_DIR / 'top_20_informative_features.csv'}")
+    
+    # 3. Bottom 20 least informative features
+    bottom_20 = coverage_df.tail(20)[["feature", "pct_present", "pct_unknown", "informativeness"]]
+    bottom_20.to_csv(EDA_DIR / "bottom_20_informative_features.csv", index=False)
+    print(f"  Saved bottom 20 features to {EDA_DIR / 'bottom_20_informative_features.csv'}")
+    
+    # 4. Disease-wise record counts
+    disease_counts = df["label_name"].value_counts().reset_index()
+    disease_counts.columns = ["disease", "count"]
+    disease_counts["percentage"] = (disease_counts["count"] / len(df) * 100).round(2)
+    disease_counts.to_csv(EDA_DIR / "disease_distribution.csv", index=False)
+    print(f"  Saved disease distribution to {EDA_DIR / 'disease_distribution.csv'}")
+    
+    # 5. Feature prevalence by disease (top 10 diseases, all features)
+    top_10_diseases = df["label_name"].value_counts().head(10).index.tolist()
+    prevalence_by_disease = {}
+    for disease in top_10_diseases:
+        disease_df = df[df["label_name"] == disease]
+        prev_row = {}
+        for feat in feature_cols[:50]:  # Limit to top 50 features for brevity
+            prev_row[feat] = round((disease_df[feat] == 1).mean() * 100, 2)
+        prevalence_by_disease[disease] = prev_row
+    
+    prev_df = pd.DataFrame(prevalence_by_disease).T
+    prev_df.to_csv(EDA_DIR / "feature_prevalence_top10_diseases.csv")
+    print(f"  Saved feature prevalence by disease to {EDA_DIR / 'feature_prevalence_top10_diseases.csv'}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PLOTTING
 # ──────────────────────────────────────────────────────────────────────────────
 def plot_coverage(coverage_df: pd.DataFrame, top_n: int = 40):
@@ -309,11 +517,16 @@ def plot_derm_vs_scin_comparison(cmp_df: pd.DataFrame):
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=== Phase 3: Feature Analysis ===\n")
+    print("=" * 60)
+    print("  PHASE 3: Feature Analysis with Detailed EDA")
+    print("=" * 60 + "\n")
 
     # Load data
+    print("Loading data...")
     derm_df = pd.read_csv(DERM_FEATURES_CSV)
     scin_df = pd.read_csv(SCIN_CSV)
+    print(f"  Derm-1M: {len(derm_df):,} records")
+    print(f"  SCIN: {len(scin_df):,} records\n")
 
     # Meta columns to exclude from feature analysis
     META_COLS = {"image", "label_name", "disease_label", "age_numeric",
@@ -324,16 +537,17 @@ if __name__ == "__main__":
         if c not in META_COLS
         and derm_df[c].isin([0, 1, 2]).mean() > 0.8  # binary/ternary cols
     ]
+    print(f"  Total features to analyze: {len(feature_cols)}\n")
 
     # 1. Coverage
-    print("Computing feature coverage...")
+    print("1. Computing feature coverage...")
     coverage = analyse_feature_coverage(derm_df, feature_cols)
     coverage.to_csv(OUTPUT_DIR / "feature_coverage.csv", index=False)
     plot_coverage(coverage)
     print(f"  Saved feature_coverage.csv and .png\n")
 
     # 2. Derm-1M vs SCIN comparison
-    print("Comparing Derm-1M vs SCIN feature availability...")
+    print("2. Comparing Derm-1M vs SCIN feature availability...")
     cmp_df = compare_derm_vs_scin(derm_df, scin_df, feature_cols)
     cmp_df.to_csv(OUTPUT_DIR / "derm_vs_scin_comparison.csv", index=False)
     plot_derm_vs_scin_comparison(cmp_df)
@@ -343,14 +557,16 @@ if __name__ == "__main__":
     print(f"  SCIN avg feature availability:       {scin_mean:.1f}%")
     print(f"  Gap (Derm-1M advantage):             {derm_mean - scin_mean:.1f}%\n")
 
-    # 3. Global feature importance (uses label_name = cleaned model labels)
-    print("Computing global mutual information feature importance...")
+    # 3. Global feature importance
+    print("3. Computing global mutual information feature importance...")
     mi_df = compute_feature_importance(derm_df, feature_cols, label_col="label_name")
     mi_df.to_csv(OUTPUT_DIR / "feature_importance_global.csv", index=False)
-    print(f"  Top 10 features:\n{mi_df.head(10).to_string(index=False)}\n")
+    print(f"  Top 10 features by mutual information:")
+    print(mi_df.head(10).to_string(index=False))
+    print()
 
-    # 4. Class-wise importance (per label_name)
-    print("Computing class-wise feature importance...")
+    # 4. Class-wise importance
+    print("4. Computing class-wise feature importance...")
     cw_importance = compute_classwise_importance(
         derm_df, feature_cols, label_col="label_name"
     )
@@ -363,6 +579,7 @@ if __name__ == "__main__":
     print(f"  Saved {len(cw_importance)} class-wise importance files\n")
 
     # 5. Example questionnaire for a confusion cluster
+    print("5. Generating example questionnaire for confusion cluster...")
     example_cluster = [
         "eczema", "dermatitis", "psoriasis",
     ]
@@ -378,8 +595,10 @@ if __name__ == "__main__":
     print(f"Example questionnaire for cluster {example_cluster}:")
     for item in questionnaire:
         print(f"  [{item['discriminatory_score']:.3f}] {item['question']}")
+    print()
 
     # 6. Features only in Derm-1M (not available in SCIN)
+    print("6. Analyzing Derm-1M-only features...")
     scin_canonical_set = set(SCIN_TO_CANONICAL.values())
     derm_only_features = [
         c for c in feature_cols if c not in scin_canonical_set
@@ -388,7 +607,7 @@ if __name__ == "__main__":
     derm_only_coverage.to_csv(
         OUTPUT_DIR / "derm_only_features.csv", index=False
     )
-    print(f"\n  Features in Derm-1M but NOT in SCIN: {len(derm_only_features)}")
+    print(f"  Features in Derm-1M but NOT in SCIN: {len(derm_only_features)}")
     print(f"  Saved derm_only_features.csv")
     if len(derm_only_coverage) > 0:
         top_derm_only = derm_only_coverage.head(10)
@@ -397,5 +616,49 @@ if __name__ == "__main__":
             print(f"    {row['feature']:40s} "
                   f"present={row['pct_present']:.1f}% "
                   f"informed={row['informativeness']:.1f}%")
+    print()
 
-    print(f"\n  All outputs saved to {OUTPUT_DIR}/")
+    # ═══════════════════════════════════════════════════════════════════════
+    # DETAILED EDA
+    # ═══════════════════════════════════════════════════════════════════════
+    print("=" * 60)
+    print("  DETAILED EDA")
+    print("=" * 60 + "\n")
+
+    # 7. Feature distribution analysis
+    print("7. Generating feature distribution analysis...")
+    plot_feature_distribution(coverage, top_n=50)
+    print()
+
+    # 8. Disease-wise feature heatmap
+    print("8. Generating disease-wise feature heatmap...")
+    plot_disease_wise_feature_heatmap(derm_df, feature_cols, 
+                                       top_diseases=20, top_features=30)
+    print()
+
+    # 9. Top features by disease
+    print("9. Generating top features by disease plots...")
+    top_5_diseases = derm_df["label_name"].value_counts().head(5).index.tolist()
+    for disease in top_5_diseases:
+        plot_top_features_by_disease(derm_df, feature_cols, disease, top_n=15)
+    print(f"  Generated top features plots for top 5 diseases\n")
+
+    # 10. Generate summary tables
+    print("10. Generating EDA summary tables...")
+    generate_eda_summary_tables(derm_df, feature_cols, coverage)
+    print()
+
+    print("=" * 60)
+    print("  ANALYSIS COMPLETE")
+    print("=" * 60)
+    print(f"\nAll outputs saved to:")
+    print(f"  - Main outputs: {OUTPUT_DIR}/")
+    print(f"  - EDA outputs: {EDA_DIR}/")
+    print(f"\nKey files:")
+    print(f"  - feature_coverage.csv - Feature coverage statistics")
+    print(f"  - feature_importance_global.csv - Global feature importance")
+    print(f"  - derm_vs_scin_comparison.csv - Derm-1M vs SCIN comparison")
+    print(f"  - eda/feature_distribution_overview.png - Feature distribution visualizations")
+    print(f"  - eda/disease_feature_heatmap.png - Disease-feature prevalence heatmap")
+    print(f"  - eda/top_features_*.png - Top features by disease")
+    print(f"  - eda/*.csv - Various summary tables")

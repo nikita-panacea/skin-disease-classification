@@ -1,6 +1,6 @@
 """
-PHASE 3b: Per-Disease Feature Co-occurrence Analysis
-=====================================================
+PHASE 3b: Per-Disease Feature Co-occurrence Analysis with Enhanced EDA
+=======================================================================
 Core insight: The classifier learned feature *combinations*, not individual features.
 A disease label's "diagnostic signature" is the set of features that consistently
 co-occur. Comparing these signatures between Derm-1M and SCIN reveals exactly
@@ -16,6 +16,8 @@ Analyses:
      Derm-1M but missing/broken in SCIN → root cause of performance drop
   5. Confusion-aware gap: for pairs of diseases the model confuses,
      which distinguishing co-occurrence is absent in SCIN?
+  6. Enhanced EDA: Co-occurrence networks, feature correlation matrices,
+     signature visualizations
 
 Run after phase2_bulk_extraction.py
 """
@@ -27,11 +29,14 @@ from pathlib import Path
 from itertools import combinations
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import seaborn as sns
 from scipy.stats import pearsonr
 import warnings
 warnings.filterwarnings("ignore")
+
+# Set style for better plots
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_palette("husl")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DERM_FEATURES_CSV  = "derm1m_features.csv"
@@ -39,13 +44,14 @@ SCIN_CSV           = "SCIN-dataset/dataset_scin_cases.csv"
 SCHEMA_PATH        = "feature_schema.json"
 OUTPUT_DIR         = Path("analysis_outputs/cooccurrence")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+EDA_DIR            = OUTPUT_DIR / "eda"
+EDA_DIR.mkdir(exist_ok=True)
 
 MIN_SUPPORT        = 0.15   # feature must be present in >= 15% of class to count
 MIN_PAIR_SUPPORT   = 0.10   # co-occurring pair must appear in >= 10% of class
 TOP_FEATURES_PLOT  = 20     # features shown in heatmaps
 
 # SCIN column -> canonical feature (must match phase2 output column names)
-# Updated to match the new schema from phase1/phase2
 SCIN_TO_CANONICAL = {
     # Textures
     "textures_raised_or_bumpy":                     "texture_raised",
@@ -269,7 +275,7 @@ def signature_completeness_in_scin(
     - Which single/pair features are AVAILABLE in SCIN (column exists)?
     - Which are INFORMATIVE in SCIN (column filled >= 10% of SCIN cases)?
     - What is the overall "signature coverage" score?
-
+    
     If scin_label_col and disease_label provided, restricts to matching SCIN cases.
     """
     disease = signature["disease"]
@@ -421,6 +427,129 @@ def confusion_aware_gap(
     return results
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ENHANCED EDA FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_signature_network(signature: dict, disease: str, min_phi: float = 0.3):
+    """
+    Plot a network visualization of feature co-occurrences for a disease.
+    Shows features as nodes and strong co-occurrences as edges.
+    """
+    import matplotlib.patches as mpatches
+    
+    pairs = [p for p in signature["pairs"] if p["phi_coefficient"] >= min_phi]
+    if len(pairs) < 3:
+        return
+    
+    # Create adjacency matrix for network layout
+    features = list(set([p["feature_1"] for p in pairs] + [p["feature_2"] for p in pairs]))
+    if len(features) < 3:
+        return
+    
+    fig, ax = plt.subplots(figsize=(14, 14))
+    
+    # Simple circular layout
+    n = len(features)
+    angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+    pos = {feat: (np.cos(angle), np.sin(angle)) for feat, angle in zip(features, angles)}
+    
+    # Draw edges
+    for p in pairs:
+        f1, f2 = p["feature_1"], p["feature_2"]
+        if f1 in pos and f2 in pos:
+            x1, y1 = pos[f1]
+            x2, y2 = pos[f2]
+            alpha = min(1.0, p["phi_coefficient"])
+            ax.plot([x1, x2], [y1, y2], 'gray', alpha=alpha, linewidth=2*alpha)
+    
+    # Draw nodes
+    for feat, (x, y) in pos.items():
+        # Find support for this feature
+        support = next((s["support"] for s in signature["singles"] if s["feature"] == feat), 0.2)
+        size = 300 + 2000 * support
+        ax.scatter(x, y, s=size, c='#1976D2', alpha=0.8, edgecolors='white', linewidth=2)
+        ax.text(x, y, feat.replace("_", " "), ha='center', va='center', 
+               fontsize=8, fontweight='bold', wrap=True)
+    
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-1.5, 1.5)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_title(f"Feature Co-occurrence Network for {disease}\n(φ >= {min_phi}, node size = support)")
+    
+    plt.tight_layout()
+    safe = disease.replace("/", "_").replace(" ", "_")[:50]
+    plt.savefig(EDA_DIR / f"signature_network_{safe}.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"    Saved signature network for {disease}")
+
+
+def plot_feature_correlation_matrix(df: pd.DataFrame, feature_cols: list[str], 
+                                     disease: str, top_n: int = 25):
+    """Plot correlation matrix of top features for a disease."""
+    subset = df[df["label_name"] == disease][feature_cols]
+    if len(subset) < 20:
+        return
+    
+    # Get top features by prevalence
+    prev = {f: (subset[f] == 1).mean() for f in feature_cols}
+    top_features = sorted(prev, key=prev.get, reverse=True)[:top_n]
+    
+    # Compute phi correlation matrix
+    corr_matrix = np.zeros((len(top_features), len(top_features)))
+    for i, f1 in enumerate(top_features):
+        for j, f2 in enumerate(top_features):
+            if i == j:
+                corr_matrix[i, j] = 1.0
+            elif i < j:
+                phi = phi_coefficient(subset[f1].values, subset[f2].values)
+                corr_matrix[i, j] = phi
+                corr_matrix[j, i] = phi
+    
+    corr_df = pd.DataFrame(corr_matrix, index=top_features, columns=top_features)
+    
+    fig, ax = plt.subplots(figsize=(16, 14))
+    mask = np.triu(np.ones_like(corr_df, dtype=bool), k=1)
+    sns.heatmap(corr_df, mask=mask, cmap="RdBu_r", center=0, vmin=-0.5, vmax=0.5,
+                annot=True, fmt=".2f", annot_kws={"size": 7}, square=True,
+                linewidths=0.5, cbar_kws={"shrink": 0.8}, ax=ax)
+    ax.set_title(f"Feature Correlation Matrix (Phi) for {disease}\nTop {top_n} features by prevalence")
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    safe = disease.replace("/", "_").replace(" ", "_")[:50]
+    plt.savefig(EDA_DIR / f"correlation_matrix_{safe}.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def generate_signature_summary_table(all_signatures: dict[str, dict], 
+                                      all_completeness: list[dict]):
+    """Generate comprehensive summary table of all signatures."""
+    rows = []
+    for comp in all_completeness:
+        disease = comp["disease"]
+        sig = all_signatures.get(disease, {})
+        summary = comp["summary"]
+        
+        rows.append({
+            "disease": disease,
+            "n_cases": comp["n_derm1m_cases"],
+            "n_signature_features": summary["n_signature_features"],
+            "n_pairs": summary["n_signature_pairs"],
+            "top_feature": sig.get("singles", [{}])[0].get("feature", "N/A") if sig.get("singles") else "N/A",
+            "top_feature_support": sig.get("singles", [{}])[0].get("support", 0) if sig.get("singles") else 0,
+            "scin_reproducibility": summary["signature_reproducibility"],
+            "single_coverage": summary["single_feature_coverage"],
+            "pair_integrity": summary["pair_integrity_score"],
+        })
+    
+    summary_df = pd.DataFrame(rows).sort_values("scin_reproducibility")
+    summary_df.to_csv(EDA_DIR / "signature_summary_all_diseases.csv", index=False)
+    print(f"  Saved signature summary to {EDA_DIR / 'signature_summary_all_diseases.csv'}")
+    return summary_df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # PLOTTING
 # ──────────────────────────────────────────────────────────────────────────────
 def plot_cooccurrence_heatmap(
@@ -483,8 +612,8 @@ def plot_reproducibility_summary(all_completeness: list[dict]):
     """Summary chart: signature reproducibility score per disease class."""
     rows = [
         (c["disease"], c["summary"]["signature_reproducibility"],
-         c["summary"]["single_feature_coverage"],
-         c["summary"]["pair_integrity_score"])
+             c["summary"]["single_feature_coverage"],
+             c["summary"]["pair_integrity_score"])
         for c in all_completeness
     ]
     rows.sort(key=lambda x: x[1])
@@ -520,7 +649,9 @@ def plot_reproducibility_summary(all_completeness: list[dict]):
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=== Phase 3b: Co-occurrence Analysis ===\n")
+    print("=" * 60)
+    print("  PHASE 3b: Co-occurrence Analysis with Enhanced EDA")
+    print("=" * 60 + "\n")
 
     # ── Load data ─────────────────────────────────────────────────────────────
     print("Loading feature matrices...")
@@ -575,7 +706,7 @@ if __name__ == "__main__":
     summary_rows = [
         c["summary"] | {
             "disease": c["disease"],
-            "n_derm1m": c["n_derm1m_cases"],
+                                    "n_derm1m": c["n_derm1m_cases"],
             "n_scin": c["n_scin_cases"],
         }
         for c in all_completeness
@@ -641,11 +772,45 @@ if __name__ == "__main__":
                     f"phi={p['phi_in_A']:.2f}"
                 )
 
-    print(f"\n  All co-occurrence outputs -> {OUTPUT_DIR}/")
-    print("   Key files:")
+    # ═══════════════════════════════════════════════════════════════════════
+    # ENHANCED EDA
+    # ═══════════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  ENHANCED EDA")
+    print("=" * 60 + "\n")
+
+    # 6. Generate signature summary table
+    print("6. Generating signature summary table...")
+    generate_signature_summary_table(all_signatures, all_completeness)
+    print()
+
+    # 7. Plot signature networks for top diseases
+    print("7. Plotting signature networks for top diseases...")
+    top_5_diseases = list(all_signatures.keys())[:5]
+    for disease in top_5_diseases:
+        sig = all_signatures[disease]
+        if sig.get("pairs"):
+            plot_signature_network(sig, disease, min_phi=0.3)
+    print(f"  Generated signature networks for top 5 diseases\n")
+
+    # 8. Plot feature correlation matrices for top diseases
+    print("8. Plotting feature correlation matrices for top diseases...")
+    for disease in top_5_diseases:
+        plot_feature_correlation_matrix(derm_df, feature_cols, disease, top_n=25)
+    print(f"  Generated correlation matrices for top 5 diseases\n")
+
+    print("=" * 60)
+    print("  ANALYSIS COMPLETE")
+    print("=" * 60)
+    print(f"\nAll outputs saved to {OUTPUT_DIR}/")
+    print(f"EDA outputs saved to {EDA_DIR}/")
+    print("\nKey files:")
     print("   - all_signatures.json               -- full per-disease feature signatures")
     print("   - signature_completeness_summary.csv -- reproducibility scores per disease")
     print("   - reproducibility_summary.png        -- visual summary across all classes")
     print("   - confusion_aware_gaps.json          -- exact missing signal per confused pair")
     print("   - cooccurrence_<disease>.png         -- heatmaps for worst-reproducibility diseases")
     print("   - signature_gap_<disease>.png        -- Derm-1M vs SCIN bar charts per disease")
+    print("   - eda/signature_network_*.png        -- feature co-occurrence networks")
+    print("   - eda/correlation_matrix_*.png       -- feature correlation matrices")
+    print("   - eda/signature_summary_all_diseases.csv -- comprehensive signature summary")

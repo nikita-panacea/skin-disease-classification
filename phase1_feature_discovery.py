@@ -6,14 +6,20 @@ then consolidate into a canonical feature schema aligned with SCIN.
 
 Strategy:
   1. Per-label-name stratified sampling (auto-calculated from label distribution)
-  2. Per-label-name LLM discovery via Gemini 2.0 Flash Thinking
+  2. Per-label-name LLM discovery via Gemini, OpenAI GPT-4o-mini, or Qwen 3.5 9B (local)
   3. Global consolidation to deduplicate synonyms
-  4. SCIN column alignment
+  4. SCIN column alignment (after final feature list is established)
 
 Run BEFORE phase2_bulk_extraction.py
 
 Prerequisites:
-  pip install pandas google-generativeai python-dotenv tqdm
+  pip install pandas google-generativeai openai python-dotenv tqdm
+
+For Qwen 3.5 (local):
+  Serve the model locally via vLLM or SGLang first, e.g.:
+    python -m sglang.launch_server --model-path Qwen/Qwen3.5-9B --port 8000 ...
+  Then set LLM_PROVIDER=qwen in your .env or environment.
+  Optionally set QWEN_BASE_URL (default: http://localhost:8000/v1).
 """
 
 import pandas as pd
@@ -25,14 +31,11 @@ from pathlib import Path
 from collections import defaultdict
 from dotenv import load_dotenv
 from tqdm import tqdm
-import google.generativeai as genai
 
-# ── Load API key from .env ───────────────────────────────────────────────────
+# ── Load API keys from .env ───────────────────────────────────────────────────
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
-    raise ValueError("Set GEMINI_API_KEY in your .env file")
-genai.configure(api_key=GEMINI_API_KEY)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CSV_PATH        = "cleaned_caption_Derm1M.csv"
@@ -40,10 +43,102 @@ SCHEMA_OUT      = "feature_schema.json"
 DISCOVERY_DIR   = Path("discovery_outputs")
 DISCOVERY_DIR.mkdir(exist_ok=True)
 
-BATCH_SIZE      = 20                    # captions per LLM call
-DISCOVERY_MODEL = "gemini-2.5-flash-lite"
+BATCH_SIZE      = 25                    # captions per LLM call
 
-model = genai.GenerativeModel(DISCOVERY_MODEL)
+# ── LLM Provider Selection ─────────────────────────────────────────────────
+# Options: "gemini", "openai", or "qwen"
+LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "gemini")  # Set via env var or change here
+
+# Qwen local server config
+QWEN_BASE_URL   = os.getenv("QWEN_BASE_URL", "http://localhost:8000/v1")
+QWEN_MODEL_NAME = os.getenv("QWEN_MODEL_NAME", "Qwen/Qwen3.5-9B")
+
+# Model configuration
+if LLM_PROVIDER == "gemini":
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
+        raise ValueError("Set GEMINI_API_KEY in your .env file for Gemini provider")
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    DISCOVERY_MODEL = "gemini-2.5-flash-lite"
+    model = genai.GenerativeModel(DISCOVERY_MODEL)
+elif LLM_PROVIDER == "openai":
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+        raise ValueError("Set OPENAI_API_KEY in your .env file for OpenAI provider")
+    import openai
+    openai.api_key = OPENAI_API_KEY
+    DISCOVERY_MODEL = "gpt-4o-mini"
+    model = None
+elif LLM_PROVIDER == "qwen":
+    from openai import OpenAI as QwenClient
+    qwen_client = QwenClient(base_url=QWEN_BASE_URL, api_key="EMPTY")
+    DISCOVERY_MODEL = QWEN_MODEL_NAME
+    model = None
+else:
+    raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}. Use 'gemini', 'openai', or 'qwen'")
+
+print(f"Using LLM Provider: {LLM_PROVIDER} with model: {DISCOVERY_MODEL}")
+if LLM_PROVIDER == "qwen":
+    print(f"  Qwen base URL: {QWEN_BASE_URL}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM API Wrapper Functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
+    """
+    Generic LLM caller that works with Gemini, OpenAI, and Qwen (local).
+    Returns the text response.
+    """
+    for attempt in range(retries):
+        try:
+            if LLM_PROVIDER == "gemini":
+                full_prompt = f"{system_prompt or ''}\n\n{prompt}" if system_prompt else prompt
+                response = model.generate_content(full_prompt)
+                return response.text
+            
+            elif LLM_PROVIDER == "openai":
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                
+                response = openai.chat.completions.create(
+                    model=DISCOVERY_MODEL,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=4096,
+                )
+                return response.choices[0].message.content
+
+            elif LLM_PROVIDER == "qwen":
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+
+                response = qwen_client.chat.completions.create(
+                    model=DISCOVERY_MODEL,
+                    messages=messages,
+                    max_tokens=4096,
+                    temperature=0.7,
+                    top_p=0.8,
+                    presence_penalty=1.5,
+                    extra_body={
+                        "top_k": 20,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                )
+                return response.choices[0].message.content
+        
+        except Exception as e:
+            print(f"    API error (attempt {attempt+1}): {str(e)[:120]}")
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                time.sleep(10 * (attempt + 1))
+            else:
+                time.sleep(2 ** attempt)
+    
+    raise Exception(f"All {retries} LLM call attempts failed")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 1: Per-label stratified sampling
@@ -51,9 +146,9 @@ model = genai.GenerativeModel(DISCOVERY_MODEL)
 
 # Sampling tiers: label_name class size → number of captions to sample
 SAMPLING_TIERS = [
-    (5000,  200),   # large classes (>5000 records): 200 captions
-    (1000,  150),   # medium classes (1000-5000): 150 captions
-    (200,    100),   # small classes (200-1000): 100 captions
+    (5000,  500),   # large classes (>5000 records): 500 captions
+    (1000,  300),   # medium classes (1000-5000): 300 captions
+    (200,    200),   # small classes (200-1000): 200 captions
     (0,    None),   # tiny classes (<200): take ALL
 ]
 
@@ -121,82 +216,168 @@ def load_and_sample(csv_path: str) -> pd.DataFrame:
 # STEP 2: LLM-based feature discovery per label_name
 # ──────────────────────────────────────────────────────────────────────────────
 
-DISCOVERY_PROMPT = """You are a clinical NLP expert specialising in dermatology.
+DISCOVERY_SYSTEM_PROMPT = """You are a clinical NLP expert specialising in dermatology.
+Your task: given a batch of skin disease case captions, extract ALL possible
+clinical and contextual feature *categories* that appear.
 
-Given the following batch of skin disease case captions (all belonging to the
-disease category "{label_name}"), extract ALL possible clinical and contextual
-feature *categories* that are ACTUALLY MENTIONED or DESCRIBED in these captions.
-
-IMPORTANT RULES:
+CRITICAL RULES:
 - Extract ONLY information that is ACTUALLY STATED in these captions.
   Do NOT infer or assume features that are not mentioned.
 - Separate compound features (e.g. 'red scaly lesion' → color=red, texture=scaly)
 - Each feature should be MEDICALLY meaningful and distinguishable
+- Look for EXACT phrases in captions and record them as extraction_examples
+- If a feature appears in multiple captions, collect ALL unique example phrases
 
-You MUST look for and extract features in ALL of these categories if present:
+You MUST look for and extract features in ALL of these categories included, but not limited to, if present:
 
-1. DEMOGRAPHICS: age, sex/gender, ethnicity, fitzpatrick skin type
-2. MORPHOLOGY - TEXTURE: raised/bumpy, flat, rough/scaly/flaky, fluid-filled,
-   ulcerated, smooth, crusted, papule, plaque, vesicle, bulla, pustule, nodule,
-   macule, patch, wheal, comedo, cyst, abscess, scar, atrophy
-3. MORPHOLOGY - COLOR: red/erythematous, brown/hyperpigmented, white/depigmented,
-   yellow, black/dark, blue/grey, pink, violaceous/purple, salmon-colored, skin-colored
-4. MORPHOLOGY - SHAPE/BORDER/SIZE: round, oval, irregular, annular, linear, serpiginous,
-   well-defined, ill-defined, small, medium, large, size measurements
-5. MORPHOLOGY - DISTRIBUTION: unilateral, bilateral, dermatomal, grouped/clustered,
-   linear, annular, widespread/generalized, localized, symmetric, asymmetric
-6. BODY LOCATION: face, scalp, neck, trunk/torso, arm, hand, palm, leg, foot, sole,
-   genitalia, groin, buttocks, mouth/oral, nails, axilla, intertriginous areas
-7. SYMPTOMS - DERMATOLOGICAL: itching, burning, pain, bleeding, increasing size,
-   darkening, tenderness, numbness, tingling
-8. SYMPTOMS - SYSTEMIC: fever, chills, fatigue, joint pain, mouth sores,
-   shortness of breath, weight loss, malaise, lymphadenopathy
-9. DURATION/ONSET: acute, chronic, sudden onset, gradual onset, recurrent,
-   congenital/lifelong, specific time periods (hours/days/weeks/months/years)
-10. TRIGGERS: sun exposure, drugs/medications, food, allergens/contact, stress,
-    trauma, infection, heat/cold, chemicals, insect bites, pregnancy, menstruation
-11. TREATMENTS: topical steroids, antibiotics (topical/oral), antifungals,
-    antihistamines, immunosuppressants, phototherapy, surgery, cryotherapy,
-    laser therapy, biologics, retinoids, emollients/moisturizers, home remedies,
-    chemotherapy, radiation
-12. CLINICAL SIGNS: Nikolsky sign, Auspitz sign, Koebner phenomenon,
-    dermoscopic patterns, Wickham striae, target lesions, pathergy
-13. HISTORY/CONTEXT: family history, recurrence, immunocompromised status,
-    associated diseases/comorbidities, contagious risk, diagnosis confidence,
-    biopsy/histology mentioned, self-diagnosed vs clinician-diagnosed
-14. LESION COUNT/EXTENT: single, multiple, few, numerous, widespread
-15. SECONDARY CHANGES: lichenification, excoriation, post-inflammatory changes,
-    scarring, fissuring, maceration
+1. DEMOGRAPHICS: 
+   - Age: specific ages (e.g., "15 years old"), age ranges (e.g., "40 to 49", "18-29"), age groups (child, adolescent, adult, elderly)
+   - Sex/Gender: male, female, man, woman, boy, girl
+   - Fitzpatrick Skin Type/Skin tone: FST1, FST2, FST3, FST4, FST5, FST6 or descriptions (very light, fair/light, medium, olive, brown, dark, deeply pigmented)
+   - Ethnicity/Race: as mentioned in captions
+
+2. MORPHOLOGY - TEXTURE: 
+   - Elevated: raised, bumpy, papule, plaque, nodule, bump, wart, verruca, hives, wheal
+   - Flat: flat, macular, macule, patch
+   - Surface: rough, scaly, flaky, scale, desquamated, keratotic, hyperkeratotic
+   - Fluid-filled: vesicle, blister, bulla, pustule, fluid-filled, weeping, oozing
+   - Ulceration: ulcer, ulcerated, erosion, eroded, crusted, crust, excoriated
+   - Smooth: smooth, shiny, glossy
+   - Other: cyst, abscess, scar, atrophy, cancerous, non-cancerous, benign, malignant, etc.
+
+3. MORPHOLOGY - COLOR: 
+   - Red spectrum: red, erythematous, erythema, pink, violaceous, purple
+   - Pigment changes: brown, hyperpigmented, hypopigmented, white, depigmented, pale, dark
+   - Other colors: yellow, black, blue, grey/gray, slate, salmon-colored, skin-colored
+
+
+4. MORPHOLOGY - SHAPE/BORDER/SIZE: 
+   - Shape: round, oval, circular, irregular, annular, ring-like, linear, serpiginous, snake-like
+   - Border: well-defined, well-demarcated, ill-defined, irregular border
+   - Size: small (<1cm), medium (1-5cm), large (>5cm), specific measurements
+   - Other: other shape, other information, other factors, other details, etc.
+
+5. MORPHOLOGY - DISTRIBUTION: 
+   - Pattern: unilateral, bilateral, symmetric, asymmetric
+   - Arrangement: grouped, clustered, herpetiform, dermatomal, linear, streak-like
+   - Extent: localized, widespread, generalized, diffuse, all over, isolated
+   - Other: other distribution, other information, other factors, other details, etc.
+
+6. BODY LOCATION (be specific):
+   - Head: face, cheek, forehead, nose, perioral, periorbital, eyelid, lip, scalp, hairline
+   - Neck: neck, cervical
+   - Torso: chest, abdomen, back, flank, torso, trunk, sternum
+   - Upper limb: arm, forearm, elbow, wrist, hand, palm, dorsum, finger, knuckle, back of hand
+   - Lower limb: leg, thigh, shin, calf, knee, ankle, foot, sole, heel, toe, dorsum of foot
+   - Special areas: genitalia, groin, scrotum, vulva, perineum, perianal, buttocks, gluteal
+   - Other: mouth, oral, tongue, mucosa, nail, axilla, armpit, intertriginous
+   - Other: other body locations, other information, other factors, other details, etc.
+
+7. SYMPTOMS - DERMATOLOGICAL:
+   - Sensations: itching, pruritus, burning, stinging, pain, tenderness, soreness, hurting
+   - Changes: increasing size, growing, spreading, expanding, darkening, lightening, bleeding
+   - Other: bothersome appearance, cosmetic concern, disfigurement, numbness, tingling
+   - Other: other dermatological symptoms, other information, other factors, other details, etc.
+
+8. SYMPTOMS - SYSTEMIC:
+   - General: fever, chills, fatigue, tiredness, malaise, lethargy, weight loss
+   - Specific: joint pain, arthralgia, arthritis, mouth sores, oral ulcers, shortness of breath, dyspnea
+   - Lymphatic: lymphadenopathy, swollen lymph nodes
+   - Other: other systemic symptoms, other information, other factors, other details, etc.
+
+9. DURATION/ONSET:
+   - Duration: acute, chronic, subacute, hours, days, weeks, months, years, lifelong, congenital, since childhood, since birth
+   - Onset: sudden onset, abrupt onset, gradual onset, slow onset, overnight, within hours, within days
+   - Pattern: recurrent, relapsing, remitting, persistent, intermittent, first episode
+
+
+10. TRIGGERS/EXACERBATING FACTORS:
+    - Environmental: sun exposure, UV light, heat, cold, sweating, humidity, seasonal changes
+    - Contact: allergens, irritants, chemicals, cosmetics, metals (nickel), latex, plants
+    - Medications: drugs, medications, antibiotics, new medications
+    - Biological: infection, bacteria, virus, fungus, insect bites, stings, trauma, friction, pressure
+    - Lifestyle: stress, anxiety, hormonal changes, pregnancy, menstruation, menopause, diet, food
+    - Occupational: occupational exposure, work-related
+    - Other: other triggers, other excacerbating factors, causes, etc.
+
+11. TREATMENTS (mentioned or suggested):
+    - Topical: topical steroids, corticosteroids, creams, ointments, lotions, gels, emollients, moisturizers
+    - Systemic medications: oral steroids, antibiotics, antifungals, antihistamines, immunosuppressants, biologics, retinoids, methotrexate
+    - Physical: phototherapy, UV therapy, laser therapy, surgery, excision, cryotherapy, freezing
+    - Supportive: home remedies, over-the-counter, OTC, self-care, wound care, dressings
+    - Other: chemotherapy, radiation therapy (for skin cancer), other treatments, other supportive measures, etc.
+
+12. CLINICAL SIGNS:
+    - Specific signs: Nikolsky sign, Auspitz sign, Koebner phenomenon, Darier sign
+    - Patterns: dermoscopic patterns, Wickham striae, target lesions, iris lesions, pathergy
+    - Diagnostic: biopsy-proven, histologically confirmed, clinically diagnosed
+
+13. HISTORY/CONTEXT:
+    - Personal: family history, genetic predisposition, atopy, allergies, asthma
+    - Disease course: recurrence, previous episodes, chronic condition, new onset
+    - Immune status: immunocompromised, immunosuppressed, HIV, diabetes, autoimmune disease
+    - Comorbidities: associated diseases, concurrent conditions
+    - Risk factors: sun damage, smoking, occupational hazards, travel history
+    - Diagnosis source: self-diagnosed, patient-reported, clinician-diagnosed, dermatologist-confirmed, biopsy-proven
+    - Other: other history, other context, other factors, other information, etc.
+
+14. LESION COUNT/EXTENT:
+    - Number: single, solitary, one lesion, few, several, multiple, numerous, countless
+    - Distribution: localized to one area, scattered, generalized, universal
+    - Other: other count, other extent, other measurements, other information, etc.
+
+15. SECONDARY CHANGES:
+    - Chronic changes: lichenification, thickening, atrophy
+    - Trauma: excoriation, scratch marks, crusting, erosion, fissuring, maceration
+    - Post-inflammatory: post-inflammatory hyperpigmentation, post-inflammatory hypopigmentation, scarring, keloid
+    - Other: other changes, other modifications, other information, other factors, etc.
+
+16. SEVERITY:
+    - Scale: mild, moderate, severe, very severe, life-threatening
+    - Impact: asymptomatic, symptomatic, disabling, affecting daily activities, quality of life impact
+
+
+17. IMAGE/CONTEXT METADATA:
+    - Image type: clinical image, dermoscopy, close-up, at angle, macro, microscopic
+    - Image quality: clear, blurry, well-lit, poor lighting
+    - View: anterior, posterior, lateral, close-up view
+    - Other: other metadata, other information, other factors, other details, etc.
+
+18. OTHER UNIQUE FEATURES:
+    - Any other specific clinical findings, descriptors, or contextual information not covered above
+    - Look for medical terminology, anatomical terms, and disease-specific descriptors
+    - Other diseases, skin-diseases, or disease acronyms mentioned in captions
+    - Other: other unique features, other information, other factors, other details, etc.
 
 Return ONLY valid JSON — no markdown fences, no prose — in this structure:
-{{
+{
   "feature_categories": [
-    {{
+    {
       "name": "snake_case_feature_name",
-      "category": "one of: demographics | morphology | body_location | symptoms | duration | triggers | treatments | clinical_signs | history | severity | other",
+      "category": "one of: demographics | morphology | body_location | symptoms | duration | triggers | treatments | clinical_signs | history | severity | image_metadata | other",
       "description": "brief clinical description of what this feature captures",
       "example_values": ["value1", "value2", "value3"],
       "is_binary": true or false,
       "extraction_examples": ["phrase from caption that indicated this feature"]
-    }}
+    }
   ]
-}}
+}
 """
 
 def discover_features_batch(
     captions: list[str], label_name: str, retries: int = 3
 ) -> list[dict]:
-    """Send a batch of captions to Gemini and extract feature categories."""
+    """Send a batch of captions to LLM and extract feature categories."""
     numbered = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(captions))
     prompt = (
-        DISCOVERY_PROMPT.format(label_name=label_name)
-        + f"\n\nHere are {len(captions)} captions for '{label_name}':\n\n{numbered}"
+        f"Extract all feature categories from these {len(captions)} dermatology captions "
+        f"for the disease category '{label_name}':\n\n{numbered}"
     )
 
     for attempt in range(retries):
         try:
-            response = model.generate_content(prompt)
-            text = response.text.strip()
+            text = call_llm(prompt, DISCOVERY_SYSTEM_PROMPT)
+            text = text.strip()
             # Strip any accidental markdown fences
             text = re.sub(r"```json\s*|```\s*", "", text).strip()
             parsed = json.loads(text)
@@ -243,8 +424,13 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
                 batch = label_captions[start:start + BATCH_SIZE]
                 feats = discover_features_batch(batch, label_name)
                 label_features.extend(feats)
-                # Rate limiting — be polite to the API
-                time.sleep(1)
+                # Rate limiting — local qwen needs no delay, remote APIs do
+                if LLM_PROVIDER == "qwen":
+                    time.sleep(0.1)
+                elif LLM_PROVIDER == "openai":
+                    time.sleep(0.5)
+                else:
+                    time.sleep(1)
 
             # Cache per-label results
             with open(cache_path, "w", encoding="utf-8") as f:
@@ -278,42 +464,36 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
 # STEP 3: Consolidation via LLM
 # ──────────────────────────────────────────────────────────────────────────────
 
-CONSOLIDATION_PROMPT = """You are a senior clinical NLP engineer building a canonical
+CONSOLIDATION_SYSTEM_PROMPT = """You are a senior clinical NLP engineer building a canonical
 feature schema for a skin disease classification system.
-
-You are given a raw list of {n_features} clinical feature categories that were
-extracted by an LLM from {n_captions_sampled} dermatology case captions across
-{n_disease_classes} disease classes.
 
 Your task:
 1. DEDUPLICATE synonyms (e.g. 'lesion_colour' and 'color_of_lesion' → 'lesion_color';
    'itch' and 'pruritus' → 'symptom_itching')
 2. MERGE overlapping features into canonical names
 3. STANDARDISE names to snake_case
-4. DO NOT REMOVE any uniques features that are useful for differential diagnosis
+4. DO NOT REMOVE any unique features that are useful for differential diagnosis
 5. ENSURE the following categories are well-represented:
-   - demographics, morphology (texture, color, shape/border, distribution),
+   - demographics (age, sex, ethnicity, fitzpatrick skin type, skin tone), morphology (texture, color, shape/border, distribution),
    - body_location, symptoms (dermatological + systemic),
    - duration/onset, triggers, treatments, clinical_signs, history
+   - lesion count/extent, secondary changes, severity, other
 6. For each feature, decide: is_binary (true = present/absent encoding)
    or categorical (false = needs value strings like "topical|systemic|surgical")
 
 Return ONLY valid JSON — no markdown fences, no prose — with this structure:
-{{
+{
   "feature_categories": [
-    {{
+    {
       "name": "snake_case_canonical_name",
       "category": "demographics | morphology | body_location | symptoms | duration | triggers | treatments | clinical_signs | history | severity | other",
       "description": "brief clinical description",
       "example_values": ["val1", "val2"],
       "is_binary": true/false,
       "regex_extractable": true/false
-    }}
+    }
   ]
-}}
-
-Here is the raw feature list:
-{raw_features}
+}
 """
 
 def consolidate_schema(
@@ -335,19 +515,19 @@ def consolidate_schema(
         })
 
     raw_json = json.dumps(compact, indent=1)
-    prompt = CONSOLIDATION_PROMPT.format(
-        n_features=len(compact),
-        n_captions_sampled=n_captions_sampled,
-        n_disease_classes=n_disease_classes,
-        raw_features=raw_json,
+    prompt = (
+        f"You are given a raw list of {len(compact)} clinical feature categories that were\n"
+        f"extracted by an LLM from {n_captions_sampled} dermatology case captions across\n"
+        f"{n_disease_classes} disease classes.\n\n"
+        f"Here is the raw feature list:\n{raw_json}"
     )
 
     print(f"  Sending {len(compact)} raw features for consolidation...")
 
     for attempt in range(3):
         try:
-            response = model.generate_content(prompt)
-            text = response.text.strip()
+            text = call_llm(prompt, CONSOLIDATION_SYSTEM_PROMPT)
+            text = text.strip()
             text = re.sub(r"```json\s*|```\s*", "", text).strip()
             parsed = json.loads(text)
             if isinstance(parsed, list):
@@ -368,28 +548,42 @@ def consolidate_schema(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 4: SCIN column alignment
+# STEP 4: SCIN column alignment (AFTER final feature list is established)
 # ──────────────────────────────────────────────────────────────────────────────
 
 SCIN_FEATURES = {
-    # SCIN column name → canonical feature name in our schema
+    # =========================================================================
+    # DEMOGRAPHICS
+    # =========================================================================
+    "age_group":                                    "age_group",
+    "sex_at_birth":                                 "sex",
+    "fitzpatrick_skin_type":                        "fitzpatrick_skin_type",
+    
+    # =========================================================================
+    # RACE/ETHNICITY (binary flags in SCIN)
+    # =========================================================================
+    "race_ethnicity_american_indian_or_alaska_native":    "race_american_indian_alaska_native",
+    "race_ethnicity_asian":                               "race_asian",
+    "race_ethnicity_black_or_african_american":          "race_black_african_american",
+    "race_ethnicity_hispanic_latino_or_spanish_origin":  "race_hispanic_latino",
+    "race_ethnicity_middle_eastern_or_north_african":     "race_middle_eastern_north_african",
+    "race_ethnicity_native_hawaiian_or_pacific_islander": "race_native_hawaiian_pacific_islander",
+    "race_ethnicity_white":                               "race_white",
+    "race_ethnicity_other_race":                          "race_other",
+    "race_ethnicity_prefer_not_to_answer":                "race_prefer_not_to_answer",
+    "race_ethnicity_two_or_more_after_mitigation":        "race_two_or_more",
+    
+    # =========================================================================
+    # TEXTURES / MORPHOLOGY
+    # =========================================================================
     "textures_raised_or_bumpy":                     "texture_raised",
     "textures_flat":                                "texture_flat",
     "textures_rough_or_flaky":                      "texture_rough_flaky",
     "textures_fluid_filled":                        "texture_fluid_filled",
-    "condition_symptoms_itching":                   "symptom_itching",
-    "condition_symptoms_burning":                   "symptom_burning",
-    "condition_symptoms_pain":                      "symptom_pain",
-    "condition_symptoms_bleeding":                  "symptom_bleeding",
-    "condition_symptoms_increasing_size":            "symptom_increasing_size",
-    "condition_symptoms_darkening":                 "symptom_darkening",
-    "condition_symptoms_bothersome_appearance":      "symptom_bothersome_appearance",
-    "other_symptoms_fever":                         "symptom_fever",
-    "other_symptoms_chills":                        "symptom_chills",
-    "other_symptoms_fatigue":                       "symptom_fatigue",
-    "other_symptoms_joint_pain":                    "symptom_joint_pain",
-    "other_symptoms_mouth_sores":                   "symptom_mouth_sores",
-    "other_symptoms_shortness_of_breath":            "symptom_shortness_of_breath",
+    
+    # =========================================================================
+    # BODY PARTS / LOCATIONS
+    # =========================================================================
     "body_parts_head_or_neck":                      "location_head_neck",
     "body_parts_arm":                               "location_arm",
     "body_parts_palm":                              "location_palm",
@@ -401,16 +595,48 @@ SCIN_FEATURES = {
     "body_parts_leg":                               "location_leg",
     "body_parts_foot_top_or_side":                  "location_foot_top_side",
     "body_parts_foot_sole":                         "location_foot_sole",
-    "age_group":                                    "age_group",
-    "sex_at_birth":                                 "sex",
-    "fitzpatrick_skin_type":                        "fitzpatrick_skin_type",
+    "body_parts_other":                             "location_other",
+    
+    # =========================================================================
+    # CONDITION SYMPTOMS (primary symptoms)
+    # =========================================================================
+    "condition_symptoms_bothersome_appearance":    "symptom_bothersome_appearance",
+    "condition_symptoms_bleeding":                  "symptom_bleeding",
+    "condition_symptoms_increasing_size":           "symptom_increasing_size",
+    "condition_symptoms_darkening":                 "symptom_darkening",
+    "condition_symptoms_itching":                   "symptom_itching",
+    "condition_symptoms_burning":                   "symptom_burning",
+    "condition_symptoms_pain":                      "symptom_pain",
+    "condition_symptoms_no_relevant_experience":  "symptom_no_relevant_experience",
+    
+    # =========================================================================
+    # OTHER SYMPTOMS (systemic/associated)
+    # =========================================================================
+    "other_symptoms_fever":                         "symptom_fever",
+    "other_symptoms_chills":                        "symptom_chills",
+    "other_symptoms_fatigue":                       "symptom_fatigue",
+    "other_symptoms_joint_pain":                    "symptom_joint_pain",
+    "other_symptoms_mouth_sores":                   "symptom_mouth_sores",
+    "other_symptoms_shortness_of_breath":           "symptom_shortness_of_breath",
+    "other_symptoms_no_relevant_symptoms":          "symptom_no_relevant_symptoms",
+    
+    # =========================================================================
+    # CONDITION METADATA
+    # =========================================================================
     "condition_duration":                           "duration",
+    "related_category":                             "related_category",
 }
 
 def add_scin_alignment(schema: dict) -> dict:
-    """Tag each schema feature with its SCIN column counterpart (if any)."""
+    """
+    Tag each schema feature with its SCIN column counterpart (if any).
+    This is done AFTER the final feature list is established from Derm-1M.
+    """
     existing_names = {f["name"] for f in schema["feature_categories"]}
-
+    
+    # Track which features are SCIN-comparable
+    scin_comparable_count = 0
+    
     for scin_col, canonical in SCIN_FEATURES.items():
         # Find feature in schema or add it as SCIN-sourced
         matched = next(
@@ -419,6 +645,7 @@ def add_scin_alignment(schema: dict) -> dict:
         if matched:
             matched["scin_column"] = scin_col
             matched["scin_comparable"] = True
+            scin_comparable_count += 1
         else:
             # Add missing SCIN feature to schema so it gets extracted
             schema["feature_categories"].append({
@@ -432,7 +659,9 @@ def add_scin_alignment(schema: dict) -> dict:
                 "scin_comparable": True,
                 "derm1m_sourced": False,
             })
-
+            scin_comparable_count += 1
+    
+    print(f"  Aligned {scin_comparable_count} features with SCIN columns")
     return schema
 
 
@@ -443,8 +672,10 @@ def _infer_category(name: str) -> str:
     if name.startswith("color_"):     return "morphology"
     if name.startswith("trigger_"):   return "triggers"
     if name.startswith("treatment_"): return "treatments"
+    if name.startswith("race_"):        return "demographics"
     if name in ("age_group", "sex", "fitzpatrick_skin_type"): return "demographics"
     if name == "duration":            return "duration"
+    if name == "related_category":    return "condition_metadata"
     return "other"
 
 
@@ -452,11 +683,12 @@ def _is_regex_extractable(name: str) -> bool:
     """Heuristic: features that can be reliably extracted via keyword/regex."""
     regex_prefixes = (
         "symptom_", "location_", "texture_", "color_",
-        "distribution_",
+        "distribution_", "race_",
     )
     regex_names = {
         "age_group", "sex", "fitzpatrick_skin_type", "duration",
         "onset_sudden", "lesion_count", "diagnosis_confidence",
+        "related_category",
     }
     return name.startswith(regex_prefixes) or name in regex_names
 
@@ -503,8 +735,8 @@ if __name__ == "__main__":
         n_disease_classes=int(sample_df["label_name"].nunique()),
     )
 
-    # ── Step 4: SCIN alignment ────────────────────────────────────────────────
-    print("\nSTEP 4: Aligning with SCIN columns...\n")
+    # ── Step 4: SCIN alignment (AFTER final feature list is established) ─────
+    print("\nSTEP 4: Aligning with SCIN columns (after final feature list established)...\n")
     schema = add_scin_alignment(schema)
 
     n_total = len(schema["feature_categories"])
@@ -532,6 +764,7 @@ if __name__ == "__main__":
         "n_regex_extractable": n_regex,
         "n_llm_only": n_llm_only,
         "model_used": DISCOVERY_MODEL,
+        "llm_provider": LLM_PROVIDER,
     }
 
     with open(SCHEMA_OUT, "w", encoding="utf-8") as fp:

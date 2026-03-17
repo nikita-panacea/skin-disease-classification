@@ -9,5 +9,5 @@ matplotlib>=3.7
 seaborn>=0.12
 tqdm>=4.60
 google-generativeai>=0.8
+openai>=1.0
 python-dotenv>=0.21
-
