@@ -20,6 +20,9 @@ For Qwen 3.5 (local):
   Optionally set QWEN_BASE_URL (default: http://localhost:8000/v1).
 
 Run after phase1_feature_discovery.py
+
+Env (optional):
+  CAPTION_COLUMN — must match phase1 (default: truncated_caption)
 """
 
 import pandas as pd
@@ -37,6 +40,9 @@ from collections import defaultdict
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# ── Paths / caption (before LLM init — used in startup logs) ─────────────────
+CAPTION_COLUMN   = os.getenv("CAPTION_COLUMN", "truncated_caption")
 
 # ── LLM Provider Selection ─────────────────────────────────────────────────
 # Options: "gemini", "openai", or "qwen"
@@ -70,6 +76,7 @@ else:
     raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}. Use 'gemini', 'openai', or 'qwen'")
 
 print(f"Using LLM Provider: {LLM_PROVIDER} with model: {MODEL_NAME}")
+print(f"  Caption column: {CAPTION_COLUMN}")
 if LLM_PROVIDER == "qwen":
     print(f"  Qwen base URL: {QWEN_BASE_URL}")
 
@@ -401,9 +408,14 @@ def run_extraction(csv_path: str, schema_path: str):
     # ── Load data ─────────────────────────────────────────────────────────────
     print(f"Loading CSV: {csv_path}")
     df = pd.read_csv(csv_path)
-    df["truncated_caption"] = df["truncated_caption"].fillna("")
+    if CAPTION_COLUMN not in df.columns:
+        raise ValueError(
+            f"Caption column {CAPTION_COLUMN!r} not found. "
+            f"Available: {list(df.columns)}"
+        )
+    df[CAPTION_COLUMN] = df[CAPTION_COLUMN].fillna("").astype(str)
     n = len(df)
-    print(f"  {n:,} records loaded\n")
+    print(f"  {n:,} records loaded (caption={CAPTION_COLUMN!r})\n")
 
     # ── LLM extraction for ALL features ──────────────────────────────────────────
     print(f"Running LLM extraction for ALL {len(all_feature_names)} features...")
@@ -417,6 +429,7 @@ def run_extraction(csv_path: str, schema_path: str):
     
     # Statistics tracking
     global_stats = {
+        "caption_column": CAPTION_COLUMN,
         "total_captions": n,
         "total_batches": 0,
         "successful_batches": 0,
@@ -439,7 +452,7 @@ def run_extraction(csv_path: str, schema_path: str):
         # Get indices for this label
         label_mask = df["label_name"] == label_name
         label_indices = df.index[label_mask].tolist()
-        label_captions = df.loc[label_indices, "truncated_caption"].tolist()
+        label_captions = df.loc[label_indices, CAPTION_COLUMN].tolist()
         
         n_label = len(label_captions)
         n_batches_label = (n_label + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE

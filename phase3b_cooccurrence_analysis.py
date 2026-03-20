@@ -20,8 +20,15 @@ Analyses:
      signature visualizations
 
 Run after phase2_bulk_extraction.py
+
+Env (optional):
+  CONFUSION_PAIRS_CSV   — CSV with columns true_label, confused_with (appends to defaults)
+  COOCCURRENCE_PHI_TOP_K — max features for phi heatmaps (default 60; 0 = all features)
 """
 
+from __future__ import annotations
+
+import os
 import pandas as pd
 import numpy as np
 import json
@@ -33,6 +40,8 @@ import seaborn as sns
 from scipy.stats import pearsonr
 import warnings
 warnings.filterwarnings("ignore")
+
+from scin_feature_map import SCIN_TO_CANONICAL
 
 # Set style for better plots
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -47,45 +56,21 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 EDA_DIR            = OUTPUT_DIR / "eda"
 EDA_DIR.mkdir(exist_ok=True)
 
-MIN_SUPPORT        = 0.15   # feature must be present in >= 15% of class to count
-MIN_PAIR_SUPPORT   = 0.10   # co-occurring pair must appear in >= 10% of class
+MIN_SUPPORT        = 0.15   # default; overridden per-class when adaptive
+MIN_PAIR_SUPPORT   = 0.10
 TOP_FEATURES_PLOT  = 20     # features shown in heatmaps
+# Max features for pairwise phi matrix (full grid is O(k^2)); 0 = use all
+COOCCURRENCE_PHI_TOP_K = int(os.getenv("COOCCURRENCE_PHI_TOP_K", "60"))
+CONFUSION_PAIRS_CSV = os.getenv("CONFUSION_PAIRS_CSV", "").strip()
 
-# SCIN column -> canonical feature (must match phase2 output column names)
-SCIN_TO_CANONICAL = {
-    # Textures
-    "textures_raised_or_bumpy":                     "texture_raised",
-    "textures_flat":                                "texture_flat",
-    "textures_rough_or_flaky":                      "texture_rough_flaky",
-    "textures_fluid_filled":                        "texture_fluid_filled",
-    # Condition symptoms
-    "condition_symptoms_itching":                   "symptom_itching",
-    "condition_symptoms_burning":                   "symptom_burning",
-    "condition_symptoms_pain":                      "symptom_pain",
-    "condition_symptoms_bleeding":                  "symptom_bleeding",
-    "condition_symptoms_increasing_size":            "symptom_increasing_size",
-    "condition_symptoms_darkening":                 "symptom_darkening",
-    "condition_symptoms_bothersome_appearance":      "symptom_bothersome_appearance",
-    # Other symptoms
-    "other_symptoms_fever":                         "symptom_fever",
-    "other_symptoms_chills":                        "symptom_chills",
-    "other_symptoms_fatigue":                       "symptom_fatigue",
-    "other_symptoms_joint_pain":                    "symptom_joint_pain",
-    "other_symptoms_mouth_sores":                   "symptom_mouth_sores",
-    "other_symptoms_shortness_of_breath":            "symptom_shortness_of_breath",
-    # Body parts -> canonical location names from phase2
-    "body_parts_head_or_neck":                      "location_head_neck",
-    "body_parts_arm":                               "location_arm",
-    "body_parts_palm":                              "location_palm",
-    "body_parts_back_of_hand":                      "location_back_of_hand",
-    "body_parts_torso_front":                       "location_torso_front",
-    "body_parts_torso_back":                        "location_torso_back",
-    "body_parts_genitalia_or_groin":                "location_genitalia_groin",
-    "body_parts_buttocks":                          "location_buttocks",
-    "body_parts_leg":                               "location_leg",
-    "body_parts_foot_top_or_side":                  "location_foot_top_side",
-    "body_parts_foot_sole":                         "location_foot_sole",
-}
+
+def adaptive_supports(n_class: int) -> tuple[float, float]:
+    """Scale min support with class size so small classes are not empty."""
+    if n_class <= 0:
+        return MIN_SUPPORT, MIN_PAIR_SUPPORT
+    ms = max(0.05, min(0.15, 30.0 / max(n_class, 1)))
+    mps = max(0.05, min(0.10, 20.0 / max(n_class, 1)))
+    return ms, mps
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UTILITIES
@@ -121,18 +106,26 @@ def binary_presence(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 def compute_disease_cooccurrence(
     df: pd.DataFrame, feature_cols: list[str], disease: str,
-    label_col: str = "label_name"
+    label_col: str = "label_name",
+    top_k_features: int | None = None,
 ) -> pd.DataFrame:
     """
     For one disease class (label_name), compute pairwise Phi coefficient
     for all feature pairs. Returns a square DataFrame (feature x feature).
+    If top_k_features is set, only the top-K features by P(feature=1) are used.
     """
-    subset = df[df[label_col] == disease][feature_cols]
+    sub_df = df[df[label_col] == disease]
+    use_cols = list(feature_cols)
+    if top_k_features and len(use_cols) > top_k_features:
+        prev = {f: (sub_df[f] == 1).mean() for f in use_cols}
+        use_cols = sorted(prev, key=prev.get, reverse=True)[:top_k_features]
+
+    subset = sub_df[use_cols]
     n_rows, n_cols = subset.shape
     phi_matrix = np.zeros((n_cols, n_cols))
 
-    for i, f1 in enumerate(feature_cols):
-        for j, f2 in enumerate(feature_cols):
+    for i, f1 in enumerate(use_cols):
+        for j, f2 in enumerate(use_cols):
             if i == j:
                 phi_matrix[i, j] = 1.0
             elif i < j:
@@ -140,7 +133,7 @@ def compute_disease_cooccurrence(
                 phi_matrix[i, j] = phi
                 phi_matrix[j, i] = phi  # symmetric
 
-    return pd.DataFrame(phi_matrix, index=feature_cols, columns=feature_cols)
+    return pd.DataFrame(phi_matrix, index=use_cols, columns=use_cols)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 2: Diagnostic signature — frequent co-occurring feature sets per disease
@@ -150,8 +143,8 @@ def extract_diagnostic_signature(
     feature_cols: list[str],
     disease: str,
     label_col: str = "label_name",
-    min_support: float = MIN_SUPPORT,
-    min_pair_support: float = MIN_PAIR_SUPPORT,
+    min_support: float | None = None,
+    min_pair_support: float | None = None,
     top_k_singles: int = 15,
 ) -> dict:
     """
@@ -163,6 +156,10 @@ def extract_diagnostic_signature(
     """
     subset = df[df[label_col] == disease]
     n = len(subset)
+    if min_support is None or min_pair_support is None:
+        ms, mps = adaptive_supports(n)
+        min_support = min_support if min_support is not None else ms
+        min_pair_support = min_pair_support if min_pair_support is not None else mps
     if n < 20:
         return {
             "disease": disease, "n_cases": n,
@@ -645,6 +642,28 @@ def plot_reproducibility_summary(all_completeness: list[dict]):
     plt.close()
     return path
 
+
+def load_confusion_pairs(default: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Load extra (true_label, confused_with) pairs from CONFUSION_PAIRS_CSV if set."""
+    if not CONFUSION_PAIRS_CSV:
+        return list(default)
+    path = Path(CONFUSION_PAIRS_CSV)
+    if not path.is_file():
+        print(f"  WARNING: CONFUSION_PAIRS_CSV not found: {path}, using defaults only")
+        return list(default)
+    extra = pd.read_csv(path)
+    for col in ("true_label", "confused_with"):
+        if col not in extra.columns:
+            raise ValueError(
+                f"{path} must have columns true_label, confused_with; got {list(extra.columns)}"
+            )
+    pairs = list(default)
+    for _, row in extra.iterrows():
+        a, b = str(row["true_label"]).strip(), str(row["confused_with"]).strip()
+        if a and b:
+            pairs.append((a, b))
+    return pairs
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
@@ -724,20 +743,21 @@ if __name__ == "__main__":
 
     plot_reproducibility_summary(all_completeness)
 
+    phi_top_k = COOCCURRENCE_PHI_TOP_K if COOCCURRENCE_PHI_TOP_K > 0 else None
+
     # ── Step 4: Co-occurrence heatmaps for key diseases ───────────────────────
     worst_diseases = summary_df.head(10)["disease"].tolist()
     print(f"\nPlotting co-occurrence heatmaps for "
           f"{len(worst_diseases)} lowest-reproducibility diseases...")
     for disease in worst_diseases:
         phi_df = compute_disease_cooccurrence(
-            derm_df, feature_cols, disease, label_col="label_name"
+            derm_df, feature_cols, disease, label_col="label_name",
+            top_k_features=phi_top_k,
         )
         plot_cooccurrence_heatmap(phi_df, disease)
 
     # ── Step 5: Confusion-aware gap ───────────────────────────────────────────
-    # Confusion pairs using label_name (the cleaned/merged model labels)
-    # Replace/extend with actual pairs from your confusion matrices
-    confusion_pairs = [
+    default_confusion_pairs = [
         ("eczema",                      "dermatitis"),
         ("eczema",                      "psoriasis"),
         ("psoriasis",                   "dermatitis"),
@@ -749,6 +769,9 @@ if __name__ == "__main__":
         ("acne",                        "folliculitis (inflamed hair follicles)"),
         ("herpes simplex virus",        "herpes zoster (shingles)"),
     ]
+    confusion_pairs = load_confusion_pairs(default_confusion_pairs)
+    if CONFUSION_PAIRS_CSV:
+        print(f"  Loaded confusion pairs from {CONFUSION_PAIRS_CSV} (merged with defaults)")
     print(f"\nComputing confusion-aware gaps for {len(confusion_pairs)} pairs...")
     conf_gaps = confusion_aware_gap(all_signatures, confusion_pairs)
     with open(OUTPUT_DIR / "confusion_aware_gaps.json", "w") as f:
@@ -784,9 +807,9 @@ if __name__ == "__main__":
     generate_signature_summary_table(all_signatures, all_completeness)
     print()
 
-    # 7. Plot signature networks for top diseases
+    # 7. Plot signature networks for top 5 diseases by case count (not dict order)
     print("7. Plotting signature networks for top diseases...")
-    top_5_diseases = list(all_signatures.keys())[:5]
+    top_5_diseases = diseases.head(5).index.tolist()
     for disease in top_5_diseases:
         sig = all_signatures[disease]
         if sig.get("pairs"):

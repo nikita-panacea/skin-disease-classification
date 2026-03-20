@@ -9,8 +9,14 @@ PHASE 3: Feature Analysis with Detailed EDA
    disease-wise feature occurrence, correlation analysis
 
 Run after phase2_bulk_extraction.py
+
+Env (optional):
+  LABEL_COL — target column for MI / chi-square / classwise OR (default: label_name; use disease_label for fine-grained)
 """
 
+from __future__ import annotations
+
+import os
 import pandas as pd
 import numpy as np
 import json
@@ -20,6 +26,8 @@ from sklearn.preprocessing import LabelEncoder
 from scipy.stats import chi2_contingency
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from scin_feature_map import SCIN_TO_CANONICAL, SCIN_COMPARABLE_CANONICALS
 
 # Set style for better plots
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -34,41 +42,8 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 EDA_DIR           = OUTPUT_DIR / "eda"
 EDA_DIR.mkdir(exist_ok=True)
 
-# SCIN column → our canonical feature name (matches phase2 output columns)
-SCIN_TO_CANONICAL = {
-    # Textures
-    "textures_raised_or_bumpy":                     "texture_raised",
-    "textures_flat":                                "texture_flat",
-    "textures_rough_or_flaky":                      "texture_rough_flaky",
-    "textures_fluid_filled":                        "texture_fluid_filled",
-    # Condition symptoms
-    "condition_symptoms_itching":                   "symptom_itching",
-    "condition_symptoms_burning":                   "symptom_burning",
-    "condition_symptoms_pain":                      "symptom_pain",
-    "condition_symptoms_bleeding":                  "symptom_bleeding",
-    "condition_symptoms_increasing_size":            "symptom_increasing_size",
-    "condition_symptoms_darkening":                 "symptom_darkening",
-    "condition_symptoms_bothersome_appearance":      "symptom_bothersome_appearance",
-    # Other symptoms
-    "other_symptoms_fever":                         "symptom_fever",
-    "other_symptoms_chills":                        "symptom_chills",
-    "other_symptoms_fatigue":                       "symptom_fatigue",
-    "other_symptoms_joint_pain":                    "symptom_joint_pain",
-    "other_symptoms_mouth_sores":                   "symptom_mouth_sores",
-    "other_symptoms_shortness_of_breath":            "symptom_shortness_of_breath",
-    # Body parts → canonical location names from phase2
-    "body_parts_head_or_neck":                      "location_head_neck",
-    "body_parts_arm":                               "location_arm",
-    "body_parts_palm":                              "location_palm",
-    "body_parts_back_of_hand":                      "location_back_of_hand",
-    "body_parts_torso_front":                       "location_torso_front",
-    "body_parts_torso_back":                        "location_torso_back",
-    "body_parts_genitalia_or_groin":                "location_genitalia_groin",
-    "body_parts_buttocks":                          "location_buttocks",
-    "body_parts_leg":                               "location_leg",
-    "body_parts_foot_top_or_side":                  "location_foot_top_side",
-    "body_parts_foot_sole":                         "location_foot_sole",
-}
+# Target column for MI / chi-square / classwise OR (label_name = merged class; disease_label = fine-grained)
+LABEL_COL = os.getenv("LABEL_COL", "label_name")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ANALYSIS 1: Feature Coverage in Derm-1M
@@ -133,35 +108,86 @@ def compare_derm_vs_scin(
 # ──────────────────────────────────────────────────────────────────────────────
 # ANALYSIS 3: Disease Class-wise Feature Importance
 # ──────────────────────────────────────────────────────────────────────────────
+def _cramers_v_from_table(observed: np.ndarray) -> tuple[float, float, float]:
+    """Return (chi2, p_value, cramers_v). Cramér's V in [0,1] for effect size."""
+    chi2, p, dof, expected = chi2_contingency(observed)
+    n = observed.sum()
+    r, k = observed.shape
+    if n <= 0 or min(r, k) < 2:
+        return float(chi2), float(p), 0.0
+    denom = n * (min(r, k) - 1)
+    if denom <= 0:
+        return float(chi2), float(p), 0.0
+    v = np.sqrt(chi2 / denom)
+    v = min(float(v), 1.0)
+    return float(chi2), float(p), v
+
+
 def compute_feature_importance(
     df: pd.DataFrame, feature_cols: list[str], label_col: str = "label_name"
 ) -> pd.DataFrame:
     """
-    Mutual information between each feature and disease label.
-    Only uses rows where feature is 0 or 1 (not unknown=2).
-    Uses label_name (the cleaned/merged labels used by the model).
+    Per feature vs disease label (informed rows only, values 0/1):
+    - Mutual information (discrete)
+    - Chi-square independence test on feature × label crosstab
+    - Cramér's V (effect size)
     """
+    if label_col not in df.columns:
+        raise ValueError(f"LABEL_COL {label_col!r} not in dataframe columns")
+
     le = LabelEncoder()
     y = le.fit_transform(df[label_col].astype(str))
+    n_classes = len(le.classes_)
 
-    mi_scores = []
+    rows_out = []
     for col in feature_cols:
-        mask = df[col] != 2      # exclude unknowns
-        x_sub = df.loc[mask, col].values.reshape(-1, 1)
-        y_sub = y[mask.values]
+        mask = df[col] != 2
+        n_inf = int(mask.sum())
+        if n_inf < 100:
+            rows_out.append({
+                "feature": col,
+                "mutual_information": 0.0,
+                "chi2_statistic": 0.0,
+                "chi2_pvalue": 1.0,
+                "cramers_v": 0.0,
+                "n_informed": n_inf,
+            })
+            continue
 
-        if len(x_sub) < 100:     # too few informed rows
-            mi = 0.0
-        else:
-            mi = mutual_info_classif(x_sub, y_sub, discrete_features=True)[0]
+        x_sub = df.loc[mask, col].astype(int).values
+        y_sub = y[mask.to_numpy()]
 
-        mi_scores.append({
+        mi = mutual_info_classif(
+            x_sub.reshape(-1, 1), y_sub, discrete_features=True
+        )[0]
+
+        ct = pd.crosstab(
+            pd.Series(x_sub, name=col),
+            pd.Series(y_sub, name="label"),
+        )
+        # Ensure 2 rows (0/1) for binary feature
+        for xi in (0, 1):
+            if xi not in ct.index:
+                ct.loc[xi] = 0
+        ct = ct.sort_index()
+        # Ensure all label columns 0..n_classes-1 present
+        for c in range(n_classes):
+            if c not in ct.columns:
+                ct[c] = 0
+        ct = ct.reindex(sorted(ct.columns), axis=1)
+        obs = ct.to_numpy(dtype=float)
+        chi2, p, v = _cramers_v_from_table(obs)
+
+        rows_out.append({
             "feature": col,
-            "mutual_information": round(mi, 5),
-            "n_informed": int(mask.sum()),
+            "mutual_information": round(float(mi), 5),
+            "chi2_statistic": round(chi2, 4),
+            "chi2_pvalue": float(p) if np.isfinite(p) else 1.0,
+            "cramers_v": round(v, 5),
+            "n_informed": n_inf,
         })
 
-    return pd.DataFrame(mi_scores).sort_values("mutual_information", ascending=False)
+    return pd.DataFrame(rows_out).sort_values("mutual_information", ascending=False)
 
 def compute_classwise_importance(
     df: pd.DataFrame, feature_cols: list[str],
@@ -186,11 +212,13 @@ def compute_classwise_importance(
                 ((in_pct + 1e-6) / (1 - in_pct + 1e-6))
                 / ((out_pct + 1e-6) / (1 - out_pct + 1e-6))
             )
+            log2_or = float(np.log2(max(or_val, 1e-9)))
             rows.append({
                 "feature": col,
                 "in_class_pct": round(in_pct * 100, 2),
                 "out_class_pct": round(out_pct * 100, 2),
                 "odds_ratio": round(or_val, 3),
+                "log2_odds_ratio": round(log2_or, 4),
             })
         results[label] = (
             pd.DataFrame(rows)
@@ -198,6 +226,80 @@ def compute_classwise_importance(
             .head(top_features)
         )
     return results
+
+
+def export_classwise_importance_long(
+    classwise: dict[str, pd.DataFrame], path: Path
+) -> None:
+    """Single long CSV: disease, feature, odds_ratio, log2_odds_ratio, ..."""
+    parts = []
+    for disease, sub in classwise.items():
+        t = sub.copy()
+        t.insert(0, "disease", disease)
+        parts.append(t)
+    if parts:
+        pd.concat(parts, ignore_index=True).to_csv(path, index=False)
+
+
+def build_feature_importance_scin_context(
+    mi_df: pd.DataFrame, cmp_df: pd.DataFrame | None
+) -> pd.DataFrame:
+    """
+    Join global importance with SCIN overlap flags and Derm vs SCIN gap (where mapped).
+    High MI + not in SCIN compare set + large gap → questionnaire / data collection priority.
+    """
+    out = mi_df.copy()
+    out["in_scin_compare_set"] = out["feature"].isin(SCIN_COMPARABLE_CANONICALS)
+    if cmp_df is not None and len(cmp_df) > 0:
+        m = cmp_df[["canonical_feature", "derm1m_pct_informed", "scin_pct_available", "gap"]].copy()
+        out = out.merge(
+            m,
+            left_on="feature",
+            right_on="canonical_feature",
+            how="left",
+        )
+        out = out.drop(columns=["canonical_feature"], errors="ignore")
+    else:
+        out["derm1m_pct_informed"] = np.nan
+        out["scin_pct_available"] = np.nan
+        out["gap"] = np.nan
+    return out
+
+
+def write_explainability_report(path: Path, label_col: str, context_df: pd.DataFrame) -> None:
+    """Short markdown summary for interpretation."""
+    top = context_df.nlargest(15, "mutual_information")
+    high_mi_no_scin = context_df[
+        (context_df["mutual_information"] > 0.01)
+        & (~context_df["in_scin_compare_set"])
+    ].sort_values("chi2_pvalue").head(10)
+    lines = [
+        "# Feature importance vs SCIN (Phase 3 summary)",
+        "",
+        f"- **Label column:** `{label_col}`",
+        "- **in_scin_compare_set:** feature has a direct SCIN questionnaire column "
+        "(textures, symptoms, body parts in `scin_feature_map.SCIN_TO_CANONICAL`).",
+        "",
+        "## Top 15 features by mutual information",
+        "",
+        "```",
+        top[["feature", "mutual_information", "cramers_v", "in_scin_compare_set"]].to_string(index=False),
+        "```",
+        "",
+        "## High MI features not in SCIN compare set (up to 10 by chi-square p-value)",
+        "",
+    ]
+    if len(high_mi_no_scin) > 0:
+        lines.append("```")
+        lines.append(
+            high_mi_no_scin[
+                ["feature", "mutual_information", "cramers_v", "chi2_pvalue"]
+            ].to_string(index=False)
+        )
+        lines.append("```")
+    else:
+        lines.append("_None or insufficient data._")
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ANALYSIS 4: Questionnaire Priority
@@ -351,11 +453,15 @@ def plot_feature_distribution(coverage_df: pd.DataFrame, top_n: int = 50):
     print(f"  Saved feature distribution overview to {EDA_DIR / 'feature_distribution_overview.png'}")
 
 
-def plot_disease_wise_feature_heatmap(df: pd.DataFrame, feature_cols: list[str], 
-                                       top_diseases: int = 20, top_features: int = 30):
+def plot_disease_wise_feature_heatmap(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    top_diseases: int = 20,
+    top_features: int = 30,
+    label_col: str = "label_name",
+):
     """Create heatmap of feature prevalence by disease."""
-    # Get top diseases by count
-    disease_counts = df["label_name"].value_counts().head(top_diseases)
+    disease_counts = df[label_col].value_counts().head(top_diseases)
     top_disease_names = disease_counts.index.tolist()
     
     # Get top features by overall informativeness
@@ -367,7 +473,7 @@ def plot_disease_wise_feature_heatmap(df: pd.DataFrame, feature_cols: list[str],
     # Create prevalence matrix
     prevalence_matrix = []
     for disease in top_disease_names:
-        disease_df = df[df["label_name"] == disease]
+        disease_df = df[df[label_col] == disease]
         row = []
         for feat in top_feature_names:
             prev = (disease_df[feat] == 1).mean() * 100
@@ -392,10 +498,15 @@ def plot_disease_wise_feature_heatmap(df: pd.DataFrame, feature_cols: list[str],
     print(f"  Saved disease-feature heatmap to {EDA_DIR / 'disease_feature_heatmap.png'}")
 
 
-def plot_top_features_by_disease(df: pd.DataFrame, feature_cols: list[str], 
-                                  disease: str, top_n: int = 15):
+def plot_top_features_by_disease(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    disease: str,
+    top_n: int = 15,
+    label_col: str = "label_name",
+):
     """Plot top features for a specific disease."""
-    disease_df = df[df["label_name"] == disease]
+    disease_df = df[df[label_col] == disease]
     if len(disease_df) == 0:
         return
     
@@ -425,14 +536,20 @@ def plot_top_features_by_disease(df: pd.DataFrame, feature_cols: list[str],
     plt.close()
 
 
-def generate_eda_summary_tables(df: pd.DataFrame, feature_cols: list[str], coverage_df: pd.DataFrame):
+def generate_eda_summary_tables(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    coverage_df: pd.DataFrame,
+    label_col: str = "label_name",
+):
     """Generate summary tables for EDA."""
-    
+
     # 1. Overall feature statistics
     stats = {
         "total_records": len(df),
         "total_features": len(feature_cols),
-        "total_diseases": df["label_name"].nunique(),
+        "total_diseases": df[label_col].nunique(),
+        "label_col_used": label_col,
         "mean_informativeness": coverage_df["informativeness"].mean(),
         "median_informativeness": coverage_df["informativeness"].median(),
         "features_with_>50%_informativeness": (coverage_df["informativeness"] > 50).sum(),
@@ -454,17 +571,17 @@ def generate_eda_summary_tables(df: pd.DataFrame, feature_cols: list[str], cover
     print(f"  Saved bottom 20 features to {EDA_DIR / 'bottom_20_informative_features.csv'}")
     
     # 4. Disease-wise record counts
-    disease_counts = df["label_name"].value_counts().reset_index()
+    disease_counts = df[label_col].value_counts().reset_index()
     disease_counts.columns = ["disease", "count"]
     disease_counts["percentage"] = (disease_counts["count"] / len(df) * 100).round(2)
     disease_counts.to_csv(EDA_DIR / "disease_distribution.csv", index=False)
     print(f"  Saved disease distribution to {EDA_DIR / 'disease_distribution.csv'}")
     
     # 5. Feature prevalence by disease (top 10 diseases, all features)
-    top_10_diseases = df["label_name"].value_counts().head(10).index.tolist()
+    top_10_diseases = df[label_col].value_counts().head(10).index.tolist()
     prevalence_by_disease = {}
     for disease in top_10_diseases:
-        disease_df = df[df["label_name"] == disease]
+        disease_df = df[df[label_col] == disease]
         prev_row = {}
         for feat in feature_cols[:50]:  # Limit to top 50 features for brevity
             prev_row[feat] = round((disease_df[feat] == 1).mean() * 100, 2)
@@ -526,7 +643,13 @@ if __name__ == "__main__":
     derm_df = pd.read_csv(DERM_FEATURES_CSV)
     scin_df = pd.read_csv(SCIN_CSV)
     print(f"  Derm-1M: {len(derm_df):,} records")
-    print(f"  SCIN: {len(scin_df):,} records\n")
+    print(f"  SCIN: {len(scin_df):,} records")
+    print(f"  LABEL_COL for MI / classwise OR: {LABEL_COL!r}\n")
+    if LABEL_COL not in derm_df.columns:
+        raise ValueError(
+            f"LABEL_COL={LABEL_COL!r} not in derm1m_features.csv. "
+            f"Use label_name or disease_label, or add column."
+        )
 
     # Meta columns to exclude from feature analysis
     META_COLS = {"image", "label_name", "disease_label", "age_numeric",
@@ -557,18 +680,28 @@ if __name__ == "__main__":
     print(f"  SCIN avg feature availability:       {scin_mean:.1f}%")
     print(f"  Gap (Derm-1M advantage):             {derm_mean - scin_mean:.1f}%\n")
 
-    # 3. Global feature importance
-    print("3. Computing global mutual information feature importance...")
-    mi_df = compute_feature_importance(derm_df, feature_cols, label_col="label_name")
+    # 3. Global feature importance (MI + chi-square + Cramér's V)
+    print("3. Computing global feature importance (MI + chi-square + Cramér's V)...")
+    mi_df = compute_feature_importance(derm_df, feature_cols, label_col=LABEL_COL)
     mi_df.to_csv(OUTPUT_DIR / "feature_importance_global.csv", index=False)
-    print(f"  Top 10 features by mutual information:")
+    print("  Top 10 features by mutual information:")
     print(mi_df.head(10).to_string(index=False))
     print()
+
+    # 3b. Explainability: importance × SCIN mapping × gap
+    context_df = build_feature_importance_scin_context(mi_df, cmp_df)
+    context_df.to_csv(
+        OUTPUT_DIR / "feature_importance_with_scin_context.csv", index=False
+    )
+    write_explainability_report(
+        OUTPUT_DIR / "explainability_report.md", LABEL_COL, context_df
+    )
+    print(f"  Saved feature_importance_with_scin_context.csv and explainability_report.md\n")
 
     # 4. Class-wise importance
     print("4. Computing class-wise feature importance...")
     cw_importance = compute_classwise_importance(
-        derm_df, feature_cols, label_col="label_name"
+        derm_df, feature_cols, label_col=LABEL_COL
     )
     # Save one CSV per disease
     cw_dir = OUTPUT_DIR / "classwise_importance"
@@ -576,7 +709,10 @@ if __name__ == "__main__":
     for disease, df_imp in cw_importance.items():
         safe_name = disease.replace("/", "_").replace(" ", "_")[:60]
         df_imp.to_csv(cw_dir / f"{safe_name}.csv", index=False)
-    print(f"  Saved {len(cw_importance)} class-wise importance files\n")
+    export_classwise_importance_long(
+        cw_importance, OUTPUT_DIR / "classwise_importance_all.csv"
+    )
+    print(f"  Saved {len(cw_importance)} class-wise CSVs + classwise_importance_all.csv\n")
 
     # 5. Example questionnaire for a confusion cluster
     print("5. Generating example questionnaire for confusion cluster...")
@@ -632,20 +768,23 @@ if __name__ == "__main__":
 
     # 8. Disease-wise feature heatmap
     print("8. Generating disease-wise feature heatmap...")
-    plot_disease_wise_feature_heatmap(derm_df, feature_cols, 
-                                       top_diseases=20, top_features=30)
+    plot_disease_wise_feature_heatmap(
+        derm_df, feature_cols, top_diseases=20, top_features=30, label_col=LABEL_COL
+    )
     print()
 
     # 9. Top features by disease
     print("9. Generating top features by disease plots...")
-    top_5_diseases = derm_df["label_name"].value_counts().head(5).index.tolist()
+    top_5_diseases = derm_df[LABEL_COL].value_counts().head(5).index.tolist()
     for disease in top_5_diseases:
-        plot_top_features_by_disease(derm_df, feature_cols, disease, top_n=15)
+        plot_top_features_by_disease(
+            derm_df, feature_cols, disease, top_n=15, label_col=LABEL_COL
+        )
     print(f"  Generated top features plots for top 5 diseases\n")
 
     # 10. Generate summary tables
     print("10. Generating EDA summary tables...")
-    generate_eda_summary_tables(derm_df, feature_cols, coverage)
+    generate_eda_summary_tables(derm_df, feature_cols, coverage, label_col=LABEL_COL)
     print()
 
     print("=" * 60)
@@ -656,7 +795,10 @@ if __name__ == "__main__":
     print(f"  - EDA outputs: {EDA_DIR}/")
     print(f"\nKey files:")
     print(f"  - feature_coverage.csv - Feature coverage statistics")
-    print(f"  - feature_importance_global.csv - Global feature importance")
+    print(f"  - feature_importance_global.csv - MI + chi-square + Cramér's V")
+    print(f"  - feature_importance_with_scin_context.csv - importance vs SCIN gap")
+    print(f"  - explainability_report.md - short interpretation summary")
+    print(f"  - classwise_importance_all.csv - long-format per-class OR")
     print(f"  - derm_vs_scin_comparison.csv - Derm-1M vs SCIN comparison")
     print(f"  - eda/feature_distribution_overview.png - Feature distribution visualizations")
     print(f"  - eda/disease_feature_heatmap.png - Disease-feature prevalence heatmap")

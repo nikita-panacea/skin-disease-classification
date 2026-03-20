@@ -5,7 +5,8 @@ Discover ALL possible clinical features directly FROM the Derm-1M captions,
 then consolidate into a canonical feature schema aligned with SCIN.
 
 Strategy:
-  1. Per-label-name stratified sampling (auto-calculated from label distribution)
+  1. Load captions from cleaned_caption_Derm1M.csv (column configurable via CAPTION_COLUMN).
+     Sampling: stratified (default) or full (all non-empty captions per label).
   2. Per-label-name LLM discovery via Gemini, OpenAI GPT-4o-mini, or Qwen 3.5 9B (local)
   3. Global consolidation to deduplicate synonyms
   4. SCIN column alignment (after final feature list is established)
@@ -20,6 +21,11 @@ For Qwen 3.5 (local):
     python -m sglang.launch_server --model-path Qwen/Qwen3.5-9B --port 8000 ...
   Then set LLM_PROVIDER=qwen in your .env or environment.
   Optionally set QWEN_BASE_URL (default: http://localhost:8000/v1).
+
+Env (optional):
+  CAPTION_COLUMN           — default truncated_caption (matches cleaned_caption_Derm1M.csv)
+  DISCOVERY_SAMPLING_MODE  — stratified | full
+  OPENAI_JSON_RESPONSE     — 1/true to use response_format json_object for OpenAI (discovery/consolidation)
 """
 
 import pandas as pd
@@ -31,6 +37,8 @@ from pathlib import Path
 from collections import defaultdict
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+from scin_feature_map import SCIN_SCHEMA_FEATURES
 
 # ── Load API keys from .env ───────────────────────────────────────────────────
 load_dotenv()
@@ -44,6 +52,10 @@ DISCOVERY_DIR   = Path("discovery_outputs")
 DISCOVERY_DIR.mkdir(exist_ok=True)
 
 BATCH_SIZE      = 25                    # captions per LLM call
+
+CAPTION_COLUMN = os.getenv("CAPTION_COLUMN", "truncated_caption")
+DISCOVERY_SAMPLING_MODE = os.getenv("DISCOVERY_SAMPLING_MODE", "stratified").strip().lower()
+OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "").lower() in ("1", "true", "yes")
 
 # ── LLM Provider Selection ─────────────────────────────────────────────────
 # Options: "gemini", "openai", or "qwen"
@@ -102,12 +114,15 @@ def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
                 
-                response = openai.chat.completions.create(
+                create_kw = dict(
                     model=DISCOVERY_MODEL,
                     messages=messages,
                     temperature=0.1,
                     max_tokens=4096,
                 )
+                if OPENAI_JSON_RESPONSE:
+                    create_kw["response_format"] = {"type": "json_object"}
+                response = openai.chat.completions.create(**create_kw)
                 return response.choices[0].message.content
 
             elif LLM_PROVIDER == "qwen":
@@ -141,7 +156,7 @@ def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STEP 1: Per-label stratified sampling
+# STEP 1: Load captions + sampling (stratified or full)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Sampling tiers: label_name class size → number of captions to sample
@@ -152,28 +167,41 @@ SAMPLING_TIERS = [
     (0,    None),   # tiny classes (<200): take ALL
 ]
 
+
 def compute_sample_size(class_count: int) -> int:
     """Determine how many captions to sample from a class based on its size."""
     for threshold, n_sample in SAMPLING_TIERS:
         if class_count > threshold:
             return n_sample if n_sample is not None else class_count
-    return class_count  # fallback: take all
+    return class_count
 
-def load_and_sample(csv_path: str) -> pd.DataFrame:
-    """
-    Load the Derm-1M CSV and create a per-label-name stratified sample.
-    Within each label_name, further stratify by disease_label to capture
-    sub-type diversity (e.g., 'dermatitis' → allergic/atopic/contact/etc.).
-    """
+
+def load_captions_df(csv_path: str, caption_col: str) -> pd.DataFrame:
+    """Load CSV, validate caption column, drop empty caption rows."""
     print("Loading full CSV...")
     df = pd.read_csv(csv_path)
-    df["truncated_caption"] = df["truncated_caption"].fillna("")
-    # Drop rows with empty captions
-    df = df[df["truncated_caption"].str.strip().ne("")].copy()
+    if caption_col not in df.columns:
+        raise ValueError(
+            f"Caption column {caption_col!r} not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+    df[caption_col] = df[caption_col].fillna("").astype(str)
+    df = df[df[caption_col].str.strip().ne("")].copy()
+    print(f"  Caption column: {caption_col}")
     print(f"  {len(df):,} records with non-empty captions")
     print(f"  {df['label_name'].nunique()} unique label_names")
-    print(f"  {df['disease_label'].nunique()} unique disease_labels\n")
+    if "disease_label" in df.columns:
+        print(f"  {df['disease_label'].nunique()} unique disease_labels\n")
+    else:
+        print()
+    return df
 
+
+def apply_stratified_sampling(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-label_name stratified sample; within label, stratify by disease_label
+    when subsampling (sub-type diversity).
+    """
     label_counts = df["label_name"].value_counts()
     sampled_parts = []
 
@@ -182,16 +210,14 @@ def load_and_sample(csv_path: str) -> pd.DataFrame:
         n_sample = min(n_sample, total_count)
 
         subset = df[df["label_name"] == label_name]
-        n_sublabels = subset["disease_label"].nunique()
+        n_sublabels = subset["disease_label"].nunique() if "disease_label" in subset.columns else 1
 
         if n_sublabels > 1 and n_sample < total_count:
-            # Stratified within disease_label sub-types
             per_sub = max(1, n_sample // n_sublabels)
             stratified = (
                 subset.groupby("disease_label", group_keys=False)
-                      .apply(lambda g: g.sample(min(len(g), per_sub), random_state=42))
+                .apply(lambda g: g.sample(min(len(g), per_sub), random_state=42))
             )
-            # If we got more than needed, downsample; if fewer, that's fine
             if len(stratified) > n_sample:
                 stratified = stratified.sample(n_sample, random_state=42)
             sampled_parts.append(stratified)
@@ -201,16 +227,49 @@ def load_and_sample(csv_path: str) -> pd.DataFrame:
     sampled = pd.concat(sampled_parts, ignore_index=True)
     print(f"  Sampled {len(sampled):,} captions across {sampled['label_name'].nunique()} label_names")
 
-    # Print tier breakdown
     tier_counts = {"large(>5K)": 0, "medium(1K-5K)": 0, "small(200-1K)": 0, "tiny(<200)": 0}
-    for label_name, cnt in label_counts.items():
-        if cnt > 5000:   tier_counts["large(>5K)"] += 1
-        elif cnt > 1000: tier_counts["medium(1K-5K)"] += 1
-        elif cnt > 200:  tier_counts["small(200-1K)"] += 1
-        else:            tier_counts["tiny(<200)"] += 1
+    for _, cnt in label_counts.items():
+        if cnt > 5000:
+            tier_counts["large(>5K)"] += 1
+        elif cnt > 1000:
+            tier_counts["medium(1K-5K)"] += 1
+        elif cnt > 200:
+            tier_counts["small(200-1K)"] += 1
+        else:
+            tier_counts["tiny(<200)"] += 1
     print(f"  Tier breakdown: {tier_counts}\n")
-
     return sampled
+
+
+def apply_sampling_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Return dataframe for discovery: either stratified subsample or all rows."""
+    if mode == "stratified":
+        return apply_stratified_sampling(df)
+    if mode == "full":
+        n = len(df)
+        n_labels = df["label_name"].nunique()
+        batches = 0
+        for ln in df["label_name"].unique():
+            cnt = (df["label_name"] == ln).sum()
+            batches += (cnt + BATCH_SIZE - 1) // BATCH_SIZE
+        print(f"  FULL mode: {n:,} rows, {n_labels} label_names, ~{batches:,} LLM batches (all captions).")
+        if n > 50_000:
+            print(
+                "  WARNING: Full-caption discovery is very expensive vs stratified. "
+                "Consider DISCOVERY_SAMPLING_MODE=stratified for iteration.\n"
+            )
+        else:
+            print()
+        return df.reset_index(drop=True)
+    raise ValueError(
+        f"Unknown DISCOVERY_SAMPLING_MODE: {mode!r}. Use 'stratified' or 'full'."
+    )
+
+
+def load_and_sample(csv_path: str, caption_col: str, mode: str) -> pd.DataFrame:
+    """Load CSV and apply the chosen sampling strategy."""
+    base = load_captions_df(csv_path, caption_col)
+    return apply_sampling_mode(base, mode)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 2: LLM-based feature discovery per label_name
@@ -406,13 +465,13 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
 
     for label_name in tqdm(label_names, desc="Discovering features per label"):
         label_captions = (
-            sample_df[sample_df["label_name"] == label_name]["truncated_caption"]
+            sample_df[sample_df["label_name"] == label_name][CAPTION_COLUMN]
             .tolist()
         )
 
-        # Check for cached per-label discovery
+        # Check for cached per-label discovery (separate cache per sampling mode)
         safe_name = re.sub(r'[^\w\-]', '_', str(label_name))[:60]
-        cache_path = DISCOVERY_DIR / f"discovery_{safe_name}.json"
+        cache_path = DISCOVERY_DIR / f"discovery_{safe_name}_{DISCOVERY_SAMPLING_MODE}.json"
 
         if cache_path.exists():
             with open(cache_path, "r", encoding="utf-8") as f:
@@ -550,82 +609,7 @@ def consolidate_schema(
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 4: SCIN column alignment (AFTER final feature list is established)
 # ──────────────────────────────────────────────────────────────────────────────
-
-SCIN_FEATURES = {
-    # =========================================================================
-    # DEMOGRAPHICS
-    # =========================================================================
-    "age_group":                                    "age_group",
-    "sex_at_birth":                                 "sex",
-    "fitzpatrick_skin_type":                        "fitzpatrick_skin_type",
-    
-    # =========================================================================
-    # RACE/ETHNICITY (binary flags in SCIN)
-    # =========================================================================
-    "race_ethnicity_american_indian_or_alaska_native":    "race_american_indian_alaska_native",
-    "race_ethnicity_asian":                               "race_asian",
-    "race_ethnicity_black_or_african_american":          "race_black_african_american",
-    "race_ethnicity_hispanic_latino_or_spanish_origin":  "race_hispanic_latino",
-    "race_ethnicity_middle_eastern_or_north_african":     "race_middle_eastern_north_african",
-    "race_ethnicity_native_hawaiian_or_pacific_islander": "race_native_hawaiian_pacific_islander",
-    "race_ethnicity_white":                               "race_white",
-    "race_ethnicity_other_race":                          "race_other",
-    "race_ethnicity_prefer_not_to_answer":                "race_prefer_not_to_answer",
-    "race_ethnicity_two_or_more_after_mitigation":        "race_two_or_more",
-    
-    # =========================================================================
-    # TEXTURES / MORPHOLOGY
-    # =========================================================================
-    "textures_raised_or_bumpy":                     "texture_raised",
-    "textures_flat":                                "texture_flat",
-    "textures_rough_or_flaky":                      "texture_rough_flaky",
-    "textures_fluid_filled":                        "texture_fluid_filled",
-    
-    # =========================================================================
-    # BODY PARTS / LOCATIONS
-    # =========================================================================
-    "body_parts_head_or_neck":                      "location_head_neck",
-    "body_parts_arm":                               "location_arm",
-    "body_parts_palm":                              "location_palm",
-    "body_parts_back_of_hand":                      "location_back_of_hand",
-    "body_parts_torso_front":                       "location_torso_front",
-    "body_parts_torso_back":                        "location_torso_back",
-    "body_parts_genitalia_or_groin":                "location_genitalia_groin",
-    "body_parts_buttocks":                          "location_buttocks",
-    "body_parts_leg":                               "location_leg",
-    "body_parts_foot_top_or_side":                  "location_foot_top_side",
-    "body_parts_foot_sole":                         "location_foot_sole",
-    "body_parts_other":                             "location_other",
-    
-    # =========================================================================
-    # CONDITION SYMPTOMS (primary symptoms)
-    # =========================================================================
-    "condition_symptoms_bothersome_appearance":    "symptom_bothersome_appearance",
-    "condition_symptoms_bleeding":                  "symptom_bleeding",
-    "condition_symptoms_increasing_size":           "symptom_increasing_size",
-    "condition_symptoms_darkening":                 "symptom_darkening",
-    "condition_symptoms_itching":                   "symptom_itching",
-    "condition_symptoms_burning":                   "symptom_burning",
-    "condition_symptoms_pain":                      "symptom_pain",
-    "condition_symptoms_no_relevant_experience":  "symptom_no_relevant_experience",
-    
-    # =========================================================================
-    # OTHER SYMPTOMS (systemic/associated)
-    # =========================================================================
-    "other_symptoms_fever":                         "symptom_fever",
-    "other_symptoms_chills":                        "symptom_chills",
-    "other_symptoms_fatigue":                       "symptom_fatigue",
-    "other_symptoms_joint_pain":                    "symptom_joint_pain",
-    "other_symptoms_mouth_sores":                   "symptom_mouth_sores",
-    "other_symptoms_shortness_of_breath":           "symptom_shortness_of_breath",
-    "other_symptoms_no_relevant_symptoms":          "symptom_no_relevant_symptoms",
-    
-    # =========================================================================
-    # CONDITION METADATA
-    # =========================================================================
-    "condition_duration":                           "duration",
-    "related_category":                             "related_category",
-}
+# SCIN column → canonical names: shared module scin_feature_map.SCIN_SCHEMA_FEATURES
 
 def add_scin_alignment(schema: dict) -> dict:
     """
@@ -637,7 +621,7 @@ def add_scin_alignment(schema: dict) -> dict:
     # Track which features are SCIN-comparable
     scin_comparable_count = 0
     
-    for scin_col, canonical in SCIN_FEATURES.items():
+    for scin_col, canonical in SCIN_SCHEMA_FEATURES.items():
         # Find feature in schema or add it as SCIN-sourced
         matched = next(
             (f for f in schema["feature_categories"] if f["name"] == canonical), None
@@ -703,7 +687,11 @@ if __name__ == "__main__":
 
     # ── Step 1: Sample ────────────────────────────────────────────────────────
     print("STEP 1: Loading and sampling captions...\n")
-    sample_df = load_and_sample(CSV_PATH)
+    print(
+        f"  DISCOVERY_SAMPLING_MODE={DISCOVERY_SAMPLING_MODE!r}, "
+        f"CAPTION_COLUMN={CAPTION_COLUMN!r}\n"
+    )
+    sample_df = load_and_sample(CSV_PATH, CAPTION_COLUMN, DISCOVERY_SAMPLING_MODE)
 
     # Save sample for reference
     sample_path = DISCOVERY_DIR / "sampled_captions.csv"
@@ -757,7 +745,10 @@ if __name__ == "__main__":
     # Add metadata
     schema["metadata"] = {
         "source_csv": CSV_PATH,
+        "caption_column": CAPTION_COLUMN,
+        "discovery_sampling_mode": DISCOVERY_SAMPLING_MODE,
         "n_captions_sampled": len(sample_df),
+        "n_rows_used": len(sample_df),
         "n_label_names": int(sample_df["label_name"].nunique()),
         "n_total_features": n_total,
         "n_scin_comparable": n_comparable,

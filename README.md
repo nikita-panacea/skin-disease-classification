@@ -1,212 +1,224 @@
 # Derm-1M Feature Extraction Pipeline
 
-## Overview
+End-to-end pipeline: discover a clinical feature schema from captions, extract **0/1/2** encodings for every row with an LLM, and run analysis / SCIN comparison.
 
-Three-phase pipeline to extract all features from the `caption` column of the Derm-1M dataset (413K records, 300MB CSV), encode them as 0/1/2, and compare against SCIN.
+## Feature encoding
 
----
-
-## Feature Encoding
 | Value | Meaning |
 |-------|---------|
-| **1** | Feature is present / mentioned |
-| **0** | Feature is explicitly absent |
-| **2** | No information available (unknown / not mentioned) |
+| **1** | Feature present / mentioned in the caption |
+| **0** | Explicitly absent (e.g. “non-itchy”) |
+| **2** | Unknown / not mentioned |
 
----
+## Repository layout
 
-## Strategy: Why Hybrid (NLP Rules + LLM)?
+| File | Role |
+|------|------|
+| `cleaned_caption_Derm1M.csv` | Input: `truncated_caption`, `label_name`, `disease_label`, … |
+| `scin_feature_map.py` | Shared SCIN ↔ canonical feature names |
+| `phase1_feature_discovery.py` | Build `feature_schema.json` (sampled or full captions) |
+| `phase2_bulk_extraction.py` | LLM extraction → `derm1m_features.csv` + `checkpoints/` |
+| `phase3_analysis.py` | Coverage, SCIN gap, MI + χ² + Cramér’s V, classwise OR, EDA |
+| `phase3b_cooccurrence_analysis.py` | Per-disease signatures, SCIN reproducibility, confusion gaps |
 
-| Approach | Speed | Accuracy | Cost | Best for |
-|----------|-------|----------|------|----------|
-| Pure regex/NLP | ✅ Very fast | ⚠️ Misses semantics | Free | Demographics, location, colour |
-| Pure LLM | ❌ 50h+ for 413K rows | ✅ Best | Expensive | Complex reasoning |
-| **Hybrid** ✅ | ✅ Fast | ✅ Good | Low | **Full pipeline** |
+Install dependencies:
 
-The hybrid approach runs **rule-based extractors** for ~25 structured features at near-instant speed, then runs **LLM batch calls** (50 captions/call) for ~14 semantically complex features. LLM processing of 413K rows at 50/call = ~8,260 API calls (≈4–6 hours, resumable via checkpoints).
-
----
-
-## Files
-
-```
-phase1_feature_discovery.py   # Discover feature schema via LLM sampling
-phase2_bulk_extraction.py     # Extract features from all 413K captions
-phase3_analysis.py            # Feature importance, SCIN comparison, questionnaire
-```
-
----
-
-## Phase 1: Feature Schema Discovery
-
-**Goal:** Before extracting features at scale, discover the complete feature taxonomy.
-
-**Method:**
-1. **Stratified sample** 1,000 captions across all 50 disease classes
-2. Send in batches of 20 to Claude Opus for feature category discovery
-3. **Consolidate** discovered features (remove synonyms/duplicates)
-4. **Align** with SCIN columns to flag which features are comparable
-
-**Output:** `feature_schema.json` — canonical feature list with SCIN mappings
-
-**Run:**
 ```bash
-pip install anthropic pandas
+pip install -r requirements.txt
+```
+
+---
+
+## Step-by-step pipeline (overview)
+
+1. **Phase 1** — discovers and consolidates features; writes `feature_schema.json`.
+2. **Phase 2** — loads the schema and runs **one LLM call per batch** of captions (checkpointed per `label_name`).
+3. **Phase 3** — statistical analysis and plots under `analysis_outputs/`.
+4. **Phase 3b** (optional) — co-occurrence / signature analysis under `analysis_outputs/cooccurrence/`.
+
+Use the **same** `LLM_PROVIDER`, `CAPTION_COLUMN`, and (for Qwen) `QWEN_BASE_URL` / `QWEN_MODEL_NAME` for Phase 1 and Phase 2 so behavior stays consistent.
+
+---
+
+## Using **Qwen 3.5 9B** locally (recommended flow)
+
+Qwen is **not** called with a cloud API key here. You run an **OpenAI-compatible server** (e.g. [SGLang](https://github.com/sgl-project/sglang) or [vLLM](https://github.com/vllm-project/vllm)) that loads **`Qwen/Qwen3.5-9B`** from Hugging Face, then the pipeline talks to it with the **`openai`** Python SDK (`base_url` + dummy key).
+
+### Step 0 — Hardware and model
+
+- You need a machine with enough GPU memory for **Qwen3.5-9B** (exact VRAM depends on quantisation and framework; see the [Qwen3.5-9B model card](https://huggingface.co/Qwen/Qwen3.5-9B)).
+- The server must expose a **Chat Completions** API (OpenAI-compatible), typically at `http://localhost:8000/v1`.
+
+### Step 1 — Start the local inference server
+
+**Example (SGLang)** — adjust GPU count and flags per your setup and the model card:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-9B \
+  --port 8000 \
+  --tp-size 1 \
+  --mem-fraction-static 0.8 \
+  --context-length 262144 \
+  --reasoning-parser qwen3
+```
+
+**Example (vLLM)** (see Qwen docs for exact flags):
+
+```bash
+vllm serve Qwen/Qwen3.5-9B \
+  --port 8000 \
+  --tensor-parallel-size 1 \
+  --max-model-len 262144 \
+  --reasoning-parser qwen3
+```
+
+Leave this process running. Check that `http://localhost:8000/v1` responds (e.g. health or a minimal chat request).
+
+### Step 2 — Configure environment
+
+Create or edit **`.env`** in the project root:
+
+```env
+# Use local Qwen for both phases
+LLM_PROVIDER=qwen
+
+# OpenAI SDK client points at your local server (no real API key)
+QWEN_BASE_URL=http://localhost:8000/v1
+QWEN_MODEL_NAME=Qwen/Qwen3.5-9B
+
+# Captions column in cleaned_caption_Derm1M.csv
+CAPTION_COLUMN=truncated_caption
+
+# Phase 1: stratified = cheaper; full = every non-empty caption (very slow)
+DISCOVERY_SAMPLING_MODE=stratified
+```
+
+You do **not** need `OPENAI_API_KEY` or `GEMINI_API_KEY` when `LLM_PROVIDER=qwen`.
+
+Optional (same shell, if you prefer not to use `.env` for the base URL):
+
+```bash
+# PowerShell
+$env:LLM_PROVIDER="qwen"
+$env:QWEN_BASE_URL="http://localhost:8000/v1"
+$env:QWEN_MODEL_NAME="Qwen/Qwen3.5-9B"
+
+# bash
+export LLM_PROVIDER=qwen
+export QWEN_BASE_URL=http://localhost:8000/v1
+export QWEN_MODEL_NAME=Qwen/Qwen3.5-9B
+```
+
+### Step 3 — Phase 1: feature discovery
+
+```bash
 python phase1_feature_discovery.py
 ```
 
----
+**Outputs:**
 
-## Phase 2: Bulk Feature Extraction
+- `feature_schema.json` — canonical features + SCIN alignment metadata  
+- `discovery_outputs/` — per-label caches (`discovery_<label>_<mode>.json`), `sampled_captions.csv`
 
-### Fast Lane (Rule-Based) — ~5 minutes for 413K rows
-Handles structured, explicit information using regex patterns:
+**Notes:**
 
-| Feature Group | Features | Method |
-|--------------|----------|--------|
-| Demographics | age_numeric, age_group, sex, fitzpatrick | Regex |
-| Body location | 12 anatomical regions | Keyword matching |
-| Morphology | texture (7), color (6), distribution (6) | Keyword matching |
-| Symptoms | 13 clinical symptoms | Keyword matching |
-| Duration | hours/days/weeks/months/years/lifelong | Regex |
-| Onset | sudden vs gradual | Regex |
-| Diagnosis confidence | confirmed/clinical/suspected/uncertain | Regex |
-| Lesion count | single/multiple/widespread | Regex |
+- First run can take a long time (many LLM calls). Cached labels are skipped on rerun.
+- Switching `DISCOVERY_SAMPLING_MODE` uses a **different** cache filename so stratified vs full do not overwrite each other.
 
-### Slow Lane (LLM) — ~4–6 hours for 413K rows
-Handles semantically complex features requiring reasoning:
+### Step 4 — Phase 2: bulk extraction
 
-| Feature | Description |
-|---------|-------------|
-| systemic_involvement | Fever + rash + joint → systemic disease |
-| trigger_identified | Sun, drug, stress, contact allergen |
-| trigger_type | Type of identified trigger |
-| contagious_risk | Infectious risk level |
-| chronic_vs_acute | Disease temporality |
-| treatment_mentioned | Topical / systemic / surgical |
-| recurrence | First episode vs recurrent |
-| family_history | Genetic component |
-| immunocompromised | Host immune status |
-| associated_disease | Comorbidities |
-| lesion_border | Well-defined vs ill-defined |
-| lesion_shape | Round / oval / irregular / annular |
-| lesion_size | Small (<1cm) / medium / large (>5cm) |
-| secondary_change | Lichenification / excoriation / PIH |
-
-**Checkpointing:** Saves every 5,000 rows to `checkpoints/` so crashes don't lose progress.
-
-**Run:**
 ```bash
-pip install pandas spacy tqdm anthropic
-python -m spacy download en_core_web_sm
-# Fast-only test (no API cost):
-# Set use_llm=False in __main__ first
 python phase2_bulk_extraction.py
 ```
 
-**Output:** `derm1m_features.csv` — 413K rows × ~55 features
+**Outputs:**
 
----
+- `derm1m_features.csv` — original metadata columns + one column per schema feature  
+- `checkpoints/llm_<label_name>.json` — resume if interrupted  
+- `extraction_stats.json` — run statistics (includes `caption_column`)
 
-## Phase 3: Analysis
+**Notes:**
 
-### 3.1 Feature Coverage Analysis
-For each feature: % present / absent / unknown in Derm-1M
+- This is the heaviest step (full dataset × batches). Qwen uses a short inter-batch sleep (`0.1s`) by default.
+- Truncates each caption to **500 characters** before the LLM (`MAX_CAPTION_LEN` in script).
 
-**Key insight:** Features with high "unknown%" indicate the dataset
-is missing that information → potential overfitting risk.
+### Step 5 — Phase 3: analysis
 
-### 3.2 Derm-1M vs SCIN Comparison
-Maps overlapping features and computes:
-- Derm-1M: % of records where feature is mentioned
-- SCIN: % of records where SCIN column is filled
-
-**Interpretation:**
-- **Large gap (Derm-1M >> SCIN):** Derm-1M contains richer features
-  → Classifier likely relies on features not available in SCIN
-  → This explains the performance drop (52% vs 84%)
-- **Small gap:** Both datasets comparably rich
-  → Model may be overfitting
-
-### 3.3 Global Feature Importance
-Uses **Mutual Information** between each feature and the 50-class disease label.
-Higher MI = feature is more discriminative across all diseases.
-
-### 3.4 Class-wise Feature Importance
-For each of 50 disease classes:
-- Features with high **odds ratio** (present in class >> present in other classes)
-- Used to identify the key distinguishing features per condition
-
-### 3.5 Questionnaire Generation
-For a given disease confusion cluster (e.g. eczema/psoriasis/contact dermatitis),
-ranks questions by their discriminatory power.
-
-**Run:**
 ```bash
-pip install pandas numpy scipy scikit-learn matplotlib seaborn
 python phase3_analysis.py
 ```
 
-**Outputs:**
-- `analysis_outputs/feature_coverage.csv` + `.png`
-- `analysis_outputs/derm_vs_scin_comparison.csv` + `.png`
-- `analysis_outputs/feature_importance_global.csv`
-- `analysis_outputs/classwise_importance/<disease>.csv` (50 files)
-- `analysis_outputs/questionnaire_<cluster>.json`
+Requires `SCIN-dataset/dataset_scin_cases.csv` (paths are set at top of the script).
+
+**Notable outputs:**
+
+- `analysis_outputs/feature_importance_global.csv` — MI, χ², Cramér’s V  
+- `analysis_outputs/feature_importance_with_scin_context.csv` — importance vs SCIN mapping / gap  
+- `analysis_outputs/explainability_report.md`  
+- `analysis_outputs/classwise_importance_all.csv`  
+- `analysis_outputs/eda/` — plots and summary tables  
+
+Optional: fine-grained label axis:
+
+```env
+LABEL_COL=disease_label
+```
+
+### Step 6 — Phase 3b (optional): co-occurrence
+
+```bash
+python phase3b_cooccurrence_analysis.py
+```
+
+Optional env:
+
+```env
+CONFUSION_PAIRS_CSV=path/to/pairs.csv
+COOCCURRENCE_PHI_TOP_K=60
+```
+
+`pairs.csv` columns: `true_label`, `confused_with` (merged with built-in default pairs).
 
 ---
 
-## Expected Feature Schema (after Phase 1)
+## Other LLM backends
 
-### Demographics (4)
-age_group, age_numeric, sex, fitzpatrick_skin_type
+| `LLM_PROVIDER` | Requirements |
+|----------------|--------------|
+| `gemini` | `GEMINI_API_KEY` in `.env` |
+| `openai` | `OPENAI_API_KEY` in `.env` (cloud OpenAI API) |
+| `qwen` | Local server at `QWEN_BASE_URL`; client uses `api_key="EMPTY"` |
 
-### Body Location (12)
-location_face, location_scalp, location_neck, location_trunk, location_arm,
-location_hand, location_leg, location_foot, location_genitalia, location_buttocks,
-location_mouth, location_widespread
-
-### Morphology — Texture (7)
-texture_raised, texture_flat, texture_rough_flaky, texture_fluid_filled,
-texture_ulcerated, texture_smooth, texture_scarring
-
-### Morphology — Colour (6)
-color_red, color_brown, color_white, color_yellow, color_black, color_blue_grey
-
-### Morphology — Distribution (6)
-distribution_unilateral, distribution_bilateral, distribution_dermatomal,
-distribution_grouped, distribution_linear, distribution_annular
-
-### Morphology — LLM (3)
-lesion_border, lesion_shape, lesion_size
-
-### Symptoms — Dermatological (7)
-symptom_itching, symptom_burning, symptom_pain, symptom_bleeding,
-symptom_increasing_size, symptom_darkening, symptom_nail_change, symptom_hair_loss
-
-### Symptoms — Systemic (6)
-symptom_fever, symptom_chills, symptom_fatigue, symptom_joint_pain,
-symptom_mouth_sores, symptom_shortness_of_breath
-
-### History / Context (7)
-onset_sudden, duration_bucket, diagnosis_confidence, lesion_count,
-recurrence, family_history, immunocompromised
-
-### Triggers / Associations (3)
-trigger_identified, trigger_type, associated_disease
-
-### Clinical Complexity (4)
-systemic_involvement, contagious_risk, chronic_vs_acute, treatment_mentioned
-
-**Total: ~65 features**
-**SCIN-comparable: ~21 features**
+Phase 1 only: set `OPENAI_JSON_RESPONSE=1` with `openai` to request JSON object mode (not used for Phase 2 array responses).
 
 ---
 
-## Interpreting the Derm-1M vs SCIN Gap
+## Environment variables (quick reference)
 
-| Gap Size | Interpretation | Action |
-|----------|---------------|--------|
-| > 30% avg gap | Derm-1M is significantly richer | Classifier relies on Derm-1M-specific features → need richer SCIN input or retrain on less-informative data |
-| 10–30% gap | Moderate informativeness difference | Add clinical questionnaire to supplement SCIN at inference |
-| < 10% gap | Datasets comparably rich | Model is overfitting → retrain with stronger regularisation |
+| Variable | Default | Used in |
+|----------|---------|---------|
+| `LLM_PROVIDER` | phase1: `gemini`, phase2: `openai` | phase1, phase2 |
+| `QWEN_BASE_URL` | `http://localhost:8000/v1` | phase1, phase2 (qwen) |
+| `QWEN_MODEL_NAME` | `Qwen/Qwen3.5-9B` | phase1, phase2 (qwen) |
+| `CAPTION_COLUMN` | `truncated_caption` | phase1, phase2 |
+| `DISCOVERY_SAMPLING_MODE` | `stratified` | phase1 (`full` = all captions) |
+| `LABEL_COL` | `label_name` | phase3 |
+| `CONFUSION_PAIRS_CSV` | (empty) | phase3b |
+| `COOCCURRENCE_PHI_TOP_K` | `60` (`0` = all features) | phase3b |
+
+---
+
+## Interpreting Derm-1M vs SCIN
+
+| Observation | Possible implication |
+|-------------|---------------------|
+| Large gap in `derm_vs_scin_comparison.csv` | Captions carry more structured cues than SCIN forms collect → external validation may lack those cues. |
+| High MI / Cramér’s V on features **not** in `SCIN_TO_CANONICAL` | Model may lean on signals that SCIN does not capture → questionnaire or retraining. |
+| Phase 3b low **signature reproducibility** on SCIN | Diagnostic co-patterns in Derm-1M are hard to reproduce from SCIN fields alone. |
+
+---
+
+## References
+
+- [Qwen3.5-9B on Hugging Face](https://huggingface.co/Qwen/Qwen3.5-9B) — serving examples (SGLang, vLLM), thinking vs non-thinking modes.

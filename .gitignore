@@ -3,3 +3,4 @@
 SCIN-dataset/
 *SCIN-dataset/
 *.json
+__pycache__/
