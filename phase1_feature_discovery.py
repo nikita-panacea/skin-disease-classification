@@ -30,6 +30,7 @@ Env (optional):
   QWEN_MAX_TOKENS          — desired max completion tokens (capped to fit QWEN_MAX_MODEL_LEN − prompt)
   QWEN_MAX_MODEL_LEN       — must match vLLM --max-model-len (default 8192); prompt+completion cannot exceed this
   QWEN_CONTEXT_BUFFER      — tokens reserved for chat template / special tokens (default 256)
+  QWEN_COMPACT_DISCOVERY_PROMPT — force short system prompt (1/true) or disable auto-compact (0/false)
   LLM_PARSE_DEBUG          — 1/true to print a snippet when JSON parsing fails
 """
 
@@ -38,6 +39,8 @@ import json
 import re
 import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -64,6 +67,7 @@ QWEN_MAX_TOKENS = int(os.getenv("QWEN_MAX_TOKENS", "8192"))
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
 QWEN_MAX_MODEL_LEN = int(os.getenv("QWEN_MAX_MODEL_LEN", "8192"))
 QWEN_CONTEXT_BUFFER = int(os.getenv("QWEN_CONTEXT_BUFFER", "256"))
+_qwen_noted_low_cap: bool = False
 
 # ── LLM Provider Selection ─────────────────────────────────────────────────
 # Options: "gemini", "openai", or "qwen"
@@ -101,17 +105,32 @@ _bs_env = os.getenv("DISCOVERY_BATCH_SIZE", "").strip()
 if _bs_env:
     BATCH_SIZE = max(1, int(_bs_env))
 elif LLM_PROVIDER == "qwen":
-    BATCH_SIZE = 10
+    # 8192 context + huge system prompt leaves little room for captions + JSON output
+    BATCH_SIZE = 4 if QWEN_MAX_MODEL_LEN <= 8192 else 10
 else:
     BATCH_SIZE = 25
 
 print(f"Using LLM Provider: {LLM_PROVIDER} with model: {DISCOVERY_MODEL}")
 if LLM_PROVIDER == "qwen":
     print(f"  Qwen base URL: {QWEN_BASE_URL}")
+    if not os.getenv("QWEN_MAX_MODEL_LEN", "").strip():
+        print(
+            "  WARNING: QWEN_MAX_MODEL_LEN not set — using default 8192. "
+            "Set QWEN_MAX_MODEL_LEN in .env to match vLLM --max-model-len (e.g. 16000), "
+            "or token caps / compact-prompt logic will be wrong."
+        )
     print(f"  Discovery batch size: {BATCH_SIZE} (set DISCOVERY_BATCH_SIZE to override)")
     print(
         f"  Qwen completion budget: up to {QWEN_MAX_TOKENS} tokens, "
         f"clamped to context {QWEN_MAX_MODEL_LEN} (set QWEN_MAX_MODEL_LEN=vLLM --max-model-len)"
+    )
+    _cp = os.getenv("QWEN_COMPACT_DISCOVERY_PROMPT", "").strip().lower()
+    _use_compact = _cp in ("1", "true", "yes") or (
+        _cp not in ("0", "false", "no") and QWEN_MAX_MODEL_LEN <= 8192
+    )
+    print(
+        f"  Discovery system prompt: {'COMPACT (for short context)' if _use_compact else 'FULL'} "
+        f"(QWEN_COMPACT_DISCOVERY_PROMPT / QWEN_MAX_MODEL_LEN)"
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -200,29 +219,71 @@ def _qwen_message_text(msg) -> str:
     return ""
 
 
-def _qwen_effective_max_tokens(prompt: str, system_prompt: str | None) -> int:
+def _vllm_count_prompt_tokens(messages: list) -> int | None:
+    """Use vLLM's /v1/messages/count_tokens for an accurate prompt length (if supported)."""
+    try:
+        base = QWEN_BASE_URL.rstrip("/")
+        url = f"{base}/messages/count_tokens"
+        payload = json.dumps({"model": DISCOVERY_MODEL, "messages": messages}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if "input_tokens" in data:
+            return int(data["input_tokens"])
+        if "total_tokens" in data:
+            return int(data["total_tokens"])
+        u = data.get("usage") or {}
+        if "prompt_tokens" in u:
+            return int(u["prompt_tokens"])
+        c = data.get("count")
+        if isinstance(c, int):
+            return c
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def _qwen_effective_max_tokens(messages: list) -> int:
     """
-    vLLM rejects requests when estimated_prompt_tokens + max_tokens > max_model_len.
-    Use a conservative chars→tokens estimate so we stay under the context window.
+    vLLM rejects when (prompt tokens) + max_tokens > max_model_len; it also validates using
+    rendered text length. Prefer server token count; else a pessimistic heuristic.
     """
-    sys_t = system_prompt or ""
-    char_len = len(sys_t) + len(prompt)
-    # ~3–4 chars/token for English; use /3 to be conservative (assume more prompt tokens).
-    est_prompt_tokens = int((char_len + 1200) / 3) + 200
-    est_prompt_tokens = max(256, est_prompt_tokens)
+    global _qwen_noted_low_cap
+    n = _vllm_count_prompt_tokens(messages)
+    if n is not None:
+        est_prompt_tokens = max(1, n)
+    else:
+        char_len = sum(len(str(m.get("content") or "")) for m in messages)
+        # Template + special tokens inflate vs raw message chars; mirror ~12k rendered from ~7k raw
+        blended = int(char_len * 1.65) + 2800
+        est_prompt_tokens = int(blended / 2.0) + 500
+        est_prompt_tokens = max(512, est_prompt_tokens)
     room = QWEN_MAX_MODEL_LEN - est_prompt_tokens - QWEN_CONTEXT_BUFFER
     if room < 64:
         raise ValueError(
             "Qwen/vLLM: this request does not fit the context window — "
             f"estimated ~{est_prompt_tokens} prompt tokens with "
             f"QWEN_MAX_MODEL_LEN={QWEN_MAX_MODEL_LEN} (must match vLLM --max-model-len). "
-            "Raise --max-model-len and QWEN_MAX_MODEL_LEN together, or lower DISCOVERY_BATCH_SIZE."
+            "Raise --max-model-len and QWEN_MAX_MODEL_LEN, lower DISCOVERY_BATCH_SIZE, "
+            "or rely on compact discovery prompt (auto when QWEN_MAX_MODEL_LEN<=8192)."
         )
     cap = min(QWEN_MAX_TOKENS, room)
+    if cap < 1536 and not _qwen_noted_low_cap:
+        _qwen_noted_low_cap = True
+        print(
+            f"    NOTE: Qwen output capped to ≤{cap} tokens this run (~{est_prompt_tokens} prompt tok / "
+            f"{QWEN_MAX_MODEL_LEN} context). For fewer truncations use --max-model-len 32768 or "
+            "DISCOVERY_BATCH_SIZE=2."
+        )
     if cap < 1024 and LLM_PARSE_DEBUG:
         print(
             f"    DEBUG Qwen completion cap={cap} (est. prompt ~{est_prompt_tokens} tok, "
-            f"context={QWEN_MAX_MODEL_LEN}). JSON may truncate; consider more context or smaller batches."
+            f"context={QWEN_MAX_MODEL_LEN})."
         )
     return cap
 
@@ -262,7 +323,7 @@ def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
 
-                max_out = _qwen_effective_max_tokens(prompt, system_prompt)
+                max_out = _qwen_effective_max_tokens(messages)
                 response = qwen_client.chat.completions.create(
                     model=DISCOVERY_MODEL,
                     messages=messages,
@@ -564,6 +625,43 @@ Return ONLY valid JSON — no markdown fences, no prose — in this structure:
 }
 """
 
+# Shorter instructions for Qwen + vLLM --max-model-len 8192 (leaves room for captions + JSON).
+DISCOVERY_COMPACT_SYSTEM_PROMPT = """You are a clinical NLP expert for dermatology. From the captions, extract ONLY features explicitly stated (no guessing).
+
+Scan: demographics (age, sex, FST/skin tone, ethnicity); morphology (texture, color, shape, border, size, distribution); body_location; dermatologic + systemic symptoms; duration/onset; triggers; treatments; clinical signs; history; lesion count/extent; secondary changes; severity; image metadata; other distinct terms.
+
+Rules: snake_case names; split compound findings; extraction_examples must quote caption phrases; merge duplicates.
+
+Return ONLY valid JSON (no markdown fences):
+{
+  "feature_categories": [
+    {
+      "name": "snake_case_feature_name",
+      "category": "demographics | morphology | body_location | symptoms | duration | triggers | treatments | clinical_signs | history | severity | image_metadata | other",
+      "description": "brief clinical description",
+      "example_values": ["value1", "value2"],
+      "is_binary": true or false,
+      "extraction_examples": ["phrase from caption"]
+    }
+  ]
+}
+"""
+
+
+def get_discovery_system_prompt() -> str:
+    """Full checklist for Gemini/OpenAI; compact default for local Qwen with short context."""
+    if LLM_PROVIDER != "qwen":
+        return DISCOVERY_SYSTEM_PROMPT
+    flag = os.getenv("QWEN_COMPACT_DISCOVERY_PROMPT", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return DISCOVERY_COMPACT_SYSTEM_PROMPT
+    if flag in ("0", "false", "no"):
+        return DISCOVERY_SYSTEM_PROMPT
+    if QWEN_MAX_MODEL_LEN <= 8192:
+        return DISCOVERY_COMPACT_SYSTEM_PROMPT
+    return DISCOVERY_SYSTEM_PROMPT
+
+
 def discover_features_batch(
     captions: list[str], label_name: str, retries: int = 3
 ) -> list[dict]:
@@ -576,7 +674,7 @@ def discover_features_batch(
 
     for attempt in range(retries):
         try:
-            text = call_llm(prompt, DISCOVERY_SYSTEM_PROMPT)
+            text = call_llm(prompt, get_discovery_system_prompt())
             parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
             if parsed is None:
                 print(f"    JSON parse error (attempt {attempt+1}), retrying...")

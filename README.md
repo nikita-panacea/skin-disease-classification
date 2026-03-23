@@ -101,14 +101,19 @@ CAPTION_COLUMN=truncated_caption
 # Phase 1: stratified = cheaper; full = every non-empty caption (very slow)
 DISCOVERY_SAMPLING_MODE=stratified
 
-# Must match vLLM --max-model-len (default here 8192). Phase 1 clamps completion tokens so
-# prompt + max_tokens never exceeds this (avoids HTTP 400 from vLLM).
-QWEN_MAX_MODEL_LEN=8192
+# Must match vLLM --max-model-len exactly (8192, 16000, 32768, …). Phase 1 clamps completion
+# tokens from this value (and picks compact vs full discovery prompt when ≤8192).
+QWEN_MAX_MODEL_LEN=16000
 ```
 
 You do **not** need `OPENAI_API_KEY` or `GEMINI_API_KEY` when `LLM_PROVIDER=qwen`.
 
 **If vLLM returns HTTP 400** about “input … and requested … output tokens”: your **prompt + `max_tokens` exceeded `--max-model-len`**. Either **raise** `--max-model-len` (e.g. `32768`) and set **`QWEN_MAX_MODEL_LEN`** to the same value, or **lower** `DISCOVERY_BATCH_SIZE` so each request is shorter.
+
+With **`--max-model-len 8192`**, Phase 1 automatically uses a **compact** discovery system prompt and **batch size 4** (override with `DISCOVERY_BATCH_SIZE`). It also calls vLLM **`/v1/messages/count_tokens`** when possible to set `max_tokens` safely. If JSON still hits `finish_reason=length`, increase context or set `DISCOVERY_BATCH_SIZE=2`.
+
+- **`QWEN_COMPACT_DISCOVERY_PROMPT=0`** — force the long checklist even on 8k context (may 400 or truncate).
+- **`QWEN_COMPACT_DISCOVERY_PROMPT=1`** — force compact prompt even with 32k context.
 
 Optional (same shell, if you prefer not to use `.env` for the base URL):
 
