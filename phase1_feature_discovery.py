@@ -787,6 +787,14 @@ def discover_features_batch(
     return []
 
 
+def _short_label_desc(label_name, max_len: int = 42) -> str:
+    """Truncate label_name for tqdm descriptions (one line, no newlines)."""
+    s = str(label_name).replace("\n", " ").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
 def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
     """
     Run per-label-name discovery across all sampled captions.
@@ -795,7 +803,11 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
     all_features: dict[str, dict] = {}
     label_names = sample_df["label_name"].unique()
 
-    for label_name in tqdm(label_names, desc="Discovering features per label"):
+    for label_name in tqdm(
+        label_names,
+        desc="Discovery (per label_name)",
+        unit="label",
+    ):
         label_captions = (
             sample_df[sample_df["label_name"] == label_name][CAPTION_COLUMN]
             .tolist()
@@ -806,6 +818,25 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
             label_captions, dup_skipped = unique_captions_preserve_order(
                 [str(x) for x in label_captions]
             )
+        else:
+            label_captions = [str(x) for x in label_captions]
+
+        uniq_n = len(label_captions)
+        if DISCOVERY_DEDUPE_CAPTIONS:
+            dup_part = (
+                f"; {dup_skipped:,} duplicate/empty row(s) not sent to LLM"
+                if dup_skipped
+                else ""
+            )
+            tqdm.write(
+                f"  [{label_name}] rows in sample: {raw_caption_n:,} → "
+                f"{uniq_n:,} unique caption(s) for extraction{dup_part}"
+            )
+        else:
+            tqdm.write(
+                f"  [{label_name}] rows in sample: {raw_caption_n:,} for extraction "
+                f"(DISCOVERY_DEDUPE_CAPTIONS off)"
+            )
 
         # Check for cached per-label discovery (separate cache per sampling mode)
         safe_name = re.sub(r'[^\w\-]', '_', str(label_name))[:60]
@@ -814,16 +845,21 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
         if cache_path.exists():
             with open(cache_path, "r", encoding="utf-8") as f:
                 label_features = json.load(f)
-            print(f"  [{label_name}] Loaded {len(label_features)} cached features")
+            tqdm.write(
+                f"  [{label_name}] loaded {len(label_features)} cached features (skipped LLM)"
+            )
         else:
-            if DISCOVERY_DEDUPE_CAPTIONS and dup_skipped > 0:
-                tqdm.write(
-                    f"  [{label_name}] {raw_caption_n:,} rows → {len(label_captions):,} unique captions "
-                    f"({dup_skipped:,} duplicates/empty skipped)"
-                )
             label_features = []
-            for start in range(0, len(label_captions), BATCH_SIZE):
-                batch = label_captions[start:start + BATCH_SIZE]
+            batch_starts = list(range(0, uniq_n, BATCH_SIZE))
+            inner_desc = f"Batches [{_short_label_desc(label_name)}]"
+            for start in tqdm(
+                batch_starts,
+                desc=inner_desc,
+                leave=False,
+                unit="batch",
+                total=len(batch_starts),
+            ):
+                batch = label_captions[start : start + BATCH_SIZE]
                 feats = discover_features_batch(batch, label_name)
                 label_features.extend(feats)
                 # Rate limiting — local qwen needs no delay, remote APIs do
@@ -838,11 +874,13 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(label_features, f, indent=2)
             src_note = (
-                f"{len(label_captions)} unique captions"
-                if DISCOVERY_DEDUPE_CAPTIONS and raw_caption_n != len(label_captions)
-                else f"{len(label_captions)} captions"
+                f"{uniq_n:,} unique captions"
+                if DISCOVERY_DEDUPE_CAPTIONS and raw_caption_n != uniq_n
+                else f"{uniq_n:,} captions"
             )
-            print(f"  [{label_name}] Discovered {len(label_features)} features from {src_note}")
+            tqdm.write(
+                f"  [{label_name}] discovered {len(label_features)} feature(s) from {src_note}"
+            )
 
         # Merge into global feature dict (deduplicate by name)
         for feat in label_features:
