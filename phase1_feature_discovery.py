@@ -34,6 +34,8 @@ Env (optional):
   QWEN_TEMPLATE_TOKEN_OVERHEAD — extra tokens assumed for chat template (default 800)
   QWEN_COMPACT_DISCOVERY_PROMPT — force short system prompt (1/true) or disable auto-compact (0/false)
   LLM_PARSE_DEBUG          — 1/true to print a snippet when JSON parsing fails
+  DISCOVERY_DEDUPE_CAPTIONS — 1/true (default): skip exact duplicate captions per label_name
+                             (after .strip()) so repeated sentences are not sent to the LLM twice
 """
 
 import pandas as pd
@@ -63,6 +65,12 @@ DISCOVERY_DIR.mkdir(exist_ok=True)
 
 CAPTION_COLUMN = os.getenv("CAPTION_COLUMN", "truncated_caption")
 DISCOVERY_SAMPLING_MODE = os.getenv("DISCOVERY_SAMPLING_MODE", "stratified").strip().lower()
+DISCOVERY_DEDUPE_CAPTIONS = os.getenv("DISCOVERY_DEDUPE_CAPTIONS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "").lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
@@ -447,6 +455,28 @@ def load_captions_df(csv_path: str, caption_col: str) -> pd.DataFrame:
     return df
 
 
+def unique_captions_preserve_order(captions: list[str]) -> tuple[list[str], int]:
+    """
+    Within one label_name, keep the first occurrence of each caption text.
+    Matching is by str.strip(); empty-after-strip strings are dropped.
+    Returns (unique_captions, n_skipped) where n_skipped counts duplicates + dropped empty.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    skipped = 0
+    for c in captions:
+        key = (c if isinstance(c, str) else str(c)).strip()
+        if not key:
+            skipped += 1
+            continue
+        if key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        out.append(key)
+    return out, skipped
+
+
 def apply_stratified_sampling(df: pd.DataFrame) -> pd.DataFrame:
     """
     Per-label_name stratified sample; within label, stratify by disease_label
@@ -499,10 +529,24 @@ def apply_sampling_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
         n = len(df)
         n_labels = df["label_name"].nunique()
         batches = 0
+        total_unique = 0
         for ln in df["label_name"].unique():
-            cnt = (df["label_name"] == ln).sum()
-            batches += (cnt + BATCH_SIZE - 1) // BATCH_SIZE
-        print(f"  FULL mode: {n:,} rows, {n_labels} label_names, ~{batches:,} LLM batches (all captions).")
+            caps = df.loc[df["label_name"] == ln, CAPTION_COLUMN].tolist()
+            if DISCOVERY_DEDUPE_CAPTIONS:
+                uniq, _ = unique_captions_preserve_order([str(x) for x in caps])
+                ucnt = len(uniq)
+            else:
+                ucnt = len(caps)
+            total_unique += ucnt
+            batches += (ucnt + BATCH_SIZE - 1) // BATCH_SIZE
+        dedupe_note = (
+            f" (~{total_unique:,} unique captions within labels; duplicates skipped)"
+            if DISCOVERY_DEDUPE_CAPTIONS
+            else " (all rows, including duplicate caption text)"
+        )
+        print(
+            f"  FULL mode: {n:,} rows, {n_labels} label_names, ~{batches:,} LLM batches{dedupe_note}."
+        )
         if n > 50_000:
             print(
                 "  WARNING: Full-caption discovery is very expensive vs stratified. "
@@ -756,6 +800,12 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
             sample_df[sample_df["label_name"] == label_name][CAPTION_COLUMN]
             .tolist()
         )
+        raw_caption_n = len(label_captions)
+        dup_skipped = 0
+        if DISCOVERY_DEDUPE_CAPTIONS:
+            label_captions, dup_skipped = unique_captions_preserve_order(
+                [str(x) for x in label_captions]
+            )
 
         # Check for cached per-label discovery (separate cache per sampling mode)
         safe_name = re.sub(r'[^\w\-]', '_', str(label_name))[:60]
@@ -766,6 +816,11 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
                 label_features = json.load(f)
             print(f"  [{label_name}] Loaded {len(label_features)} cached features")
         else:
+            if DISCOVERY_DEDUPE_CAPTIONS and dup_skipped > 0:
+                tqdm.write(
+                    f"  [{label_name}] {raw_caption_n:,} rows → {len(label_captions):,} unique captions "
+                    f"({dup_skipped:,} duplicates/empty skipped)"
+                )
             label_features = []
             for start in range(0, len(label_captions), BATCH_SIZE):
                 batch = label_captions[start:start + BATCH_SIZE]
@@ -782,8 +837,12 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
             # Cache per-label results
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(label_features, f, indent=2)
-            print(f"  [{label_name}] Discovered {len(label_features)} features "
-                  f"from {len(label_captions)} captions")
+            src_note = (
+                f"{len(label_captions)} unique captions"
+                if DISCOVERY_DEDUPE_CAPTIONS and raw_caption_n != len(label_captions)
+                else f"{len(label_captions)} captions"
+            )
+            print(f"  [{label_name}] Discovered {len(label_features)} features from {src_note}")
 
         # Merge into global feature dict (deduplicate by name)
         for feat in label_features:
@@ -979,7 +1038,8 @@ if __name__ == "__main__":
     print("STEP 1: Loading and sampling captions...\n")
     print(
         f"  DISCOVERY_SAMPLING_MODE={DISCOVERY_SAMPLING_MODE!r}, "
-        f"CAPTION_COLUMN={CAPTION_COLUMN!r}\n"
+        f"CAPTION_COLUMN={CAPTION_COLUMN!r}, "
+        f"DISCOVERY_DEDUPE_CAPTIONS={'on' if DISCOVERY_DEDUPE_CAPTIONS else 'off'}\n"
     )
     sample_df = load_and_sample(CSV_PATH, CAPTION_COLUMN, DISCOVERY_SAMPLING_MODE)
 

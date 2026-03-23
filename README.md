@@ -226,6 +226,7 @@ Phase 1 only: set `OPENAI_JSON_RESPONSE=1` with `openai` to request JSON object 
 | `QWEN_TEMPLATE_TOKEN_OVERHEAD` | `800` | phase1 (qwen, heuristic if `/tokenize` fails) |
 | `CAPTION_COLUMN` | `truncated_caption` | phase1, phase2 |
 | `DISCOVERY_SAMPLING_MODE` | `stratified` | phase1 (`full` = all captions) |
+| `DISCOVERY_DEDUPE_CAPTIONS` | `1` (on) | phase1: skip duplicate caption text per `label_name` (after strip) |
 | `LABEL_COL` | `label_name` | phase3 |
 | `CONFUSION_PAIRS_CSV` | (empty) | phase3b |
 | `COOCCURRENCE_PHI_TOP_K` | `60` (`0` = all features) | phase3b |
