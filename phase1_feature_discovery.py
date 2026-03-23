@@ -27,7 +27,7 @@ Env (optional):
   DISCOVERY_SAMPLING_MODE  — stratified | full
   OPENAI_JSON_RESPONSE     — 1/true to use response_format json_object for OpenAI (discovery/consolidation)
   DISCOVERY_BATCH_SIZE     — captions per LLM batch (default 25; default 10 when LLM_PROVIDER=qwen for 8k context)
-  QWEN_MAX_TOKENS          — desired max completion tokens (capped to fit QWEN_MAX_MODEL_LEN − prompt)
+  QWEN_MAX_TOKENS          — max completion tokens (default scales with QWEN_MAX_MODEL_LEN if unset)
   QWEN_MAX_MODEL_LEN       — must match vLLM --max-model-len (default 8192); prompt+completion cannot exceed this
   QWEN_CONTEXT_BUFFER      — tokens reserved for chat template / special tokens (default 256)
   QWEN_CHARS_PER_TOKEN     — heuristic divisor when vLLM /tokenize fails (default 2.75)
@@ -65,9 +65,14 @@ CAPTION_COLUMN = os.getenv("CAPTION_COLUMN", "truncated_caption")
 DISCOVERY_SAMPLING_MODE = os.getenv("DISCOVERY_SAMPLING_MODE", "stratified").strip().lower()
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "").lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
-QWEN_MAX_TOKENS = int(os.getenv("QWEN_MAX_TOKENS", "8192"))
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
 QWEN_MAX_MODEL_LEN = int(os.getenv("QWEN_MAX_MODEL_LEN", "8192"))
+# Full discovery JSON often needs >8k completion tokens when context allows; cap still clamped per-request.
+_qwen_mt_env = os.getenv("QWEN_MAX_TOKENS", "").strip()
+if _qwen_mt_env:
+    QWEN_MAX_TOKENS = int(_qwen_mt_env)
+else:
+    QWEN_MAX_TOKENS = min(16384, max(8192, QWEN_MAX_MODEL_LEN // 2))
 QWEN_CONTEXT_BUFFER = int(os.getenv("QWEN_CONTEXT_BUFFER", "256"))
 # Heuristic when /tokenize is unavailable (chars per token ~2.5–3 for English + medical terms)
 QWEN_CHARS_PER_TOKEN = float(os.getenv("QWEN_CHARS_PER_TOKEN", "2.75"))

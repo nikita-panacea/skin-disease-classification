@@ -221,6 +221,7 @@ Phase 1 only: set `OPENAI_JSON_RESPONSE=1` with `openai` to request JSON object 
 | `QWEN_BASE_URL` | `http://localhost:8000/v1` | phase1, phase2 (qwen) |
 | `QWEN_MODEL_NAME` | `Qwen/Qwen3.5-9B` | phase1, phase2 (qwen) |
 | `QWEN_MAX_MODEL_LEN` | `8192` (set to match vLLM `--max-model-len`) | phase1 (qwen) |
+| `QWEN_MAX_TOKENS` | if unset: `min(16384, max(8192, QWEN_MAX_MODEL_LEN/2))` | phase1 (qwen) — raise if JSON still truncates |
 | `QWEN_CHARS_PER_TOKEN` | `2.75` | phase1 (qwen, heuristic if `/tokenize` fails) |
 | `QWEN_TEMPLATE_TOKEN_OVERHEAD` | `800` | phase1 (qwen, heuristic if `/tokenize` fails) |
 | `CAPTION_COLUMN` | `truncated_caption` | phase1, phase2 |
