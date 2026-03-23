@@ -27,7 +27,9 @@ Env (optional):
   DISCOVERY_SAMPLING_MODE  — stratified | full
   OPENAI_JSON_RESPONSE     — 1/true to use response_format json_object for OpenAI (discovery/consolidation)
   DISCOVERY_BATCH_SIZE     — captions per LLM batch (default 25; default 10 when LLM_PROVIDER=qwen for 8k context)
-  QWEN_MAX_TOKENS          — max completion tokens for Qwen (default 8192; raise if JSON is truncated)
+  QWEN_MAX_TOKENS          — desired max completion tokens (capped to fit QWEN_MAX_MODEL_LEN − prompt)
+  QWEN_MAX_MODEL_LEN       — must match vLLM --max-model-len (default 8192); prompt+completion cannot exceed this
+  QWEN_CONTEXT_BUFFER      — tokens reserved for chat template / special tokens (default 256)
   LLM_PARSE_DEBUG          — 1/true to print a snippet when JSON parsing fails
 """
 
@@ -59,6 +61,9 @@ DISCOVERY_SAMPLING_MODE = os.getenv("DISCOVERY_SAMPLING_MODE", "stratified").str
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "").lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
 QWEN_MAX_TOKENS = int(os.getenv("QWEN_MAX_TOKENS", "8192"))
+# Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
+QWEN_MAX_MODEL_LEN = int(os.getenv("QWEN_MAX_MODEL_LEN", "8192"))
+QWEN_CONTEXT_BUFFER = int(os.getenv("QWEN_CONTEXT_BUFFER", "256"))
 
 # ── LLM Provider Selection ─────────────────────────────────────────────────
 # Options: "gemini", "openai", or "qwen"
@@ -104,7 +109,10 @@ print(f"Using LLM Provider: {LLM_PROVIDER} with model: {DISCOVERY_MODEL}")
 if LLM_PROVIDER == "qwen":
     print(f"  Qwen base URL: {QWEN_BASE_URL}")
     print(f"  Discovery batch size: {BATCH_SIZE} (set DISCOVERY_BATCH_SIZE to override)")
-    print(f"  Qwen max_tokens: {QWEN_MAX_TOKENS} (set QWEN_MAX_TOKENS if JSON truncates)")
+    print(
+        f"  Qwen completion budget: up to {QWEN_MAX_TOKENS} tokens, "
+        f"clamped to context {QWEN_MAX_MODEL_LEN} (set QWEN_MAX_MODEL_LEN=vLLM --max-model-len)"
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LLM API Wrapper Functions
@@ -192,6 +200,33 @@ def _qwen_message_text(msg) -> str:
     return ""
 
 
+def _qwen_effective_max_tokens(prompt: str, system_prompt: str | None) -> int:
+    """
+    vLLM rejects requests when estimated_prompt_tokens + max_tokens > max_model_len.
+    Use a conservative chars→tokens estimate so we stay under the context window.
+    """
+    sys_t = system_prompt or ""
+    char_len = len(sys_t) + len(prompt)
+    # ~3–4 chars/token for English; use /3 to be conservative (assume more prompt tokens).
+    est_prompt_tokens = int((char_len + 1200) / 3) + 200
+    est_prompt_tokens = max(256, est_prompt_tokens)
+    room = QWEN_MAX_MODEL_LEN - est_prompt_tokens - QWEN_CONTEXT_BUFFER
+    if room < 64:
+        raise ValueError(
+            "Qwen/vLLM: this request does not fit the context window — "
+            f"estimated ~{est_prompt_tokens} prompt tokens with "
+            f"QWEN_MAX_MODEL_LEN={QWEN_MAX_MODEL_LEN} (must match vLLM --max-model-len). "
+            "Raise --max-model-len and QWEN_MAX_MODEL_LEN together, or lower DISCOVERY_BATCH_SIZE."
+        )
+    cap = min(QWEN_MAX_TOKENS, room)
+    if cap < 1024 and LLM_PARSE_DEBUG:
+        print(
+            f"    DEBUG Qwen completion cap={cap} (est. prompt ~{est_prompt_tokens} tok, "
+            f"context={QWEN_MAX_MODEL_LEN}). JSON may truncate; consider more context or smaller batches."
+        )
+    return cap
+
+
 def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
     """
     Generic LLM caller that works with Gemini, OpenAI, and Qwen (local).
@@ -227,10 +262,11 @@ def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
 
+                max_out = _qwen_effective_max_tokens(prompt, system_prompt)
                 response = qwen_client.chat.completions.create(
                     model=DISCOVERY_MODEL,
                     messages=messages,
-                    max_tokens=QWEN_MAX_TOKENS,
+                    max_tokens=max_out,
                     temperature=0.2,
                     top_p=0.9,
                     extra_body={
@@ -245,6 +281,11 @@ def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
                     )
                 return _qwen_message_text(choice.message)
         
+        except ValueError as e:
+            if "Qwen/vLLM" in str(e):
+                raise
+            print(f"    API error (attempt {attempt+1}): {str(e)[:120]}")
+            time.sleep(2 ** attempt)
         except Exception as e:
             print(f"    API error (attempt {attempt+1}): {str(e)[:120]}")
             if "429" in str(e) or "rate limit" in str(e).lower():
