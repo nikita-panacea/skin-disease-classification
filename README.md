@@ -51,27 +51,35 @@ Qwen is **not** called with a cloud API key here. You run an **OpenAI-compatible
 
 ### Step 1 — Start the local inference server
 
-**Example (SGLang)** — adjust GPU count and flags per your setup and the model card:
+**Example (SGLang)** — adjust GPU count and flags per your setup and the model card.
+
+For **this pipeline** (short captions + JSON), you do **not** need 262k context. A **smaller context** uses far less KV-cache GPU memory and starts more reliably:
 
 ```bash
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-9B \
   --port 8000 \
   --tp-size 1 \
-  --mem-fraction-static 0.8 \
-  --context-length 262144 \
+  --mem-fraction-static 0.85 \
+  --context-length 32768 \
   --reasoning-parser qwen3
 ```
 
-**Example (vLLM)** (see Qwen docs for exact flags):
+**Example (vLLM)** — **prefer a moderate `--max-model-len`** (e.g. `8192`–`32768`). Values like `262144` often leave almost **no KV cache** on a single consumer GPU and can trigger failures during CUDA-graph capture on Qwen3.5’s hybrid layers.
+
+**Recommended first try** (caption / JSON extraction):
 
 ```bash
 vllm serve Qwen/Qwen3.5-9B \
   --port 8000 \
   --tensor-parallel-size 1 \
-  --max-model-len 262144 \
-  --reasoning-parser qwen3
+  --max-model-len 32768 \
+  --reasoning-parser qwen3 \
+  --enforce-eager
 ```
+
+- Drop `--language-model-only` unless you are sure you need it; if you use it and still crash, retry **without** it.
+- If startup still fails, try `--max-model-len 8192` or add `--gpu-memory-utilization 0.92`.
 
 Leave this process running. Check that `http://localhost:8000/v1` responds (e.g. health or a minimal chat request).
 
@@ -216,6 +224,43 @@ Phase 1 only: set `OPENAI_JSON_RESPONSE=1` with `openai` to request JSON object 
 | Large gap in `derm_vs_scin_comparison.csv` | Captions carry more structured cues than SCIN forms collect → external validation may lack those cues. |
 | High MI / Cramér’s V on features **not** in `SCIN_TO_CANONICAL` | Model may lean on signals that SCIN does not capture → questionnaire or retraining. |
 | Phase 3b low **signature reproducibility** on SCIN | Diagnostic co-patterns in Derm-1M are hard to reproduce from SCIN fields alone. |
+
+---
+
+## Troubleshooting: vLLM, GPU, and Python env
+
+### `pip install vllm` → protobuf / `google-ai-generativelanguage` conflicts
+
+vLLM often pulls **`protobuf` 6.x**, while **`google-generativeai`** (Gemini) expects **`protobuf` &lt; 6**. Pip warns but both may break at runtime.
+
+**Fix:** use **two environments** (recommended):
+
+- **Env A (`Derm-serve` or similar):** only what you need to run **vLLM** + `openai` client → serve Qwen.
+- **Env B (`Derm-pipeline`):** `pip install -r requirements.txt` for **phase1–3** (Gemini/OpenAI/cloud) **without** installing vLLM on the same env.
+
+If everything runs on one machine: run vLLM in env A, run `python phase1_feature_discovery.py` in env B with `LLM_PROVIDER=qwen` and `QWEN_BASE_URL=http://localhost:8000/v1` (no vLLM import required in the pipeline).
+
+### vLLM crashes after loading weights: `AssertionError` in `causal_conv1d` / `num_cache_lines >= batch`
+
+Typical pattern in the log:
+
+- **“Available KV cache memory: ~2–3 GiB”** and **“Maximum concurrency for 262144 tokens … 0.33x”**
+- Failure during **“Capturing CUDA graphs”**
+
+**Cause:** **`--max-model-len 262144`** reserves a huge KV budget; on one GPU there is little room left, and vLLM’s graph capture for **Qwen3.5** (GDN / linear-attention paths) can hit an internal assert.
+
+**Fix (try in order):**
+
+1. **Lower context** (enough for captions + JSON):  
+   `--max-model-len 32768` or `8192`.
+2. Add **`--enforce-eager`** (disables CUDA graphs; slower but stable).
+3. Remove **`--language-model-only`** if you added it; retry.
+4. Upgrade/downgrade vLLM to match [Qwen’s vLLM recipe](https://huggingface.co/Qwen/Qwen3.5-9B) or try **SGLang** instead.
+5. As a last resort, set **`VLLM_USE_V1=0`** to force the legacy engine (if your vLLM build supports it).
+
+### Pipeline note
+
+Phase 1/2 use **small** `max_tokens` (e.g. 4096) and **short** prompts; the server only needs a **modest** `max_model_len`, not the model’s theoretical maximum.
 
 ---
 

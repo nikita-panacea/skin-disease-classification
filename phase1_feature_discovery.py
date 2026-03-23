@@ -26,6 +26,9 @@ Env (optional):
   CAPTION_COLUMN           — default truncated_caption (matches cleaned_caption_Derm1M.csv)
   DISCOVERY_SAMPLING_MODE  — stratified | full
   OPENAI_JSON_RESPONSE     — 1/true to use response_format json_object for OpenAI (discovery/consolidation)
+  DISCOVERY_BATCH_SIZE     — captions per LLM batch (default 25; default 10 when LLM_PROVIDER=qwen for 8k context)
+  QWEN_MAX_TOKENS          — max completion tokens for Qwen (default 8192; raise if JSON is truncated)
+  LLM_PARSE_DEBUG          — 1/true to print a snippet when JSON parsing fails
 """
 
 import pandas as pd
@@ -51,11 +54,11 @@ SCHEMA_OUT      = "feature_schema.json"
 DISCOVERY_DIR   = Path("discovery_outputs")
 DISCOVERY_DIR.mkdir(exist_ok=True)
 
-BATCH_SIZE      = 25                    # captions per LLM call
-
 CAPTION_COLUMN = os.getenv("CAPTION_COLUMN", "truncated_caption")
 DISCOVERY_SAMPLING_MODE = os.getenv("DISCOVERY_SAMPLING_MODE", "stratified").strip().lower()
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "").lower() in ("1", "true", "yes")
+LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
+QWEN_MAX_TOKENS = int(os.getenv("QWEN_MAX_TOKENS", "8192"))
 
 # ── LLM Provider Selection ─────────────────────────────────────────────────
 # Options: "gemini", "openai", or "qwen"
@@ -88,13 +91,106 @@ elif LLM_PROVIDER == "qwen":
 else:
     raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}. Use 'gemini', 'openai', or 'qwen'")
 
+# Captions per LLM call — smaller batches for local Qwen + short max_model_len reduce truncated JSON
+_bs_env = os.getenv("DISCOVERY_BATCH_SIZE", "").strip()
+if _bs_env:
+    BATCH_SIZE = max(1, int(_bs_env))
+elif LLM_PROVIDER == "qwen":
+    BATCH_SIZE = 10
+else:
+    BATCH_SIZE = 25
+
 print(f"Using LLM Provider: {LLM_PROVIDER} with model: {DISCOVERY_MODEL}")
 if LLM_PROVIDER == "qwen":
     print(f"  Qwen base URL: {QWEN_BASE_URL}")
+    print(f"  Discovery batch size: {BATCH_SIZE} (set DISCOVERY_BATCH_SIZE to override)")
+    print(f"  Qwen max_tokens: {QWEN_MAX_TOKENS} (set QWEN_MAX_TOKENS if JSON truncates)")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LLM API Wrapper Functions
 # ──────────────────────────────────────────────────────────────────────────────
+
+def strip_qwen_thinking(text: str) -> str:
+    """
+    Remove Qwen3-style thinking segments so JSON can be parsed.
+    Handles raw model output and edge cases when vLLM does not fully strip reasoning.
+    """
+    if not text:
+        return text
+    t = text.strip()
+    # Qwen3 templates use XML-style delimiters (avoid raw <think> in source for editors)
+    _open = "\u003cthink\u003e"
+    _close = "\u003c/think\u003e"
+    t = re.sub(
+        re.escape(_open) + r"[\s\S]*?" + re.escape(_close),
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    # Optional backticks around closing tag
+    t = re.sub(
+        "`" + re.escape(_close) + "`",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    for marker in ("`" + _close + "`", _close):
+        if marker in t:
+            t = t[t.rfind(marker) + len(marker) :].strip()
+    return t
+
+
+def normalize_llm_json_text(text: str) -> str:
+    """Strip fences and thinking wrappers before JSON parsing."""
+    if not text:
+        return ""
+    t = str(text).strip()
+    t = re.sub(r"```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"```\s*", "", t).strip()
+    t = strip_qwen_thinking(t)
+    return t.strip()
+
+
+def parse_llm_json(text: str, *, debug: bool = False) -> dict | list | None:
+    """
+    Parse JSON from an LLM reply: full document, or first object/array via raw_decode
+    (handles leading/trailing prose and partially fenced output).
+    """
+    t = normalize_llm_json_text(text)
+    if not t:
+        return None
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    dec = json.JSONDecoder()
+    for opener in ("{", "["):
+        idx = t.find(opener)
+        if idx < 0:
+            continue
+        try:
+            obj, _end = dec.raw_decode(t, idx)
+            return obj
+        except json.JSONDecodeError:
+            continue
+    if debug:
+        head = t[:600].replace("\n", " ")
+        tail = t[-200:].replace("\n", " ") if len(t) > 200 else ""
+        print(f"    DEBUG unparseable JSON. head={head!r} ... tail={tail!r}")
+    return None
+
+
+def _qwen_message_text(msg) -> str:
+    """Extract assistant text from OpenAI-compatible chat message (vLLM / Qwen)."""
+    raw = (getattr(msg, "content", None) or "").strip()
+    if raw:
+        return raw
+    for attr in ("reasoning_content",):
+        v = getattr(msg, attr, None)
+        if v and str(v).strip():
+            return str(v).strip()
+    return ""
+
 
 def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
     """
@@ -134,16 +230,20 @@ def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
                 response = qwen_client.chat.completions.create(
                     model=DISCOVERY_MODEL,
                     messages=messages,
-                    max_tokens=4096,
-                    temperature=0.7,
-                    top_p=0.8,
-                    presence_penalty=1.5,
+                    max_tokens=QWEN_MAX_TOKENS,
+                    temperature=0.2,
+                    top_p=0.9,
                     extra_body={
-                        "top_k": 20,
                         "chat_template_kwargs": {"enable_thinking": False},
                     },
                 )
-                return response.choices[0].message.content
+                choice = response.choices[0]
+                if getattr(choice, "finish_reason", None) == "length":
+                    print(
+                        "    WARNING: Qwen completion hit max_tokens (JSON may be truncated). "
+                        "Lower DISCOVERY_BATCH_SIZE or raise QWEN_MAX_TOKENS / vLLM --max-model-len."
+                    )
+                return _qwen_message_text(choice.message)
         
         except Exception as e:
             print(f"    API error (attempt {attempt+1}): {str(e)[:120]}")
@@ -436,10 +536,11 @@ def discover_features_batch(
     for attempt in range(retries):
         try:
             text = call_llm(prompt, DISCOVERY_SYSTEM_PROMPT)
-            text = text.strip()
-            # Strip any accidental markdown fences
-            text = re.sub(r"```json\s*|```\s*", "", text).strip()
-            parsed = json.loads(text)
+            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+            if parsed is None:
+                print(f"    JSON parse error (attempt {attempt+1}), retrying...")
+                time.sleep(2 ** attempt)
+                continue
             if isinstance(parsed, dict):
                 return parsed.get("feature_categories", [])
             elif isinstance(parsed, list):
@@ -586,12 +687,14 @@ def consolidate_schema(
     for attempt in range(3):
         try:
             text = call_llm(prompt, CONSOLIDATION_SYSTEM_PROMPT)
-            text = text.strip()
-            text = re.sub(r"```json\s*|```\s*", "", text).strip()
-            parsed = json.loads(text)
+            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+            if parsed is None:
+                print(f"  Consolidation JSON parse error (attempt {attempt+1}), retrying...")
+                time.sleep(3)
+                continue
             if isinstance(parsed, list):
                 parsed = {"feature_categories": parsed}
-            if "feature_categories" in parsed:
+            if isinstance(parsed, dict) and "feature_categories" in parsed:
                 print(f"  Consolidated to {len(parsed['feature_categories'])} features")
                 return parsed
         except json.JSONDecodeError:
