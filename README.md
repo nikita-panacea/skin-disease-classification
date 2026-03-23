@@ -110,7 +110,7 @@ You do **not** need `OPENAI_API_KEY` or `GEMINI_API_KEY` when `LLM_PROVIDER=qwen
 
 **If vLLM returns HTTP 400** about “input … and requested … output tokens”: your **prompt + `max_tokens` exceeded `--max-model-len`**. Either **raise** `--max-model-len` (e.g. `32768`) and set **`QWEN_MAX_MODEL_LEN`** to the same value, or **lower** `DISCOVERY_BATCH_SIZE` so each request is shorter.
 
-With **`--max-model-len 8192`**, Phase 1 automatically uses a **compact** discovery system prompt and **batch size 4** (override with `DISCOVERY_BATCH_SIZE`). It also calls vLLM **`/v1/messages/count_tokens`** when possible to set `max_tokens` safely. If JSON still hits `finish_reason=length`, increase context or set `DISCOVERY_BATCH_SIZE=2`.
+With **`--max-model-len 8192`**, Phase 1 automatically uses a **compact** discovery system prompt and **batch size 4** (override with `DISCOVERY_BATCH_SIZE`). For Qwen/vLLM it estimates prompt length via **`POST …/tokenize`** on the server root (derived from `QWEN_BASE_URL`, e.g. `http://localhost:8000/tokenize`) so `max_tokens` stays under `--max-model-len`. If `/tokenize` is unavailable, it falls back to **`QWEN_CHARS_PER_TOKEN`** (default `2.75`) and **`QWEN_TEMPLATE_TOKEN_OVERHEAD`** (default `800`). If JSON still hits `finish_reason=length`, increase context, lower `DISCOVERY_BATCH_SIZE`, or tune those two env vars.
 
 - **`QWEN_COMPACT_DISCOVERY_PROMPT=0`** — force the long checklist even on 8k context (may 400 or truncate).
 - **`QWEN_COMPACT_DISCOVERY_PROMPT=1`** — force compact prompt even with 32k context.
@@ -220,6 +220,9 @@ Phase 1 only: set `OPENAI_JSON_RESPONSE=1` with `openai` to request JSON object 
 | `LLM_PROVIDER` | phase1: `gemini`, phase2: `openai` | phase1, phase2 |
 | `QWEN_BASE_URL` | `http://localhost:8000/v1` | phase1, phase2 (qwen) |
 | `QWEN_MODEL_NAME` | `Qwen/Qwen3.5-9B` | phase1, phase2 (qwen) |
+| `QWEN_MAX_MODEL_LEN` | `8192` (set to match vLLM `--max-model-len`) | phase1 (qwen) |
+| `QWEN_CHARS_PER_TOKEN` | `2.75` | phase1 (qwen, heuristic if `/tokenize` fails) |
+| `QWEN_TEMPLATE_TOKEN_OVERHEAD` | `800` | phase1 (qwen, heuristic if `/tokenize` fails) |
 | `CAPTION_COLUMN` | `truncated_caption` | phase1, phase2 |
 | `DISCOVERY_SAMPLING_MODE` | `stratified` | phase1 (`full` = all captions) |
 | `LABEL_COL` | `label_name` | phase3 |

@@ -30,6 +30,8 @@ Env (optional):
   QWEN_MAX_TOKENS          — desired max completion tokens (capped to fit QWEN_MAX_MODEL_LEN − prompt)
   QWEN_MAX_MODEL_LEN       — must match vLLM --max-model-len (default 8192); prompt+completion cannot exceed this
   QWEN_CONTEXT_BUFFER      — tokens reserved for chat template / special tokens (default 256)
+  QWEN_CHARS_PER_TOKEN     — heuristic divisor when vLLM /tokenize fails (default 2.75)
+  QWEN_TEMPLATE_TOKEN_OVERHEAD — extra tokens assumed for chat template (default 800)
   QWEN_COMPACT_DISCOVERY_PROMPT — force short system prompt (1/true) or disable auto-compact (0/false)
   LLM_PARSE_DEBUG          — 1/true to print a snippet when JSON parsing fails
 """
@@ -67,7 +69,11 @@ QWEN_MAX_TOKENS = int(os.getenv("QWEN_MAX_TOKENS", "8192"))
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
 QWEN_MAX_MODEL_LEN = int(os.getenv("QWEN_MAX_MODEL_LEN", "8192"))
 QWEN_CONTEXT_BUFFER = int(os.getenv("QWEN_CONTEXT_BUFFER", "256"))
+# Heuristic when /tokenize is unavailable (chars per token ~2.5–3 for English + medical terms)
+QWEN_CHARS_PER_TOKEN = float(os.getenv("QWEN_CHARS_PER_TOKEN", "2.75"))
+QWEN_TEMPLATE_TOKEN_OVERHEAD = int(os.getenv("QWEN_TEMPLATE_TOKEN_OVERHEAD", "800"))
 _qwen_noted_low_cap: bool = False
+_vllm_tokenize_warned: bool = False
 
 # ── LLM Provider Selection ─────────────────────────────────────────────────
 # Options: "gemini", "openai", or "qwen"
@@ -219,50 +225,87 @@ def _qwen_message_text(msg) -> str:
     return ""
 
 
-def _vllm_count_prompt_tokens(messages: list) -> int | None:
-    """Use vLLM's /v1/messages/count_tokens for an accurate prompt length (if supported)."""
-    try:
-        base = QWEN_BASE_URL.rstrip("/")
-        url = f"{base}/messages/count_tokens"
-        payload = json.dumps({"model": DISCOVERY_MODEL, "messages": messages}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        if "input_tokens" in data:
-            return int(data["input_tokens"])
-        if "total_tokens" in data:
-            return int(data["total_tokens"])
-        u = data.get("usage") or {}
-        if "prompt_tokens" in u:
-            return int(u["prompt_tokens"])
-        c = data.get("count")
-        if isinstance(c, int):
-            return c
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError, TypeError, KeyError):
-        pass
+def _vllm_server_root() -> str:
+    """http://host:8000/v1 -> http://host:8000 (for /tokenize on vLLM)."""
+    u = QWEN_BASE_URL.strip().rstrip("/")
+    if u.lower().endswith("/v1"):
+        return u[:-3].rstrip("/")
+    return u
+
+
+def _messages_to_counting_prompt(messages: list) -> str:
+    """Flatten chat messages for /tokenize (approximates pre-template size; we add overhead below)."""
+    parts = []
+    for m in messages:
+        role = str(m.get("role", ""))
+        c = str(m.get("content") or "")
+        parts.append(f"## {role}\n{c}")
+    return "\n\n".join(parts)
+
+
+def _vllm_tokenize_count_text(prompt: str) -> int | None:
+    """
+    vLLM exposes POST /tokenize (server root, not always under /v1).
+    OpenAI-style /v1/messages/count_tokens often expects Anthropic payloads → 400; avoid it.
+    """
+    root = _vllm_server_root()
+    bodies = (
+        {"prompt": prompt},
+        {"prompt": prompt, "model": DISCOVERY_MODEL},
+        {"text": prompt},
+    )
+    for path in ("/tokenize", "/v1/tokenize"):
+        url = f"{root}{path}"
+        for body in bodies:
+            try:
+                payload = json.dumps(body).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                cnt = data.get("count")
+                if isinstance(cnt, int) and cnt > 0:
+                    return int(cnt * 1.10) + 128
+                toks = data.get("tokens")
+                if toks is None:
+                    toks = data.get("token_ids")
+                if isinstance(toks, list) and toks:
+                    # Apply_chat_template adds special tokens vs raw concat
+                    return int(len(toks) * 1.10) + 128
+            except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError, TypeError, KeyError, OSError):
+                continue
     return None
+
+
+def _vllm_count_prompt_tokens(messages: list) -> int | None:
+    flat = _messages_to_counting_prompt(messages)
+    return _vllm_tokenize_count_text(flat)
 
 
 def _qwen_effective_max_tokens(messages: list) -> int:
     """
     vLLM rejects when (prompt tokens) + max_tokens > max_model_len; it also validates using
-    rendered text length. Prefer server token count; else a pessimistic heuristic.
+    rendered text length. Prefer POST /tokenize; else a moderate chars→tokens heuristic.
     """
-    global _qwen_noted_low_cap
+    global _qwen_noted_low_cap, _vllm_tokenize_warned
     n = _vllm_count_prompt_tokens(messages)
     if n is not None:
         est_prompt_tokens = max(1, n)
     else:
+        if not _vllm_tokenize_warned:
+            _vllm_tokenize_warned = True
+            print(
+                "    NOTE: vLLM /tokenize unavailable; using QWEN_CHARS_PER_TOKEN heuristic "
+                f"({QWEN_CHARS_PER_TOKEN} chars/tok + {QWEN_TEMPLATE_TOKEN_OVERHEAD} template overhead). "
+                "If JSON still truncates, tune those env vars or check vLLM /tokenize path."
+            )
         char_len = sum(len(str(m.get("content") or "")) for m in messages)
-        # Template + special tokens inflate vs raw message chars; mirror ~12k rendered from ~7k raw
-        blended = int(char_len * 1.65) + 2800
-        est_prompt_tokens = int(blended / 2.0) + 500
-        est_prompt_tokens = max(512, est_prompt_tokens)
+        est_prompt_tokens = int(char_len / QWEN_CHARS_PER_TOKEN) + QWEN_TEMPLATE_TOKEN_OVERHEAD
+        est_prompt_tokens = max(256, est_prompt_tokens)
     room = QWEN_MAX_MODEL_LEN - est_prompt_tokens - QWEN_CONTEXT_BUFFER
     if room < 64:
         raise ValueError(
