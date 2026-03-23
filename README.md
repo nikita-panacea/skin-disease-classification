@@ -16,6 +16,7 @@ End-to-end pipeline: discover a clinical feature schema from captions, extract *
 |------|------|
 | `cleaned_caption_Derm1M.csv` | Input: `truncated_caption`, `label_name`, `disease_label`, … |
 | `scin_feature_map.py` | Shared SCIN ↔ canonical feature names |
+| `openai_batch_utils.py` | Shared OpenAI Batch JSONL chunking (50k lines + 200 MB file cap) |
 | `phase1_feature_discovery.py` | Build `feature_schema.json` (sampled or full captions) |
 | `phase2_bulk_extraction.py` | LLM extraction → `derm1m_features.csv` + `checkpoints/` |
 | `phase3_analysis.py` | Coverage, SCIN gap, MI + χ² + Cramér’s V, classwise OR, EDA |
@@ -211,6 +212,12 @@ COOCCURRENCE_PHI_TOP_K=60
 
 Phase 1 only: set `OPENAI_JSON_RESPONSE=1` with `openai` to request JSON object mode (not used for Phase 2 array responses).
 
+**Phase 1 OpenAI cost / throughput**
+
+- **`OPENAI_USE_BATCH=1`**: discovery calls are submitted via the [Batch API](https://developers.openai.com/api/docs/guides/batch) (~**50% lower** token pricing vs synchronous chat completions for eligible models, separate rate limits, completion within **24h**).
+- **Prompt caching** ([guide](https://developers.openai.com/api/docs/guides/prompt-caching)): discovery uses a **fixed system message first** and **variable user message last**; caching engages from **~1024+ identical prompt tokens**. Stable `OPENAI_PROMPT_CACHE_KEY` / `OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY` help routing for shared long prefixes. Optional `OPENAI_PROMPT_CACHE_RETENTION=in_memory|24h` (**24h** only on models OpenAI lists for extended retention).
+- **Batch input files** ([Batch API](https://developers.openai.com/api/docs/guides/batch)): jobs are split so each upload stays under **50,000 lines** and **`OPENAI_BATCH_MAX_FILE_BYTES`** (default ~195 MiB, under the **200 MB** file cap).
+
 ---
 
 ## Environment variables (quick reference)
@@ -218,6 +225,16 @@ Phase 1 only: set `OPENAI_JSON_RESPONSE=1` with `openai` to request JSON object 
 | Variable | Default | Used in |
 |----------|---------|---------|
 | `LLM_PROVIDER` | phase1: `gemini`, phase2: `openai` | phase1, phase2 |
+| `OPENAI_MODEL_NAME` | `gpt-4o-mini` | phase1 (`openai`) |
+| `OPENAI_USE_BATCH` | (off) | phase1 discovery + phase2 extraction when `1` (Batch API) |
+| `OPENAI_PROMPT_CACHE_KEY` | phase1: `phase1_discovery_v1`; phase2: `phase2_extraction_v1` | sync + batch bodies (set one env; phase2 overrides default in code) |
+| `OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY` | `phase1_consolidation_v1` | phase1 consolidation call |
+| `OPENAI_PROMPT_CACHE_RETENTION` | (unset) | optional: `in_memory` or `24h` if supported |
+| `OPENAI_BATCH_POLL_SEC` | `20` | phase1 / phase2 batch status poll interval |
+| `OPENAI_BATCH_MAX_REQUESTS` | `50000` | max requests per batch file (API max); jobs above this are split into multiple batches |
+| `OPENAI_BATCH_MAX_FILE_BYTES` | `204472320` (~195 MiB) | max UTF-8 size per batch `.jsonl` (API max 200 MB); split earlier if needed |
+| `OPENAI_LOG_USAGE` | (off) | log prompt/cached/completion tokens when useful |
+| `LLM_BATCH_SIZE` | `25` | phase2 captions per API / batch line |
 | `QWEN_BASE_URL` | `http://localhost:8000/v1` | phase1, phase2 (qwen) |
 | `QWEN_MODEL_NAME` | `Qwen/Qwen3.5-9B` | phase1, phase2 (qwen) |
 | `QWEN_MAX_MODEL_LEN` | `8192` (set to match vLLM `--max-model-len`) | phase1 (qwen) |

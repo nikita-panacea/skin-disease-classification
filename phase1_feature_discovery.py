@@ -36,6 +36,19 @@ Env (optional):
   LLM_PARSE_DEBUG          — 1/true to print a snippet when JSON parsing fails
   DISCOVERY_DEDUPE_CAPTIONS — 1/true (default): skip exact duplicate captions per label_name
                              (after .strip()) so repeated sentences are not sent to the LLM twice
+  OPENAI_USE_BATCH         — 1/true: run discovery via Batch API (~50% lower $, async, ≤24h window)
+  OPENAI_PROMPT_CACHE_KEY  — stable key so identical system-prefix requests share prompt cache (discovery)
+  OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY — same for consolidation call
+  OPENAI_PROMPT_CACHE_RETENTION — optional: in_memory | 24h (if model supports extended cache)
+  OPENAI_BATCH_POLL_SEC    — seconds between batch status polls (default 20)
+  OPENAI_BATCH_MAX_REQUESTS — max lines per batch JSONL (default 50000, API cap 50k; larger jobs split into multiple batches)
+  OPENAI_BATCH_MAX_FILE_BYTES — max UTF-8 bytes per batch JSONL (default ~195 MiB; API cap 200 MB per file)
+  OPENAI_LOG_USAGE         — 1/true: print prompt/cached/output token stats when available
+
+Prompt caching (OpenAI): static system message first, variable user message last; caching applies from
+  ~1024+ identical prompt tokens (see https://developers.openai.com/api/docs/guides/prompt-caching ).
+  Use OPENAI_PROMPT_CACHE_KEY consistently; OPENAI_PROMPT_CACHE_RETENTION=in_memory|24h (24h only on
+  models that support extended retention per OpenAI docs).
 """
 
 import pandas as pd
@@ -50,6 +63,12 @@ from collections import defaultdict
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from openai_batch_utils import (
+    chunk_jobs_for_openai_batch,
+    openai_batch_max_file_bytes,
+    openai_batches_create_safe,
+    write_openai_batch_jsonl,
+)
 from scin_feature_map import SCIN_SCHEMA_FEATURES
 
 # ── Load API keys from .env ───────────────────────────────────────────────────
@@ -72,6 +91,16 @@ DISCOVERY_DEDUPE_CAPTIONS = os.getenv("DISCOVERY_DEDUPE_CAPTIONS", "1").strip().
     "off",
 )
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "").lower() in ("1", "true", "yes")
+OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
+OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase1_discovery_v1").strip()
+OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY = os.getenv(
+    "OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY", "phase1_consolidation_v1"
+).strip()
+OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
+OPENAI_BATCH_POLL_SEC = max(5, int(os.getenv("OPENAI_BATCH_POLL_SEC", "20")))
+# OpenAI Batch: max 50,000 requests per batch file (https://developers.openai.com/api/docs/guides/batch)
+OPENAI_BATCH_MAX_REQUESTS = max(1, min(50_000, int(os.getenv("OPENAI_BATCH_MAX_REQUESTS", "50000"))))
+OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
 QWEN_MAX_MODEL_LEN = int(os.getenv("QWEN_MAX_MODEL_LEN", "8192"))
@@ -101,18 +130,23 @@ if LLM_PROVIDER == "gemini":
     if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
         raise ValueError("Set GEMINI_API_KEY in your .env file for Gemini provider")
     import google.generativeai as genai
+
+    openai_client = None
     genai.configure(api_key=GEMINI_API_KEY)
     DISCOVERY_MODEL = "gemini-2.5-flash-lite"
     model = genai.GenerativeModel(DISCOVERY_MODEL)
 elif LLM_PROVIDER == "openai":
     if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
         raise ValueError("Set OPENAI_API_KEY in your .env file for OpenAI provider")
-    import openai
-    openai.api_key = OPENAI_API_KEY
-    DISCOVERY_MODEL = "gpt-4o-mini"
+    from openai import OpenAI
+
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    DISCOVERY_MODEL = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini").strip() or "gpt-4o-mini"
     model = None
 elif LLM_PROVIDER == "qwen":
     from openai import OpenAI as QwenClient
+
+    openai_client = None
     qwen_client = QwenClient(base_url=QWEN_BASE_URL, api_key="EMPTY")
     DISCOVERY_MODEL = QWEN_MODEL_NAME
     model = None
@@ -151,6 +185,32 @@ if LLM_PROVIDER == "qwen":
         f"  Discovery system prompt: {'COMPACT (for short context)' if _use_compact else 'FULL'} "
         f"(QWEN_COMPACT_DISCOVERY_PROMPT / QWEN_MAX_MODEL_LEN)"
     )
+elif LLM_PROVIDER == "openai":
+    print(f"  Discovery batch size: {BATCH_SIZE} (set DISCOVERY_BATCH_SIZE to override)")
+    if OPENAI_USE_BATCH:
+        print(
+            "  OpenAI discovery: Batch API (~50% lower token cost vs sync; async, typically within 24h). "
+            "See https://developers.openai.com/api/docs/guides/batch"
+        )
+        print(
+            f"  Batch file limits: ≤{OPENAI_BATCH_MAX_REQUESTS:,} requests/file, "
+            f"≤{openai_batch_max_file_bytes() / (1024 * 1024):.0f} MiB UTF-8/file"
+        )
+    else:
+        print(
+            "  OpenAI discovery: synchronous Chat Completions "
+            "(set OPENAI_USE_BATCH=1 for Batch API + discount)"
+        )
+    if OPENAI_PROMPT_CACHE_KEY:
+        print(
+            f"  Prompt caching: discovery key={OPENAI_PROMPT_CACHE_KEY!r} "
+            f"(static system prompt first → cache-friendly; "
+            "https://developers.openai.com/api/docs/guides/prompt-caching )"
+        )
+    if OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY:
+        print(f"  Prompt caching: consolidation key={OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY!r}")
+    if OPENAI_PROMPT_CACHE_RETENTION in ("in_memory", "24h"):
+        print(f"  prompt_cache_retention={OPENAI_PROMPT_CACHE_RETENTION!r}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LLM API Wrapper Functions
@@ -344,7 +404,249 @@ def _qwen_effective_max_tokens(messages: list) -> int:
     return cap
 
 
-def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
+def _openai_apply_prompt_caching(create_kw: dict, cache_key: str) -> None:
+    """
+    Attach prompt_cache_key / prompt_cache_retention for OpenAI Prompt Caching.
+    See https://developers.openai.com/api/docs/guides/prompt-caching
+    (prefix match from start of messages; optional key improves routing for shared long prefixes).
+    """
+    if cache_key:
+        create_kw["prompt_cache_key"] = cache_key
+    if OPENAI_PROMPT_CACHE_RETENTION in ("in_memory", "24h"):
+        create_kw["prompt_cache_retention"] = OPENAI_PROMPT_CACHE_RETENTION
+
+
+def _openai_discovery_chat_body(user_prompt: str) -> dict:
+    """
+    Chat Completions body for discovery. Static system message first, variable user last
+    so repeated discovery calls share a cacheable prefix (see OpenAI prompt caching guide).
+    """
+    system_text = get_discovery_system_prompt()
+    messages = [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_prompt},
+    ]
+    body: dict = {
+        "model": DISCOVERY_MODEL,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": 4096,
+        "stream": False,
+    }
+    if OPENAI_JSON_RESPONSE:
+        body["response_format"] = {"type": "json_object"}
+    _openai_apply_prompt_caching(body, OPENAI_PROMPT_CACHE_KEY)
+    return body
+
+
+def _maybe_log_openai_chat_usage(resp, context: str = "") -> None:
+    if not OPENAI_LOG_USAGE and not LLM_PARSE_DEBUG:
+        return
+    u = getattr(resp, "usage", None)
+    if not u:
+        return
+    pt = int(getattr(u, "prompt_tokens", None) or 0)
+    ct = int(getattr(u, "completion_tokens", None) or 0)
+    details = getattr(u, "prompt_tokens_details", None)
+    cached = 0
+    if details is not None:
+        cached = int(getattr(details, "cached_tokens", None) or 0)
+    extra = f" ({context})" if context else ""
+    print(
+        f"    OpenAI usage{extra}: prompt={pt} (cached={cached}, "
+        f"non_cached≈{max(0, pt - cached)}) completion={ct}"
+    )
+
+
+def _openai_parse_batch_output_jsonl(raw: str) -> tuple[dict[str, str], dict[str, int]]:
+    """Parse Batch output file: custom_id -> assistant text; accumulate token usage."""
+    acc = {"prompt": 0, "completion": 0, "cached": 0}
+    out: dict[str, str] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cid = obj.get("custom_id")
+        err = obj.get("error")
+        if err:
+            tqdm.write(f"    Batch item {cid!r} error: {err}")
+            continue
+        resp = obj.get("response") or {}
+        if resp.get("status_code") != 200:
+            tqdm.write(
+                f"    Batch item {cid!r} HTTP {resp.get('status_code')}: "
+                f"{str(resp.get('body'))[:200]}"
+            )
+            continue
+        body = resp.get("body")
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(body, dict):
+            continue
+        usage = body.get("usage") or {}
+        acc["prompt"] += int(usage.get("prompt_tokens", 0))
+        acc["completion"] += int(usage.get("completion_tokens", 0))
+        details = usage.get("prompt_tokens_details") or {}
+        acc["cached"] += int(details.get("cached_tokens", 0))
+        choices = body.get("choices") or []
+        if not choices:
+            continue
+        msg = (choices[0].get("message") or {})
+        content = msg.get("content") or ""
+        if cid:
+            out[cid] = content
+    return out, acc
+
+
+def _openai_download_batch_file_text(file_id: str | None) -> str:
+    if not file_id:
+        return ""
+    file_resp = openai_client.files.content(file_id)
+    return file_resp.text if hasattr(file_resp, "text") else file_resp.read().decode("utf-8")
+
+
+def _openai_log_batch_error_file_summary(error_file_id: str | None) -> None:
+    """Batch API writes failed/expired per-request lines to error_file_id (separate from output)."""
+    raw = _openai_download_batch_file_text(error_file_id)
+    if not raw.strip():
+        return
+    n = sum(1 for line in raw.splitlines() if line.strip())
+    tqdm.write(
+        f"  Batch error_file: {n} line(s). Those custom_ids have no successful output line; "
+        "pipeline uses sync fallback where needed."
+    )
+
+
+def _estimate_openai_discovery_cost_usd(acc: dict[str, int], *, batch_api: bool) -> float:
+    """
+    Rough cost in USD for gpt-4o-mini list pricing:
+      input $0.15/M, cached input $0.075/M, output $0.60/M
+    Batch API: 50% discount on those rates (see OpenAI Batch guide).
+    """
+    pin, pcached, pout = 0.15, 0.075, 0.60
+    if batch_api:
+        pin, pcached, pout = pin * 0.5, pcached * 0.5, pout * 0.5
+    non_cached = max(0, acc["prompt"] - acc["cached"])
+    incost = (non_cached / 1e6) * pin + (acc["cached"] / 1e6) * pcached
+    outcost = (acc["completion"] / 1e6) * pout
+    return incost + outcost
+
+
+def _run_openai_discovery_batch_chunk(
+    jobs: list[dict], chunk_idx: int
+) -> tuple[dict[str, str], dict[str, int], str]:
+    """
+    One Batch API job (≤ OPENAI_BATCH_MAX_REQUESTS lines). Returns (mapping, usage_acc, batch_id).
+    Matches https://developers.openai.com/api/docs/guides/batch (jsonl → upload → create → poll → files.content).
+    """
+    input_path = DISCOVERY_DIR / f"openai_batch_discovery_input_{chunk_idx}.jsonl"
+    nbytes = write_openai_batch_jsonl(input_path, jobs)
+
+    tqdm.write(
+        f"  Uploading OpenAI batch chunk {chunk_idx}: {len(jobs):,} jobs, "
+        f"{nbytes / (1024 * 1024):.2f} MiB → {input_path.name}"
+    )
+    with open(input_path, "rb") as fp:
+        uploaded = openai_client.files.create(file=fp, purpose="batch")
+
+    batch_job = openai_batches_create_safe(
+        openai_client,
+        input_file_id=uploaded.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+        metadata={"phase": "phase1_discovery", "chunk": str(chunk_idx)},
+    )
+    tqdm.write(
+        f"  batch_id={batch_job.id}  polling every {OPENAI_BATCH_POLL_SEC}s "
+        f"(≤24h completion window per OpenAI Batch API)."
+    )
+
+    terminal = {"completed", "failed", "expired", "cancelled"}
+    while batch_job.status not in terminal:
+        time.sleep(OPENAI_BATCH_POLL_SEC)
+        batch_job = openai_client.batches.retrieve(batch_job.id)
+        rc = batch_job.request_counts
+        tqdm.write(
+            f"    status={batch_job.status}  completed={rc.completed}/{rc.total}  failed={rc.failed}"
+        )
+
+    # Allow partial results when window expired (completed requests still in output_file).
+    if batch_job.status == "expired" and batch_job.output_file_id:
+        tqdm.write(
+            "  NOTE: Batch status=expired — reading partial output_file (per Batch API expiration rules)."
+        )
+    elif batch_job.status != "completed":
+        raise RuntimeError(
+            f"OpenAI batch ended with status={batch_job.status!r}. "
+            f"Inspect batch in dashboard; error_file_id may list per-request failures."
+        )
+    if not batch_job.output_file_id:
+        raise RuntimeError(
+            f"No output_file_id for batch status={batch_job.status!r} — nothing to parse."
+        )
+
+    raw_text = _openai_download_batch_file_text(batch_job.output_file_id)
+    err_id = getattr(batch_job, "error_file_id", None)
+    _openai_log_batch_error_file_summary(err_id)
+
+    mapping, acc = _openai_parse_batch_output_jsonl(raw_text)
+    return mapping, acc, batch_job.id
+
+
+def _run_openai_discovery_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
+    """
+    jobs: [{"custom_id": str, "body": dict}, ...]
+    Splits at OPENAI_BATCH_MAX_REQUESTS (API max 50k lines per file).
+    """
+    if not jobs:
+        return {}, {"prompt": 0, "completion": 0, "cached": 0}
+
+    max_r = OPENAI_BATCH_MAX_REQUESTS
+    file_cap = openai_batch_max_file_bytes()
+    chunks = chunk_jobs_for_openai_batch(
+        jobs, max_requests=max_r, max_file_bytes=file_cap
+    )
+    n_chunks = len(chunks)
+    combined: dict[str, str] = {}
+    acc_total = {"prompt": 0, "completion": 0, "cached": 0}
+
+    if n_chunks > 1:
+        tqdm.write(
+            f"  Splitting {len(jobs):,} requests into {n_chunks} batch file(s) "
+            f"(≤{max_r:,} lines each, ≤{file_cap / (1024 * 1024):.0f} MiB UTF-8 per file per Batch API)."
+        )
+
+    for ci, chunk in enumerate(chunks):
+        m, a, _bid = _run_openai_discovery_batch_chunk(chunk, ci)
+        combined.update(m)
+        for k in acc_total:
+            acc_total[k] += a[k]
+
+    tqdm.write(
+        f"  Batch token totals (all chunks): prompt={acc_total['prompt']:,}, "
+        f"cached_prompt={acc_total['cached']:,}, completion={acc_total['completion']:,}"
+    )
+    est = _estimate_openai_discovery_cost_usd(acc_total, batch_api=True)
+    tqdm.write(
+        f"  Approx. discovery cost (Batch API 50% tier, gpt-4o-mini list rates): ${est:.2f} USD"
+    )
+    return combined, acc_total
+
+
+def call_llm(
+    prompt: str,
+    system_prompt: str = None,
+    retries: int = 3,
+    *,
+    openai_prompt_cache_key: str | None = None,
+) -> str:
     """
     Generic LLM caller that works with Gemini, OpenAI, and Qwen (local).
     Returns the text response.
@@ -361,16 +663,24 @@ def call_llm(prompt: str, system_prompt: str = None, retries: int = 3) -> str:
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
-                
+
                 create_kw = dict(
                     model=DISCOVERY_MODEL,
                     messages=messages,
                     temperature=0.1,
                     max_tokens=4096,
+                    stream=False,
                 )
                 if OPENAI_JSON_RESPONSE:
                     create_kw["response_format"] = {"type": "json_object"}
-                response = openai.chat.completions.create(**create_kw)
+                ck = (
+                    openai_prompt_cache_key
+                    if openai_prompt_cache_key is not None
+                    else OPENAI_PROMPT_CACHE_KEY
+                )
+                _openai_apply_prompt_caching(create_kw, ck)
+                response = openai_client.chat.completions.create(**create_kw)
+                _maybe_log_openai_chat_usage(response)
                 return response.choices[0].message.content
 
             elif LLM_PROVIDER == "qwen":
@@ -754,19 +1064,36 @@ def get_discovery_system_prompt() -> str:
     return DISCOVERY_SYSTEM_PROMPT
 
 
-def discover_features_batch(
-    captions: list[str], label_name: str, retries: int = 3
-) -> list[dict]:
-    """Send a batch of captions to LLM and extract feature categories."""
+def build_discovery_user_prompt(captions: list[str], label_name: str) -> str:
+    """User message (variable part) for discovery — keep separate from static system prompt for caching."""
     numbered = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(captions))
-    prompt = (
+    return (
         f"Extract all feature categories from these {len(captions)} dermatology captions "
         f"for the disease category '{label_name}':\n\n{numbered}"
     )
 
+
+def features_from_discovery_response_text(text: str) -> list[dict]:
+    """Parse discovery JSON into feature dicts (empty list if unparseable)."""
+    parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+    if parsed is None:
+        return []
+    if isinstance(parsed, dict):
+        return list(parsed.get("feature_categories") or [])
+    if isinstance(parsed, list):
+        return parsed
+    return []
+
+
+def discover_features_batch(
+    captions: list[str], label_name: str, retries: int = 3
+) -> list[dict]:
+    """Send a batch of captions to LLM and extract feature categories."""
+    user_prompt = build_discovery_user_prompt(captions, label_name)
+
     for attempt in range(retries):
         try:
-            text = call_llm(prompt, get_discovery_system_prompt())
+            text = call_llm(user_prompt, get_discovery_system_prompt())
             parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
             if parsed is None:
                 print(f"    JSON parse error (attempt {attempt+1}), retrying...")
@@ -795,11 +1122,152 @@ def _short_label_desc(label_name, max_len: int = 42) -> str:
     return s[: max_len - 3] + "..."
 
 
-def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
+def _merge_raw_label_features_into_global(
+    all_features: dict[str, dict], label_features: list, label_name
+) -> None:
+    """Merge one label's discovery list into the global feature dict (by snake_case name)."""
+    for feat in label_features:
+        name = feat.get("name", "").lower().strip().replace(" ", "_")
+        if not name:
+            continue
+        if name not in all_features:
+            all_features[name] = feat
+            all_features[name]["found_in_labels"] = [label_name]
+        else:
+            existing_ex = set(all_features[name].get("example_values", []))
+            new_ex = set(feat.get("example_values", []))
+            all_features[name]["example_values"] = list(existing_ex | new_ex)[:10]
+            existing_extr = set(all_features[name].get("extraction_examples", []))
+            new_extr = set(feat.get("extraction_examples", []))
+            all_features[name]["extraction_examples"] = list(existing_extr | new_extr)[:5]
+            if label_name not in all_features[name].get("found_in_labels", []):
+                all_features[name]["found_in_labels"].append(label_name)
+
+
+def _prepare_label_captions_block(sample_df: pd.DataFrame, label_name) -> tuple[list[str], int, int]:
+    """Return (deduped caption list, raw_row_count, dup_skipped)."""
+    label_captions = (
+        sample_df[sample_df["label_name"] == label_name][CAPTION_COLUMN].tolist()
+    )
+    raw_caption_n = len(label_captions)
+    dup_skipped = 0
+    if DISCOVERY_DEDUPE_CAPTIONS:
+        label_captions, dup_skipped = unique_captions_preserve_order(
+            [str(x) for x in label_captions]
+        )
+    else:
+        label_captions = [str(x) for x in label_captions]
+    return label_captions, raw_caption_n, dup_skipped
+
+
+def _log_label_caption_counts(label_name, raw_caption_n: int, uniq_n: int, dup_skipped: int) -> None:
+    if DISCOVERY_DEDUPE_CAPTIONS:
+        dup_part = (
+            f"; {dup_skipped:,} duplicate/empty row(s) not sent to LLM" if dup_skipped else ""
+        )
+        tqdm.write(
+            f"  [{label_name}] rows in sample: {raw_caption_n:,} → "
+            f"{uniq_n:,} unique caption(s) for extraction{dup_part}"
+        )
+    else:
+        tqdm.write(
+            f"  [{label_name}] rows in sample: {raw_caption_n:,} for extraction "
+            f"(DISCOVERY_DEDUPE_CAPTIONS off)"
+        )
+
+
+def _discover_all_features_openai_batch(sample_df: pd.DataFrame) -> dict[str, dict]:
     """
-    Run per-label-name discovery across all sampled captions.
-    Returns a dict of {feature_name: feature_dict}.
+    OpenAI-only: enqueue all discovery chat completions on the Batch API, then assemble results.
+    Per-label disk cache is respected; only missing labels are batched.
     """
+    all_features: dict[str, dict] = {}
+    label_names = sample_df["label_name"].unique()
+    jobs: list[dict] = []
+    job_meta: dict[str, dict] = {}
+    job_seq = 0
+
+    for label_name in tqdm(label_names, desc="Discovery (per label_name)", unit="label"):
+        label_captions, raw_caption_n, dup_skipped = _prepare_label_captions_block(
+            sample_df, label_name
+        )
+        uniq_n = len(label_captions)
+        _log_label_caption_counts(label_name, raw_caption_n, uniq_n, dup_skipped)
+
+        safe_name = re.sub(r"[^\w\-]", "_", str(label_name))[:60]
+        cache_path = DISCOVERY_DIR / f"discovery_{safe_name}_{DISCOVERY_SAMPLING_MODE}.json"
+
+        if cache_path.exists():
+            with open(cache_path, "r", encoding="utf-8") as f:
+                label_features = json.load(f)
+            tqdm.write(
+                f"  [{label_name}] loaded {len(label_features)} cached features (skipped LLM)"
+            )
+            _merge_raw_label_features_into_global(all_features, label_features, label_name)
+            continue
+
+        for start in range(0, uniq_n, BATCH_SIZE):
+            batch = label_captions[start : start + BATCH_SIZE]
+            cid = f"job_{job_seq}"
+            job_seq += 1
+            user_prompt = build_discovery_user_prompt(batch, label_name)
+            jobs.append({"custom_id": cid, "body": _openai_discovery_chat_body(user_prompt)})
+            job_meta[cid] = {
+                "label_name": label_name,
+                "batch_start": start,
+                "captions": batch,
+                "cache_path": cache_path,
+                "uniq_n": uniq_n,
+                "raw_caption_n": raw_caption_n,
+            }
+
+    if not jobs:
+        tqdm.write("  No OpenAI batch jobs (all labels had disk cache).")
+        return all_features
+
+    mapping, _acc = _run_openai_discovery_batch(jobs)
+
+    by_label: dict = defaultdict(list)
+    for cid, meta in job_meta.items():
+        by_label[meta["label_name"]].append((meta["batch_start"], cid, meta))
+
+    for label_name in label_names:
+        if label_name not in by_label:
+            continue
+        entries = sorted(by_label[label_name], key=lambda x: x[0])
+        meta0 = entries[0][2]
+        cache_path = meta0["cache_path"]
+        uniq_n = meta0["uniq_n"]
+        raw_caption_n = meta0["raw_caption_n"]
+        label_features: list = []
+        for _start, cid, meta in entries:
+            text = mapping.get(cid) or ""
+            feats = features_from_discovery_response_text(text)
+            if not feats:
+                tqdm.write(
+                    f"    Batch parse/sync fallback: {meta['label_name']!r} "
+                    f"batch @ {meta['batch_start']}"
+                )
+                feats = discover_features_batch(meta["captions"], meta["label_name"])
+            label_features.extend(feats)
+
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(label_features, f, indent=2)
+        src_note = (
+            f"{uniq_n:,} unique captions"
+            if DISCOVERY_DEDUPE_CAPTIONS and raw_caption_n != uniq_n
+            else f"{uniq_n:,} captions"
+        )
+        tqdm.write(
+            f"  [{label_name}] discovered {len(label_features)} feature(s) from {src_note} (batch)"
+        )
+        _merge_raw_label_features_into_global(all_features, label_features, label_name)
+
+    return all_features
+
+
+def _discover_all_features_sequential(sample_df: pd.DataFrame) -> dict[str, dict]:
+    """Gemini / Qwen / OpenAI sync: one chat completion per caption batch."""
     all_features: dict[str, dict] = {}
     label_names = sample_df["label_name"].unique()
 
@@ -808,38 +1276,13 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
         desc="Discovery (per label_name)",
         unit="label",
     ):
-        label_captions = (
-            sample_df[sample_df["label_name"] == label_name][CAPTION_COLUMN]
-            .tolist()
+        label_captions, raw_caption_n, dup_skipped = _prepare_label_captions_block(
+            sample_df, label_name
         )
-        raw_caption_n = len(label_captions)
-        dup_skipped = 0
-        if DISCOVERY_DEDUPE_CAPTIONS:
-            label_captions, dup_skipped = unique_captions_preserve_order(
-                [str(x) for x in label_captions]
-            )
-        else:
-            label_captions = [str(x) for x in label_captions]
-
         uniq_n = len(label_captions)
-        if DISCOVERY_DEDUPE_CAPTIONS:
-            dup_part = (
-                f"; {dup_skipped:,} duplicate/empty row(s) not sent to LLM"
-                if dup_skipped
-                else ""
-            )
-            tqdm.write(
-                f"  [{label_name}] rows in sample: {raw_caption_n:,} → "
-                f"{uniq_n:,} unique caption(s) for extraction{dup_part}"
-            )
-        else:
-            tqdm.write(
-                f"  [{label_name}] rows in sample: {raw_caption_n:,} for extraction "
-                f"(DISCOVERY_DEDUPE_CAPTIONS off)"
-            )
+        _log_label_caption_counts(label_name, raw_caption_n, uniq_n, dup_skipped)
 
-        # Check for cached per-label discovery (separate cache per sampling mode)
-        safe_name = re.sub(r'[^\w\-]', '_', str(label_name))[:60]
+        safe_name = re.sub(r"[^\w\-]", "_", str(label_name))[:60]
         cache_path = DISCOVERY_DIR / f"discovery_{safe_name}_{DISCOVERY_SAMPLING_MODE}.json"
 
         if cache_path.exists():
@@ -862,7 +1305,6 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
                 batch = label_captions[start : start + BATCH_SIZE]
                 feats = discover_features_batch(batch, label_name)
                 label_features.extend(feats)
-                # Rate limiting — local qwen needs no delay, remote APIs do
                 if LLM_PROVIDER == "qwen":
                     time.sleep(0.1)
                 elif LLM_PROVIDER == "openai":
@@ -870,7 +1312,6 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
                 else:
                     time.sleep(1)
 
-            # Cache per-label results
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(label_features, f, indent=2)
             src_note = (
@@ -882,26 +1323,19 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
                 f"  [{label_name}] discovered {len(label_features)} feature(s) from {src_note}"
             )
 
-        # Merge into global feature dict (deduplicate by name)
-        for feat in label_features:
-            name = feat.get("name", "").lower().strip().replace(" ", "_")
-            if not name:
-                continue
-            if name not in all_features:
-                all_features[name] = feat
-                all_features[name]["found_in_labels"] = [label_name]
-            else:
-                # Merge example values and track which labels have this feature
-                existing_ex = set(all_features[name].get("example_values", []))
-                new_ex = set(feat.get("example_values", []))
-                all_features[name]["example_values"] = list(existing_ex | new_ex)[:10]
-                existing_extr = set(all_features[name].get("extraction_examples", []))
-                new_extr = set(feat.get("extraction_examples", []))
-                all_features[name]["extraction_examples"] = list(existing_extr | new_extr)[:5]
-                if label_name not in all_features[name].get("found_in_labels", []):
-                    all_features[name]["found_in_labels"].append(label_name)
+        _merge_raw_label_features_into_global(all_features, label_features, label_name)
 
     return all_features
+
+
+def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
+    """
+    Run per-label-name discovery across all sampled captions.
+    Returns a dict of {feature_name: feature_dict}.
+    """
+    if LLM_PROVIDER == "openai" and OPENAI_USE_BATCH:
+        return _discover_all_features_openai_batch(sample_df)
+    return _discover_all_features_sequential(sample_df)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -970,7 +1404,11 @@ def consolidate_schema(
 
     for attempt in range(3):
         try:
-            text = call_llm(prompt, CONSOLIDATION_SYSTEM_PROMPT)
+            text = call_llm(
+                prompt,
+                CONSOLIDATION_SYSTEM_PROMPT,
+                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY,
+            )
             parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
             if parsed is None:
                 print(f"  Consolidation JSON parse error (attempt {attempt+1}), retrying...")
@@ -1144,6 +1582,8 @@ if __name__ == "__main__":
         "n_llm_only": n_llm_only,
         "model_used": DISCOVERY_MODEL,
         "llm_provider": LLM_PROVIDER,
+        "openai_use_batch": bool(LLM_PROVIDER == "openai" and OPENAI_USE_BATCH),
+        "openai_prompt_cache_key": OPENAI_PROMPT_CACHE_KEY if LLM_PROVIDER == "openai" else "",
     }
 
     with open(SCHEMA_OUT, "w", encoding="utf-8") as fp:
