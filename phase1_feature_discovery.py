@@ -50,6 +50,7 @@ Env (optional):
   OPENAI_CONSOLIDATION_CHUNK_SIZE — raw features per batch when auto-chunking (default 72)
   OPENAI_CONSOLIDATION_SINGLE_CALL_MAX — if feature count ≤ this after a reduce round, one final full-schema polish call (default 72)
   OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON — 1/true: write each chunk LLM JSON to discovery_outputs/consolidation_batches/
+  OPENAI_CONSOLIDATION_MAX_ROUNDS — cap on reduce rounds before stagnation / fallback (default 12)
   OPENAI_PROMPT_CACHE_RETENTION — optional: in_memory | 24h (if model supports extended cache)
   OPENAI_BATCH_POLL_SEC    — seconds between batch status polls (default 20)
   OPENAI_BATCH_MAX_REQUESTS — max lines per batch JSONL (default 50000, API cap 50k; larger jobs split into multiple batches)
@@ -156,6 +157,9 @@ OPENAI_CONSOLIDATION_SINGLE_CALL_MAX = _safe_int_env(
 OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON = os.getenv(
     "OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON", ""
 ).strip().lower() in ("1", "true", "yes")
+OPENAI_CONSOLIDATION_MAX_ROUNDS = _safe_int_env(
+    "OPENAI_CONSOLIDATION_MAX_ROUNDS", 12, vmin=1, vmax=50
+)
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
@@ -275,7 +279,8 @@ elif LLM_PROVIDER == "openai":
     )
     print(
         f"  Consolidation chunking: CHUNK_SIZE={OPENAI_CONSOLIDATION_CHUNK_SIZE}, "
-        f"SINGLE_CALL_MAX={OPENAI_CONSOLIDATION_SINGLE_CALL_MAX} "
+        f"SINGLE_CALL_MAX={OPENAI_CONSOLIDATION_SINGLE_CALL_MAX}, "
+        f"MAX_ROUNDS={OPENAI_CONSOLIDATION_MAX_ROUNDS} "
         f"(auto multi-batch when raw feature count > SINGLE_CALL_MAX)"
     )
     if OPENAI_PROMPT_CACHE_RETENTION in ("in_memory", "24h"):
@@ -1540,17 +1545,29 @@ Return ONLY valid JSON — no markdown fences, no prose — with this structure:
 }
 """
 
-# Shorter system prompt for batched reduce steps (smaller completion than one-shot 700+ features).
+# Batched reduce: caller sorts by category so synonyms are likelier to land in the same batch.
 CONSOLIDATION_CHUNK_SYSTEM_PROMPT = """You consolidate dermatology feature definitions for a classifier schema.
 
-You receive ONE BATCH of raw features that is part of a larger list (other batches exist).
-Merge obvious duplicates and synonyms WITHIN this batch only. Keep clinically distinct concepts separate.
-Use snake_case names. description ≤120 characters. At most 3 strings in example_values per feature.
-Set is_binary and regex_extractable sensibly (same meaning as in the full schema).
+You receive ONE BATCH that is part of a larger schema (other batches run separately). Rows are grouped by category.
 
-Return ONLY valid JSON — no markdown — exactly:
-{"feature_categories":[{"name":"...","category":"...","description":"...","example_values":[],"is_binary":true,"regex_extractable":false}, ...]}
+REQUIRED:
+- Merge duplicates and NEAR-synonyms WITHIN this batch (same clinical idea, different spelling → one feature).
+- Obey the HARD LIMIT on output count in the user message (ceil); prefer fewer, broader canonical names when unsure.
+- description ≤80 characters. At most 2 short strings in example_values.
+- snake_case names. Set is_binary and regex_extractable sensibly.
+
+Return ONLY valid JSON — no markdown:
+{"feature_categories":[{"name":"...","category":"...","description":"...","example_values":[],"is_binary":true,"regex_extractable":false}]}
 """
+
+CONSOLIDATION_MINIMAL_DEDUPE_SYSTEM_PROMPT = """You deduplicate a long list of dermatology classifier features (name + category + is_binary only).
+
+Merge obvious synonyms globally (e.g. lesion_colour + lesion_color → lesion_color; itch + pruritus → symptom_itching).
+Do NOT merge clinically distinct concepts. Output SHORT JSON only — no markdown, no descriptions, no example_values.
+
+{"feature_categories":[{"name":"snake_case","category":"demographics|morphology|body_location|symptoms|duration|triggers|treatments|clinical_signs|history|severity|other","is_binary":true,"regex_extractable":false}]}
+
+regex_extractable: true only when a simple regex could extract it from text."""
 
 
 def _merge_consolidation_features_by_name(features: list) -> list[dict]:
@@ -1592,6 +1609,75 @@ def _parsed_to_feature_list(parsed) -> list | None:
         return parsed
     if isinstance(parsed, dict) and "feature_categories" in parsed:
         return parsed.get("feature_categories")
+    return None
+
+
+def _enrich_consolidated_from_pool(merged: list[dict], pool: list[dict]) -> list[dict]:
+    """Copy description / example_values from pool when output name matches a pool feature."""
+    pool_idx: dict[str, dict] = {}
+    for p in pool:
+        if not isinstance(p, dict):
+            continue
+        k = str(p.get("name") or "").strip().lower().replace(" ", "_")
+        if k and k not in pool_idx:
+            pool_idx[k] = dict(p)
+    out: list[dict] = []
+    for m in merged:
+        if not isinstance(m, dict):
+            continue
+        nm = str(m.get("name") or "").strip()
+        k = nm.lower().replace(" ", "_")
+        base = dict(pool_idx.get(k, {}))
+        base.update(m)
+        if not str(base.get("description") or "").strip():
+            base["description"] = nm.replace("_", " ")[:200]
+        base.setdefault("example_values", [])
+        out.append(base)
+    return _normalize_schema_feature_categories(out)
+
+
+def _consolidate_minimal_global_dedupe(current: list[dict]) -> list[dict] | None:
+    """
+    Single LLM call on compact name/category/is_binary rows (fits context + ~16k output).
+    Used when batched reduce stops shrinking (synonyms were mostly across batches).
+    """
+    rows = []
+    for f in current:
+        if not isinstance(f, dict):
+            continue
+        rows.append(
+            {
+                "name": str(f.get("name") or ""),
+                "category": str(f.get("category") or "other"),
+                "is_binary": bool(f.get("is_binary", True)),
+            }
+        )
+    body = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    user = (
+        f"There are {len(rows)} rows (name/category/is_binary). Globally merge synonyms into one row each.\n"
+        f"JSON:\n{body}"
+    )
+    for attempt in range(2):
+        try:
+            text = call_llm(
+                user,
+                CONSOLIDATION_MINIMAL_DEDUPE_SYSTEM_PROMPT,
+                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY + "_minimal",
+                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
+            )
+            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+            items = _parsed_to_feature_list(parsed)
+            if not items:
+                time.sleep(2)
+                continue
+            enriched = _enrich_consolidated_from_pool(
+                _normalize_schema_feature_categories(items), current
+            )
+            print(f"  Minimal global dedupe: {len(rows)} → {len(enriched)} features")
+            return enriched
+        except Exception as e:
+            print(f"  Minimal dedupe attempt {attempt+1} failed: {e}")
+            time.sleep(2)
     return None
 
 
@@ -1651,10 +1737,14 @@ def _llm_consolidation_chunk(
     batch_idx: int,
     n_batches: int,
 ) -> list[dict] | None:
+    n_in = len(batch)
+    # Force real shrink per batch (synonyms within batch); cap output to ~half of inputs.
+    target_cap = max(6, min(n_in, (n_in * 50 + 99) // 100))
     body = json.dumps(batch, ensure_ascii=False, separators=(",", ":"))
     user = (
         f"Consolidation batch {batch_idx} of {n_batches} in reduce round {round_idx}.\n"
-        f"Merge duplicates only within this batch ({len(batch)} features).\n\n"
+        f"Inputs: {n_in} features. HARD LIMIT: output at most {target_cap} feature_categories "
+        f"(merge aggressively; you must output FEWER than {n_in} unless already minimal).\n\n"
         f"JSON:\n{body}"
     )
     for attempt in range(3):
@@ -1739,11 +1829,14 @@ def _consolidate_schema_chunked_reduce(
     single_max = OPENAI_CONSOLIDATION_SINGLE_CALL_MAX
     current = list(compact)
     round_idx = 0
-    max_rounds = 50
+    max_rounds = OPENAI_CONSOLIDATION_MAX_ROUNDS
+    stagnant_rounds = 0
+    minimal_tried = False
 
     print(
         f"  Chunked consolidation: CHUNK_SIZE={chunk_sz}, "
-        f"SINGLE_CALL_MAX={single_max} (gpt-4o-mini output ~16k tokens)."
+        f"SINGLE_CALL_MAX={single_max}, MAX_ROUNDS={max_rounds} "
+        f"(gpt-4o-mini output ~16k tokens)."
     )
     if OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON:
         batch_dir = DISCOVERY_DIR / "consolidation_batches"
@@ -1753,6 +1846,13 @@ def _consolidate_schema_chunked_reduce(
     while len(current) > single_max and round_idx < max_rounds:
         round_idx += 1
         prev_len = len(current)
+        # Group by category so cross-synonyms in the same domain land in one LLM batch.
+        current.sort(
+            key=lambda x: (
+                str(x.get("category") or ""),
+                str(x.get("name") or "").lower(),
+            )
+        )
         n_batches = (len(current) + chunk_sz - 1) // chunk_sz
         print(
             f"  Reduce round {round_idx}: {len(current)} features in {n_batches} LLM batch(es)"
@@ -1773,10 +1873,36 @@ def _consolidate_schema_chunked_reduce(
             next_parts.extend(got)
         current = _merge_consolidation_features_by_name(next_parts)
         print(f"  → {len(current)} features after name-merge")
-        if len(current) >= prev_len and round_idx >= 4:
-            tqdm.write(
-                "  NOTE: Slow shrinkage — consider lowering OPENAI_CONSOLIDATION_CHUNK_SIZE."
+
+        shrink = prev_len - len(current)
+        rel = shrink / prev_len if prev_len else 1.0
+        if shrink <= max(1, int(prev_len * 0.008)):  # < ~0.8% reduction
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+
+        if stagnant_rounds >= 2 and not minimal_tried:
+            print(
+                "  Stagnation: batches barely shrink (synonyms are mostly ACROSS batches). "
+                "Running one minimal global dedupe pass (name/category only)…"
             )
+            alt = _consolidate_minimal_global_dedupe(current)
+            minimal_tried = True
+            if alt is not None:
+                current = alt
+                stagnant_rounds = 0
+                print(f"  → {len(current)} features after minimal global dedupe")
+                if len(current) <= single_max:
+                    break
+            else:
+                stagnant_rounds = 3
+
+        if stagnant_rounds >= 3:
+            print(
+                "  Stagnation persists — stopping reduce rounds (try smaller CHUNK_SIZE or re-run). "
+                "Proceeding to final polish / fallback."
+            )
+            break
 
     if round_idx >= max_rounds and len(current) > single_max:
         print(
