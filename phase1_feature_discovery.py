@@ -15,6 +15,12 @@ Run BEFORE phase2_bulk_extraction.py
 
 Prerequisites:
   pip install pandas google-generativeai openai python-dotenv tqdm
+  (OpenAI Batch also uses openai_batch_utils.py in this repo.)
+
+OpenAI + gpt-4o-mini (discovery):
+  .env: OPENAI_API_KEY=sk-...
+  LLM_PROVIDER=openai
+  Optional: OPENAI_MODEL_NAME=gpt-4o-mini (default)
 
 For Qwen 3.5 (local):
   Serve the model locally via vLLM or SGLang first, e.g.:
@@ -37,6 +43,7 @@ Env (optional):
   DISCOVERY_DEDUPE_CAPTIONS — 1/true (default): skip exact duplicate captions per label_name
                              (after .strip()) so repeated sentences are not sent to the LLM twice
   OPENAI_USE_BATCH         — 1/true: run discovery via Batch API (~50% lower $, async, ≤24h window)
+  OPENAI_MODEL_NAME        — default gpt-4o-mini (must support Chat Completions + Batch per OpenAI model docs)
   OPENAI_PROMPT_CACHE_KEY  — stable key so identical system-prefix requests share prompt cache (discovery)
   OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY — same for consolidation call
   OPENAI_PROMPT_CACHE_RETENTION — optional: in_memory | 24h (if model supports extended cache)
