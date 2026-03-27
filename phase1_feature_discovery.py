@@ -46,7 +46,10 @@ Env (optional):
   OPENAI_MODEL_NAME        — default gpt-4o-mini (must support Chat Completions + Batch per OpenAI model docs)
   OPENAI_PROMPT_CACHE_KEY  — stable key so identical system-prefix requests share prompt cache (discovery)
   OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY — same for consolidation call
-  OPENAI_CONSOLIDATION_MAX_TOKENS — max completion tokens for consolidation only (default 16384; was 4096 via call_llm and truncates large schemas)
+  OPENAI_CONSOLIDATION_MAX_TOKENS — max completion tokens per consolidation LLM call (default 16384; gpt-4o-mini output cap)
+  OPENAI_CONSOLIDATION_CHUNK_SIZE — raw features per batch when auto-chunking (default 72)
+  OPENAI_CONSOLIDATION_SINGLE_CALL_MAX — if feature count ≤ this after a reduce round, one final full-schema polish call (default 72)
+  OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON — 1/true: write each chunk LLM JSON to discovery_outputs/consolidation_batches/
   OPENAI_PROMPT_CACHE_RETENTION — optional: in_memory | 24h (if model supports extended cache)
   OPENAI_BATCH_POLL_SEC    — seconds between batch status polls (default 20)
   OPENAI_BATCH_MAX_REQUESTS — max lines per batch JSONL (default 50000, API cap 50k; larger jobs split into multiple batches)
@@ -140,10 +143,19 @@ OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
 OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
     "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
 )
-# Consolidation returns a large JSON schema; 4096 max_tokens truncates and breaks JSON parse.
+# Consolidation returns a large JSON schema; gpt-4o-mini max completion ~16k — chunk when list is large.
 OPENAI_CONSOLIDATION_MAX_TOKENS = _safe_int_env(
     "OPENAI_CONSOLIDATION_MAX_TOKENS", 16_384, vmin=4_096, vmax=65_536
 )
+OPENAI_CONSOLIDATION_CHUNK_SIZE = _safe_int_env(
+    "OPENAI_CONSOLIDATION_CHUNK_SIZE", 72, vmin=24, vmax=150
+)
+OPENAI_CONSOLIDATION_SINGLE_CALL_MAX = _safe_int_env(
+    "OPENAI_CONSOLIDATION_SINGLE_CALL_MAX", 72, vmin=24, vmax=200
+)
+OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON = os.getenv(
+    "OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON", ""
+).strip().lower() in ("1", "true", "yes")
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
@@ -259,7 +271,12 @@ elif LLM_PROVIDER == "openai":
         print(f"  Prompt caching: consolidation key={OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY!r}")
     print(
         f"  Consolidation max_tokens={OPENAI_CONSOLIDATION_MAX_TOKENS:,} "
-        f"(OPENAI_CONSOLIDATION_MAX_TOKENS; raise if JSON still truncates)"
+        f"(OPENAI_CONSOLIDATION_MAX_TOKENS)"
+    )
+    print(
+        f"  Consolidation chunking: CHUNK_SIZE={OPENAI_CONSOLIDATION_CHUNK_SIZE}, "
+        f"SINGLE_CALL_MAX={OPENAI_CONSOLIDATION_SINGLE_CALL_MAX} "
+        f"(auto multi-batch when raw feature count > SINGLE_CALL_MAX)"
     )
     if OPENAI_PROMPT_CACHE_RETENTION in ("in_memory", "24h"):
         print(f"  prompt_cache_retention={OPENAI_PROMPT_CACHE_RETENTION!r}")
@@ -500,7 +517,9 @@ def _maybe_log_openai_chat_usage(resp, context: str = "") -> None:
             if fin == "length":
                 print(
                     f"    WARNING: OpenAI response truncated at max_tokens{extra} — "
-                    "increase OPENAI_CONSOLIDATION_MAX_TOKENS (consolidation) or reduce prompt size."
+                    "gpt-4o-mini caps near 16k completion; phase1 uses multi-batch consolidation when "
+                    "the feature list is long (OPENAI_CONSOLIDATION_CHUNK_SIZE). "
+                    "Or try a model with higher max output / lower chunk size."
                 )
         except (IndexError, TypeError, AttributeError):
             pass
@@ -1521,25 +1540,67 @@ Return ONLY valid JSON — no markdown fences, no prose — with this structure:
 }
 """
 
-def consolidate_schema(
-    all_features: dict[str, dict],
-    n_captions_sampled: int = 0,
-    n_disease_classes: int = 0,
-) -> dict:
-    """Send all discovered features to LLM for deduplication and consolidation."""
-    # Prepare a compact version for the prompt (drop found_in_labels to save tokens)
-    compact = []
-    for name, feat in all_features.items():
-        compact.append({
-            "name": name,
-            "category": feat.get("category", "other"),
-            "description": feat.get("description", ""),
-            "example_values": feat.get("example_values", [])[:5],
-            "is_binary": feat.get("is_binary", True),
-            "n_labels_found": len(feat.get("found_in_labels", [])),
-        })
+# Shorter system prompt for batched reduce steps (smaller completion than one-shot 700+ features).
+CONSOLIDATION_CHUNK_SYSTEM_PROMPT = """You consolidate dermatology feature definitions for a classifier schema.
 
-    # Compact JSON saves prompt tokens (large raw lists approach context limits).
+You receive ONE BATCH of raw features that is part of a larger list (other batches exist).
+Merge obvious duplicates and synonyms WITHIN this batch only. Keep clinically distinct concepts separate.
+Use snake_case names. description ≤120 characters. At most 3 strings in example_values per feature.
+Set is_binary and regex_extractable sensibly (same meaning as in the full schema).
+
+Return ONLY valid JSON — no markdown — exactly:
+{"feature_categories":[{"name":"...","category":"...","description":"...","example_values":[],"is_binary":true,"regex_extractable":false}, ...]}
+"""
+
+
+def _merge_consolidation_features_by_name(features: list) -> list[dict]:
+    """Collapse features that share the same normalised snake_case name."""
+    out: dict[str, dict] = {}
+    for raw in features:
+        if not isinstance(raw, dict):
+            continue
+        nm = str(raw.get("name") or "").strip()
+        if not nm:
+            continue
+        key = nm.lower().replace(" ", "_")
+        if key not in out:
+            d = dict(raw)
+            d["name"] = nm
+            if "n_labels_found" not in d:
+                d["n_labels_found"] = int(raw.get("n_labels_found", 0) or 0)
+            out[key] = d
+        else:
+            ex = out[key]
+            oev = _stringify_listish(ex.get("example_values"))
+            nev = _stringify_listish(raw.get("example_values"))
+            ex["example_values"] = list(dict.fromkeys(oev + nev))[:8]
+            d1 = str(ex.get("description") or "")
+            d2 = str(raw.get("description") or "")
+            if len(d2) > len(d1):
+                ex["description"] = d2
+            ex["n_labels_found"] = max(
+                int(ex.get("n_labels_found", 0) or 0),
+                int(raw.get("n_labels_found", 0) or 0),
+            )
+    return list(out.values())
+
+
+def _parsed_to_feature_list(parsed) -> list | None:
+    if parsed is None:
+        return None
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and "feature_categories" in parsed:
+        return parsed.get("feature_categories")
+    return None
+
+
+def _consolidate_schema_single_pass(
+    compact: list[dict],
+    n_captions_sampled: int,
+    n_disease_classes: int,
+) -> dict | None:
+    """One full-schema LLM call; returns None on failure."""
     raw_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     prompt = (
         f"You are given a raw list of {len(compact)} clinical feature categories that were\n"
@@ -1547,9 +1608,6 @@ def consolidate_schema(
         f"{n_disease_classes} disease classes.\n\n"
         f"Here is the raw feature list:\n{raw_json}"
     )
-
-    print(f"  Sending {len(compact)} raw features for consolidation...")
-
     for attempt in range(3):
         try:
             text = call_llm(
@@ -1559,31 +1617,219 @@ def consolidate_schema(
                 openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
             )
             parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            if parsed is None:
+            items = _parsed_to_feature_list(parsed)
+            if items is None:
                 print(
                     f"  Consolidation JSON parse error (attempt {attempt+1}), retrying... "
-                    f"(if completion hit max_tokens, set OPENAI_CONSOLIDATION_MAX_TOKENS higher)"
+                    "(large lists use chunked consolidation automatically if this keeps failing)"
                 )
                 time.sleep(3)
                 continue
             if isinstance(parsed, list):
-                parsed = {"feature_categories": parsed}
-            if isinstance(parsed, dict) and "feature_categories" in parsed:
-                parsed["feature_categories"] = _normalize_schema_feature_categories(
-                    parsed.get("feature_categories")
-                )
-                print(f"  Consolidated to {len(parsed['feature_categories'])} features")
-                return parsed
+                parsed = {"feature_categories": items}
+            else:
+                parsed = dict(parsed)
+                parsed["feature_categories"] = items
+            parsed["feature_categories"] = _normalize_schema_feature_categories(
+                parsed.get("feature_categories")
+            )
+            print(f"  Consolidated to {len(parsed['feature_categories'])} features")
+            return parsed
         except json.JSONDecodeError:
             print(f"  Consolidation JSON parse error (attempt {attempt+1}), retrying...")
             time.sleep(3)
         except Exception as e:
             print(f"  Consolidation API error (attempt {attempt+1}): {e}")
             time.sleep(3)
+    return None
 
-    # Fallback: use raw features as-is
-    print("  WARNING: Consolidation failed, using raw discovered features.")
-    return {"feature_categories": compact}
+
+def _llm_consolidation_chunk(
+    batch: list[dict],
+    *,
+    round_idx: int,
+    batch_idx: int,
+    n_batches: int,
+) -> list[dict] | None:
+    body = json.dumps(batch, ensure_ascii=False, separators=(",", ":"))
+    user = (
+        f"Consolidation batch {batch_idx} of {n_batches} in reduce round {round_idx}.\n"
+        f"Merge duplicates only within this batch ({len(batch)} features).\n\n"
+        f"JSON:\n{body}"
+    )
+    for attempt in range(3):
+        try:
+            text = call_llm(
+                user,
+                CONSOLIDATION_CHUNK_SYSTEM_PROMPT,
+                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY + "_chunk",
+                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
+            )
+            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+            items = _parsed_to_feature_list(parsed)
+            if not items:
+                print(
+                    f"    Chunk r{round_idx} b{batch_idx}: parse failed "
+                    f"(attempt {attempt+1}), retrying..."
+                )
+                time.sleep(2)
+                continue
+            norm = _normalize_schema_feature_categories(items)
+            if OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON:
+                out_dir = DISCOVERY_DIR / "consolidation_batches"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"round{round_idx}_batch{batch_idx}_of{n_batches}.json"
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump({"feature_categories": norm}, f, indent=2, ensure_ascii=False)
+                print(f"    Wrote chunk response → {out_path}")
+            return norm
+        except Exception as e:
+            print(f"    Chunk r{round_idx} b{batch_idx} error (attempt {attempt+1}): {e}")
+            time.sleep(2)
+    return None
+
+
+def _consolidate_schema_final_polish(
+    current: list[dict],
+    n_captions_sampled: int,
+    n_disease_classes: int,
+) -> dict | None:
+    raw_json = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
+    prompt = (
+        f"After batched merging, there are {len(current)} candidate feature categories.\n"
+        f"Perform a GLOBAL polish: merge synonyms across the whole list, standardise snake_case, "
+        f"fix categories. Keep clinically distinct features.\n"
+        f"Corpus: {n_captions_sampled} captions sampled, {n_disease_classes} disease classes.\n\n"
+        f"JSON:\n{raw_json}"
+    )
+    for attempt in range(3):
+        try:
+            text = call_llm(
+                prompt,
+                CONSOLIDATION_SYSTEM_PROMPT,
+                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY,
+                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
+            )
+            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+            items = _parsed_to_feature_list(parsed)
+            if items is None:
+                print(
+                    f"  Final polish JSON parse error (attempt {attempt+1}), retrying... "
+                    "(if truncated, lower OPENAI_CONSOLIDATION_SINGLE_CALL_MAX or CHUNK_SIZE)"
+                )
+                time.sleep(3)
+                continue
+            out = {
+                "feature_categories": _normalize_schema_feature_categories(items),
+            }
+            print(f"  Final polish: {len(out['feature_categories'])} features")
+            return out
+        except Exception as e:
+            print(f"  Final polish error (attempt {attempt+1}): {e}")
+            time.sleep(3)
+    return None
+
+
+def _consolidate_schema_chunked_reduce(
+    compact: list[dict],
+    n_captions_sampled: int,
+    n_disease_classes: int,
+) -> dict:
+    chunk_sz = OPENAI_CONSOLIDATION_CHUNK_SIZE
+    single_max = OPENAI_CONSOLIDATION_SINGLE_CALL_MAX
+    current = list(compact)
+    round_idx = 0
+    max_rounds = 50
+
+    print(
+        f"  Chunked consolidation: CHUNK_SIZE={chunk_sz}, "
+        f"SINGLE_CALL_MAX={single_max} (gpt-4o-mini output ~16k tokens)."
+    )
+    if OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON:
+        batch_dir = DISCOVERY_DIR / "consolidation_batches"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Per-batch JSON → {batch_dir}/ (OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON)")
+
+    while len(current) > single_max and round_idx < max_rounds:
+        round_idx += 1
+        prev_len = len(current)
+        n_batches = (len(current) + chunk_sz - 1) // chunk_sz
+        print(
+            f"  Reduce round {round_idx}: {len(current)} features in {n_batches} LLM batch(es)"
+        )
+        next_parts: list[dict] = []
+        for bi in range(n_batches):
+            sl = current[bi * chunk_sz : (bi + 1) * chunk_sz]
+            got = _llm_consolidation_chunk(
+                sl, round_idx=round_idx, batch_idx=bi + 1, n_batches=n_batches
+            )
+            if got is None:
+                print("  WARNING: Chunk LLM failed; using name-merged list without further LLM steps.")
+                return {
+                    "feature_categories": _normalize_schema_feature_categories(
+                        _merge_consolidation_features_by_name(current)
+                    ),
+                }
+            next_parts.extend(got)
+        current = _merge_consolidation_features_by_name(next_parts)
+        print(f"  → {len(current)} features after name-merge")
+        if len(current) >= prev_len and round_idx >= 4:
+            tqdm.write(
+                "  NOTE: Slow shrinkage — consider lowering OPENAI_CONSOLIDATION_CHUNK_SIZE."
+            )
+
+    if round_idx >= max_rounds and len(current) > single_max:
+        print(
+            f"  WARNING: Hit max reduce rounds ({max_rounds}); final polish may still truncate."
+        )
+
+    final = _consolidate_schema_final_polish(
+        current, n_captions_sampled, n_disease_classes
+    )
+    if final is not None:
+        return final
+
+    print(
+        "  WARNING: Final polish failed or truncated; returning merge-only feature list "
+        "(run again or tighten OPENAI_CONSOLIDATION_SINGLE_CALL_MAX)."
+    )
+    return {
+        "feature_categories": _normalize_schema_feature_categories(current),
+    }
+
+
+def consolidate_schema(
+    all_features: dict[str, dict],
+    n_captions_sampled: int = 0,
+    n_disease_classes: int = 0,
+) -> dict:
+    """Deduplicate discovered features via LLM (chunked when the list is large)."""
+    compact: list[dict] = []
+    for name, feat in all_features.items():
+        compact.append(
+            {
+                "name": name,
+                "category": feat.get("category", "other"),
+                "description": feat.get("description", ""),
+                "example_values": feat.get("example_values", [])[:5],
+                "is_binary": feat.get("is_binary", True),
+                "n_labels_found": len(feat.get("found_in_labels", [])),
+            }
+        )
+
+    print(f"  Sending {len(compact)} raw features for consolidation...")
+
+    if len(compact) <= OPENAI_CONSOLIDATION_SINGLE_CALL_MAX:
+        done = _consolidate_schema_single_pass(
+            compact, n_captions_sampled, n_disease_classes
+        )
+        if done is not None:
+            return done
+        print("  Single-pass consolidation failed; using chunked reduce on the full list...")
+
+    return _consolidate_schema_chunked_reduce(
+        compact, n_captions_sampled, n_disease_classes
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
