@@ -97,23 +97,59 @@ OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY = os.getenv(
     "OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY", "phase1_consolidation_v1"
 ).strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
-OPENAI_BATCH_POLL_SEC = max(5, int(os.getenv("OPENAI_BATCH_POLL_SEC", "20")))
+
+
+def _safe_int_env(key: str, default: int, *, vmin: int | None = None, vmax: int | None = None) -> int:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        v = default
+    else:
+        try:
+            v = int(raw)
+        except ValueError:
+            print(f"WARNING: invalid integer env {key}={raw!r}, using default {default}")
+            v = default
+    if vmin is not None:
+        v = max(vmin, v)
+    if vmax is not None:
+        v = min(vmax, v)
+    return v
+
+
+def _safe_float_env(key: str, default: float) -> float:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"WARNING: invalid float env {key}={raw!r}, using default {default}")
+        return default
+
+
+OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
 # OpenAI Batch: max 50,000 requests per batch file (https://developers.openai.com/api/docs/guides/batch)
-OPENAI_BATCH_MAX_REQUESTS = max(1, min(50_000, int(os.getenv("OPENAI_BATCH_MAX_REQUESTS", "50000"))))
+OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
+    "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
+)
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
 # Must match the server's --max-model-len; vLLM returns 400 if prompt_tokens + max_tokens exceeds this.
-QWEN_MAX_MODEL_LEN = int(os.getenv("QWEN_MAX_MODEL_LEN", "8192"))
+QWEN_MAX_MODEL_LEN = _safe_int_env("QWEN_MAX_MODEL_LEN", 8192, vmin=1)
 # Full discovery JSON often needs >8k completion tokens when context allows; cap still clamped per-request.
 _qwen_mt_env = os.getenv("QWEN_MAX_TOKENS", "").strip()
 if _qwen_mt_env:
-    QWEN_MAX_TOKENS = int(_qwen_mt_env)
+    try:
+        QWEN_MAX_TOKENS = int(_qwen_mt_env)
+    except ValueError:
+        print(f"WARNING: invalid QWEN_MAX_TOKENS={_qwen_mt_env!r}, using heuristic from context")
+        QWEN_MAX_TOKENS = min(16384, max(8192, QWEN_MAX_MODEL_LEN // 2))
 else:
     QWEN_MAX_TOKENS = min(16384, max(8192, QWEN_MAX_MODEL_LEN // 2))
-QWEN_CONTEXT_BUFFER = int(os.getenv("QWEN_CONTEXT_BUFFER", "256"))
+QWEN_CONTEXT_BUFFER = _safe_int_env("QWEN_CONTEXT_BUFFER", 256, vmin=0)
 # Heuristic when /tokenize is unavailable (chars per token ~2.5–3 for English + medical terms)
-QWEN_CHARS_PER_TOKEN = float(os.getenv("QWEN_CHARS_PER_TOKEN", "2.75"))
-QWEN_TEMPLATE_TOKEN_OVERHEAD = int(os.getenv("QWEN_TEMPLATE_TOKEN_OVERHEAD", "800"))
+QWEN_CHARS_PER_TOKEN = _safe_float_env("QWEN_CHARS_PER_TOKEN", 2.75)
+QWEN_TEMPLATE_TOKEN_OVERHEAD = _safe_int_env("QWEN_TEMPLATE_TOKEN_OVERHEAD", 800, vmin=0)
 _qwen_noted_low_cap: bool = False
 _vllm_tokenize_warned: bool = False
 
@@ -156,7 +192,7 @@ else:
 # Captions per LLM call — smaller batches for local Qwen + short max_model_len reduce truncated JSON
 _bs_env = os.getenv("DISCOVERY_BATCH_SIZE", "").strip()
 if _bs_env:
-    BATCH_SIZE = max(1, int(_bs_env))
+    BATCH_SIZE = _safe_int_env("DISCOVERY_BATCH_SIZE", 25, vmin=1)
 elif LLM_PROVIDER == "qwen":
     # 8192 context + huge system prompt leaves little room for captions + JSON output
     BATCH_SIZE = 4 if QWEN_MAX_MODEL_LEN <= 8192 else 10
@@ -496,9 +532,11 @@ def _openai_parse_batch_output_jsonl(raw: str) -> tuple[dict[str, str], dict[str
         details = usage.get("prompt_tokens_details") or {}
         acc["cached"] += int(details.get("cached_tokens", 0))
         choices = body.get("choices") or []
-        if not choices:
+        if not choices or not isinstance(choices[0], dict):
             continue
-        msg = (choices[0].get("message") or {})
+        msg = choices[0].get("message") or {}
+        if not isinstance(msg, dict):
+            msg = {}
         content = msg.get("content") or ""
         if cid:
             out[cid] = content
@@ -1122,23 +1160,92 @@ def _short_label_desc(label_name, max_len: int = 42) -> str:
     return s[: max_len - 3] + "..."
 
 
+def _coerce_discovery_feature_items(items: list | None) -> list[dict]:
+    """
+    Some models (e.g. Qwen) return feature_categories as a mix of objects and bare strings.
+    Merge expects dicts with a "name" key; coerce strings into minimal dicts, skip junk.
+    """
+    if not items:
+        return []
+    out: list[dict] = []
+    for feat in items:
+        if isinstance(feat, dict):
+            out.append(feat)
+            continue
+        if isinstance(feat, str):
+            s = feat.strip()
+            if not s:
+                continue
+            out.append(
+                {
+                    "name": s,
+                    "category": "other",
+                    "description": "",
+                    "example_values": [],
+                    "is_binary": False,
+                    "extraction_examples": [],
+                }
+            )
+    return out
+
+
+def _stringify_listish(x) -> list[str]:
+    """Coerce example_values / extraction_examples to a list of strings (avoids set() on nested types)."""
+    if x is None:
+        return []
+    if isinstance(x, str):
+        return [x] if x.strip() else []
+    if isinstance(x, list):
+        return [str(i) for i in x]
+    return [str(x)]
+
+
+def _normalize_schema_feature_categories(items: list | None) -> list[dict]:
+    """Canonical schema list for phase 1 output and phase 2 input: dicts with non-empty names only."""
+    if not items:
+        return []
+    out: list[dict] = []
+    for feat in items:
+        if isinstance(feat, dict):
+            raw_name = feat.get("name")
+            name_s = str(raw_name).strip() if raw_name is not None else ""
+            if not name_s:
+                continue
+            d = dict(feat)
+            d["name"] = name_s
+            out.append(d)
+        elif isinstance(feat, str):
+            s = feat.strip()
+            if s:
+                out.append(
+                    {
+                        "name": s,
+                        "category": "other",
+                        "description": "",
+                        "example_values": [],
+                        "is_binary": True,
+                    }
+                )
+    return out
+
+
 def _merge_raw_label_features_into_global(
     all_features: dict[str, dict], label_features: list, label_name
 ) -> None:
     """Merge one label's discovery list into the global feature dict (by snake_case name)."""
-    for feat in label_features:
-        name = feat.get("name", "").lower().strip().replace(" ", "_")
+    for feat in _coerce_discovery_feature_items(label_features):
+        name = str(feat.get("name") or "").lower().strip().replace(" ", "_")
         if not name:
             continue
         if name not in all_features:
             all_features[name] = feat
             all_features[name]["found_in_labels"] = [label_name]
         else:
-            existing_ex = set(all_features[name].get("example_values", []))
-            new_ex = set(feat.get("example_values", []))
+            existing_ex = set(_stringify_listish(all_features[name].get("example_values")))
+            new_ex = set(_stringify_listish(feat.get("example_values")))
             all_features[name]["example_values"] = list(existing_ex | new_ex)[:10]
-            existing_extr = set(all_features[name].get("extraction_examples", []))
-            new_extr = set(feat.get("extraction_examples", []))
+            existing_extr = set(_stringify_listish(all_features[name].get("extraction_examples")))
+            new_extr = set(_stringify_listish(feat.get("extraction_examples")))
             all_features[name]["extraction_examples"] = list(existing_extr | new_extr)[:5]
             if label_name not in all_features[name].get("found_in_labels", []):
                 all_features[name]["found_in_labels"].append(label_name)
@@ -1417,6 +1524,9 @@ def consolidate_schema(
             if isinstance(parsed, list):
                 parsed = {"feature_categories": parsed}
             if isinstance(parsed, dict) and "feature_categories" in parsed:
+                parsed["feature_categories"] = _normalize_schema_feature_categories(
+                    parsed.get("feature_categories")
+                )
                 print(f"  Consolidated to {len(parsed['feature_categories'])} features")
                 return parsed
         except json.JSONDecodeError:
@@ -1441,11 +1551,20 @@ def add_scin_alignment(schema: dict) -> dict:
     Tag each schema feature with its SCIN column counterpart (if any).
     This is done AFTER the final feature list is established from Derm-1M.
     """
+    fc = schema.get("feature_categories")
+    schema["feature_categories"] = _normalize_schema_feature_categories(
+        fc if isinstance(fc, list) else []
+    )
+    if isinstance(fc, list) and len(fc) > 0 and len(schema["feature_categories"]) == 0:
+        print(
+            "  WARNING: feature_categories had no valid dict/string entries after normalization."
+        )
+
     existing_names = {f["name"] for f in schema["feature_categories"]}
-    
+
     # Track which features are SCIN-comparable
     scin_comparable_count = 0
-    
+
     for scin_col, canonical in SCIN_SCHEMA_FEATURES.items():
         # Find feature in schema or add it as SCIN-sourced
         matched = next(

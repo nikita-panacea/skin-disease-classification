@@ -70,8 +70,29 @@ LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")  # Default to openai for c
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
 OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase2_extraction_v1").strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
-OPENAI_BATCH_POLL_SEC = max(5, int(os.getenv("OPENAI_BATCH_POLL_SEC", "20")))
-OPENAI_BATCH_MAX_REQUESTS = max(1, min(50_000, int(os.getenv("OPENAI_BATCH_MAX_REQUESTS", "50000"))))
+
+
+def _safe_int_env(key: str, default: int, *, vmin: int | None = None, vmax: int | None = None) -> int:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        v = default
+    else:
+        try:
+            v = int(raw)
+        except ValueError:
+            print(f"WARNING: invalid integer env {key}={raw!r}, using default {default}")
+            v = default
+    if vmin is not None:
+        v = max(vmin, v)
+    if vmax is not None:
+        v = min(vmax, v)
+    return v
+
+
+OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
+OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
+    "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
+)
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 
 # Qwen local server config
@@ -132,7 +153,7 @@ SCHEMA_PATH      = "feature_schema.json"
 OUTPUT_CSV       = "derm1m_features.csv"
 STATS_FILE       = "extraction_stats.json"
 CHECKPOINT_DIR   = Path("checkpoints")
-LLM_BATCH_SIZE   = max(1, int(os.getenv("LLM_BATCH_SIZE", "25")))
+LLM_BATCH_SIZE = _safe_int_env("LLM_BATCH_SIZE", 25, vmin=1)
 MAX_CAPTION_LEN  = 500             # truncate before sending to LLM (chars)
 MAX_RETRIES      = 5               # max retries per batch
 RATE_LIMIT_SLEEP = 0.1 if LLM_PROVIDER == "qwen" else 0.5
@@ -224,8 +245,10 @@ def _openai_parse_batch_output_jsonl(raw: str) -> tuple[dict[str, str], dict[str
         details = usage.get("prompt_tokens_details") or {}
         acc["cached"] += int(details.get("cached_tokens", 0))
         choices = body.get("choices") or []
-        if choices and cid:
-            msg = (choices[0].get("message") or {})
+        if choices and cid and isinstance(choices[0], dict):
+            msg = choices[0].get("message") or {}
+            if not isinstance(msg, dict):
+                msg = {}
             out[cid] = msg.get("content") or ""
     return out, acc
 
@@ -421,35 +444,84 @@ def call_llm(
 # SCHEMA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _normalize_schema_feature_categories(items: list | None) -> list[dict]:
+    """
+    Phase 1 may emit string entries in feature_categories (some local LLMs).
+    Phase 2 requires dicts with string names.
+    """
+    if not items:
+        return []
+    out: list[dict] = []
+    for feat in items:
+        if isinstance(feat, dict):
+            raw_name = feat.get("name")
+            name_s = str(raw_name).strip() if raw_name is not None else ""
+            if not name_s:
+                continue
+            d = dict(feat)
+            d["name"] = name_s
+            out.append(d)
+        elif isinstance(feat, str):
+            s = feat.strip()
+            if s:
+                out.append(
+                    {
+                        "name": s,
+                        "category": "other",
+                        "description": "",
+                        "example_values": [],
+                        "is_binary": True,
+                    }
+                )
+    return out
+
+
 def load_schema(schema_path: str) -> dict:
     """Load the feature schema produced by Phase 1."""
     with open(schema_path, "r", encoding="utf-8") as f:
         schema = json.load(f)
-    features = schema.get("feature_categories", [])
+    raw = schema.get("feature_categories")
+    if not isinstance(raw, list):
+        print(f"  WARNING: feature_categories is not a list (got {type(raw).__name__}); using [].")
+        raw = []
+    n_raw = len(raw)
+    features = _normalize_schema_feature_categories(raw)
+    schema["feature_categories"] = features
+    if n_raw and len(features) < n_raw:
+        print(
+            f"  WARNING: dropped {n_raw - len(features)} invalid feature_categories entr(y/ies)"
+        )
     print(f"  Loaded schema: {len(features)} features")
-    
+
     # Show feature breakdown by category
     categories = defaultdict(int)
     for feat in features:
-        cat = feat.get("category", "other")
-        categories[cat] += 1
-    
+        cat = feat.get("category", "other") if isinstance(feat, dict) else "other"
+        categories[str(cat)] += 1
+
     print(f"  Feature breakdown by category:")
     for cat, count in sorted(categories.items()):
         print(f"    - {cat}: {count}")
-    
+
     return schema
 
 
 def get_all_feature_names(schema: dict) -> list[str]:
     """Get list of all feature names from the schema."""
-    return [f["name"] for f in schema.get("feature_categories", [])]
+    names: list[str] = []
+    for f in schema.get("feature_categories", []):
+        if isinstance(f, dict) and f.get("name"):
+            names.append(str(f["name"]))
+    return names
 
 
 def get_feature_categories(schema: dict) -> dict[str, str]:
     """Get mapping of feature name to category."""
-    return {f["name"]: f.get("category", "other") 
-            for f in schema.get("feature_categories", [])}
+    m: dict[str, str] = {}
+    for f in schema.get("feature_categories", []):
+        if isinstance(f, dict) and f.get("name"):
+            m[str(f["name"])] = str(f.get("category", "other"))
+    return m
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -604,10 +676,16 @@ def validate_batch_results(
             for feat in list(extra_features):
                 del result[feat]
         
-        # Validate values are 0, 1, or 2
+        # Validate values are 0, 1, or 2 (coerce bool / float from JSON)
         for feat in expected_features:
             val = result.get(feat, 2)
-            if val not in [0, 1, 2]:
+            if isinstance(val, bool):
+                val = int(val)
+                result[feat] = val
+            elif isinstance(val, (int, float)) and float(val).is_integer():
+                val = int(val)
+                result[feat] = val
+            if val not in (0, 1, 2):
                 result[feat] = 2  # Default to unknown for invalid values
         
         valid_results.append(result)
@@ -830,6 +908,12 @@ def run_extraction(csv_path: str, schema_path: str):
             f"Caption column {CAPTION_COLUMN!r} not found. "
             f"Available: {list(df.columns)}"
         )
+    meta_needed = ["image", "label_name", "disease_label"]
+    missing_meta = [c for c in meta_needed if c not in df.columns]
+    if missing_meta:
+        raise ValueError(
+            f"CSV missing required column(s) {missing_meta}. Available: {list(df.columns)}"
+        )
     df[CAPTION_COLUMN] = df[CAPTION_COLUMN].fillna("").astype(str)
     n = len(df)
     print(f"  {n:,} records loaded (caption={CAPTION_COLUMN!r})\n")
@@ -983,6 +1067,13 @@ def run_extraction(csv_path: str, schema_path: str):
         for i in range(n):
             if all_results_list[i] is None:
                 all_results_list[i] = fallback
+
+    # Normalize rows (checkpoints / edge cases may have non-dicts or bad values)
+    all_results_list, row_fixes = validate_batch_results(
+        all_results_list, all_feature_names, n
+    )
+    if row_fixes > 0:
+        print(f"  Row validation: applied {row_fixes} fix(es) before building feature matrix")
 
     # Create features DataFrame
     features_df = pd.DataFrame(all_results_list)
