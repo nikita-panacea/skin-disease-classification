@@ -46,6 +46,7 @@ Env (optional):
   OPENAI_MODEL_NAME        — default gpt-4o-mini (must support Chat Completions + Batch per OpenAI model docs)
   OPENAI_PROMPT_CACHE_KEY  — stable key so identical system-prefix requests share prompt cache (discovery)
   OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY — same for consolidation call
+  OPENAI_CONSOLIDATION_MAX_TOKENS — max completion tokens for consolidation only (default 16384; was 4096 via call_llm and truncates large schemas)
   OPENAI_PROMPT_CACHE_RETENTION — optional: in_memory | 24h (if model supports extended cache)
   OPENAI_BATCH_POLL_SEC    — seconds between batch status polls (default 20)
   OPENAI_BATCH_MAX_REQUESTS — max lines per batch JSONL (default 50000, API cap 50k; larger jobs split into multiple batches)
@@ -138,6 +139,10 @@ OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
 # OpenAI Batch: max 50,000 requests per batch file (https://developers.openai.com/api/docs/guides/batch)
 OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
     "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
+)
+# Consolidation returns a large JSON schema; 4096 max_tokens truncates and breaks JSON parse.
+OPENAI_CONSOLIDATION_MAX_TOKENS = _safe_int_env(
+    "OPENAI_CONSOLIDATION_MAX_TOKENS", 16_384, vmin=4_096, vmax=65_536
 )
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
@@ -252,6 +257,10 @@ elif LLM_PROVIDER == "openai":
         )
     if OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY:
         print(f"  Prompt caching: consolidation key={OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY!r}")
+    print(
+        f"  Consolidation max_tokens={OPENAI_CONSOLIDATION_MAX_TOKENS:,} "
+        f"(OPENAI_CONSOLIDATION_MAX_TOKENS; raise if JSON still truncates)"
+    )
     if OPENAI_PROMPT_CACHE_RETENTION in ("in_memory", "24h"):
         print(f"  prompt_cache_retention={OPENAI_PROMPT_CACHE_RETENTION!r}")
 
@@ -483,6 +492,19 @@ def _openai_discovery_chat_body(user_prompt: str) -> dict:
 
 
 def _maybe_log_openai_chat_usage(resp, context: str = "") -> None:
+    extra = f" ({context})" if context else ""
+    if OPENAI_LOG_USAGE or LLM_PARSE_DEBUG:
+        try:
+            ch = resp.choices[0] if getattr(resp, "choices", None) else None
+            fin = getattr(ch, "finish_reason", None) if ch else None
+            if fin == "length":
+                print(
+                    f"    WARNING: OpenAI response truncated at max_tokens{extra} — "
+                    "increase OPENAI_CONSOLIDATION_MAX_TOKENS (consolidation) or reduce prompt size."
+                )
+        except (IndexError, TypeError, AttributeError):
+            pass
+
     if not OPENAI_LOG_USAGE and not LLM_PARSE_DEBUG:
         return
     u = getattr(resp, "usage", None)
@@ -494,10 +516,17 @@ def _maybe_log_openai_chat_usage(resp, context: str = "") -> None:
     cached = 0
     if details is not None:
         cached = int(getattr(details, "cached_tokens", None) or 0)
-    extra = f" ({context})" if context else ""
+    fr = ""
+    try:
+        ch2 = resp.choices[0] if getattr(resp, "choices", None) else None
+        fin2 = getattr(ch2, "finish_reason", None) if ch2 else None
+        if fin2:
+            fr = f", finish_reason={fin2!r}"
+    except (IndexError, TypeError, AttributeError):
+        pass
     print(
         f"    OpenAI usage{extra}: prompt={pt} (cached={cached}, "
-        f"non_cached≈{max(0, pt - cached)}) completion={ct}"
+        f"non_cached≈{max(0, pt - cached)}) completion={ct}{fr}"
     )
 
 
@@ -691,10 +720,13 @@ def call_llm(
     retries: int = 3,
     *,
     openai_prompt_cache_key: str | None = None,
+    openai_max_tokens: int | None = None,
 ) -> str:
     """
     Generic LLM caller that works with Gemini, OpenAI, and Qwen (local).
     Returns the text response.
+
+    openai_max_tokens: OpenAI only; default 4096. Use OPENAI_CONSOLIDATION_MAX_TOKENS for consolidation.
     """
     for attempt in range(retries):
         try:
@@ -709,11 +741,12 @@ def call_llm(
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
 
+                max_out = openai_max_tokens if openai_max_tokens is not None else 4096
                 create_kw = dict(
                     model=DISCOVERY_MODEL,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=4096,
+                    max_tokens=max_out,
                     stream=False,
                 )
                 if OPENAI_JSON_RESPONSE:
@@ -1506,7 +1539,8 @@ def consolidate_schema(
             "n_labels_found": len(feat.get("found_in_labels", [])),
         })
 
-    raw_json = json.dumps(compact, indent=1)
+    # Compact JSON saves prompt tokens (large raw lists approach context limits).
+    raw_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     prompt = (
         f"You are given a raw list of {len(compact)} clinical feature categories that were\n"
         f"extracted by an LLM from {n_captions_sampled} dermatology case captions across\n"
@@ -1522,10 +1556,14 @@ def consolidate_schema(
                 prompt,
                 CONSOLIDATION_SYSTEM_PROMPT,
                 openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY,
+                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
             )
             parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
             if parsed is None:
-                print(f"  Consolidation JSON parse error (attempt {attempt+1}), retrying...")
+                print(
+                    f"  Consolidation JSON parse error (attempt {attempt+1}), retrying... "
+                    f"(if completion hit max_tokens, set OPENAI_CONSOLIDATION_MAX_TOKENS higher)"
+                )
                 time.sleep(3)
                 continue
             if isinstance(parsed, list):
