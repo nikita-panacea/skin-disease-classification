@@ -1,14 +1,18 @@
 """
 PHASE 1: Feature Schema Discovery (Bottom-Up)
 ===============================================
-Discover ALL possible clinical features directly FROM the Derm-1M captions,
+Discover ALL possible binary clinical features directly FROM the Derm-1M captions,
 then consolidate into a canonical feature schema aligned with SCIN.
+
+Output schema: {subcategory: [binary_feature_values]}  -- every feature is binary (0/1/2).
+Feature names in Phase 2 are constructed as {subcategory}_{value} (e.g. body_location_nose).
 
 Strategy:
   1. Load captions from cleaned_caption_Derm1M.csv (column configurable via CAPTION_COLUMN).
      Sampling: stratified (default) or full (all non-empty captions per label).
   2. Per-label-name LLM discovery via Gemini, OpenAI GPT-4o-mini, or Qwen 3.5 9B (local)
-  3. Global consolidation to deduplicate synonyms
+     Output: compact {subcategory: [values]} per batch (cost-optimized vs verbose JSON objects)
+  3. Global consolidation to deduplicate synonym values within subcategories
   4. SCIN column alignment (after final feature list is established)
 
 Run BEFORE phase2_bulk_extraction.py
@@ -47,10 +51,6 @@ Env (optional):
   OPENAI_PROMPT_CACHE_KEY  — stable key so identical system-prefix requests share prompt cache (discovery)
   OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY — same for consolidation call
   OPENAI_CONSOLIDATION_MAX_TOKENS — max completion tokens per consolidation LLM call (default 16384; gpt-4o-mini output cap)
-  OPENAI_CONSOLIDATION_CHUNK_SIZE — raw features per batch when auto-chunking (default 72)
-  OPENAI_CONSOLIDATION_SINGLE_CALL_MAX — if feature count ≤ this after a reduce round, one final full-schema polish call (default 72)
-  OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON — 1/true: write each chunk LLM JSON to discovery_outputs/consolidation_batches/
-  OPENAI_CONSOLIDATION_MAX_ROUNDS — cap on reduce rounds before stagnation / fallback (default 12)
   OPENAI_PROMPT_CACHE_RETENTION — optional: in_memory | 24h (if model supports extended cache)
   OPENAI_BATCH_POLL_SEC    — seconds between batch status polls (default 20)
   OPENAI_BATCH_MAX_REQUESTS — max lines per batch JSONL (default 50000, API cap 50k; larger jobs split into multiple batches)
@@ -144,21 +144,8 @@ OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
 OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
     "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
 )
-# Consolidation returns a large JSON schema; gpt-4o-mini max completion ~16k — chunk when list is large.
 OPENAI_CONSOLIDATION_MAX_TOKENS = _safe_int_env(
     "OPENAI_CONSOLIDATION_MAX_TOKENS", 16_384, vmin=4_096, vmax=65_536
-)
-OPENAI_CONSOLIDATION_CHUNK_SIZE = _safe_int_env(
-    "OPENAI_CONSOLIDATION_CHUNK_SIZE", 72, vmin=24, vmax=150
-)
-OPENAI_CONSOLIDATION_SINGLE_CALL_MAX = _safe_int_env(
-    "OPENAI_CONSOLIDATION_SINGLE_CALL_MAX", 72, vmin=24, vmax=200
-)
-OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON = os.getenv(
-    "OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON", ""
-).strip().lower() in ("1", "true", "yes")
-OPENAI_CONSOLIDATION_MAX_ROUNDS = _safe_int_env(
-    "OPENAI_CONSOLIDATION_MAX_ROUNDS", 12, vmin=1, vmax=50
 )
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 LLM_PARSE_DEBUG = os.getenv("LLM_PARSE_DEBUG", "").lower() in ("1", "true", "yes")
@@ -276,12 +263,6 @@ elif LLM_PROVIDER == "openai":
     print(
         f"  Consolidation max_tokens={OPENAI_CONSOLIDATION_MAX_TOKENS:,} "
         f"(OPENAI_CONSOLIDATION_MAX_TOKENS)"
-    )
-    print(
-        f"  Consolidation chunking: CHUNK_SIZE={OPENAI_CONSOLIDATION_CHUNK_SIZE}, "
-        f"SINGLE_CALL_MAX={OPENAI_CONSOLIDATION_SINGLE_CALL_MAX}, "
-        f"MAX_ROUNDS={OPENAI_CONSOLIDATION_MAX_ROUNDS} "
-        f"(auto multi-batch when raw feature count > SINGLE_CALL_MAX)"
     )
     if OPENAI_PROMPT_CACHE_RETENTION in ("in_memory", "24h"):
         print(f"  prompt_cache_retention={OPENAI_PROMPT_CACHE_RETENTION!r}")
@@ -504,7 +485,7 @@ def _openai_discovery_chat_body(user_prompt: str) -> dict:
         "model": DISCOVERY_MODEL,
         "messages": messages,
         "temperature": 0.1,
-        "max_tokens": 4096,
+        "max_tokens": 2048,
         "stream": False,
     }
     if OPENAI_JSON_RESPONSE:
@@ -522,9 +503,7 @@ def _maybe_log_openai_chat_usage(resp, context: str = "") -> None:
             if fin == "length":
                 print(
                     f"    WARNING: OpenAI response truncated at max_tokens{extra} — "
-                    "gpt-4o-mini caps near 16k completion; phase1 uses multi-batch consolidation when "
-                    "the feature list is long (OPENAI_CONSOLIDATION_CHUNK_SIZE). "
-                    "Or try a model with higher max output / lower chunk size."
+                    "gpt-4o-mini caps near 16k completion tokens."
                 )
         except (IndexError, TypeError, AttributeError):
             pass
@@ -982,173 +961,130 @@ def load_and_sample(csv_path: str, caption_col: str, mode: str) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 
 DISCOVERY_SYSTEM_PROMPT = """You are a clinical NLP expert specialising in dermatology.
-Your task: given a batch of skin disease case captions, extract ALL possible
-clinical and contextual feature *categories* that appear.
+Your task: given a batch of skin disease case captions, enumerate ALL specific
+binary features that appear, grouped by subcategory.
 
 CRITICAL RULES:
 - Extract ONLY information that is ACTUALLY STATED in these captions.
   Do NOT infer or assume features that are not mentioned.
-- Separate compound features (e.g. 'red scaly lesion' → color=red, texture=scaly)
-- Each feature should be MEDICALLY meaningful and distinguishable
-- Look for EXACT phrases in captions and record them as extraction_examples
-- If a feature appears in multiple captions, collect ALL unique example phrases
+- Separate compound features (e.g. 'red scaly lesion' → morphology_color: [red], morphology_texture: [scaly])
+- Each value must be a specific, distinguishable binary attribute (present / absent)
+- Use snake_case for all values (e.g. oral_mucosal, back_of_hand, joint_pain)
 
-You MUST look for and extract features in ALL of these categories included, but not limited to, if present:
+You MUST scan for features in ALL of these subcategories (use these exact keys), if present:
 
-1. DEMOGRAPHICS: 
-   - Age: specific ages (e.g., "15 years old"), age ranges (e.g., "40 to 49", "18-29"), age groups (child, adolescent, adult, elderly)
-   - Sex/Gender: male, female, man, woman, boy, girl
-   - Fitzpatrick Skin Type/Skin tone: FST1, FST2, FST3, FST4, FST5, FST6 or descriptions (very light, fair/light, medium, olive, brown, dark, deeply pigmented)
-   - Ethnicity/Race: as mentioned in captions
+1. demographics_age: child, adolescent, adult, middle_aged, elderly, infant, neonate, specific ages
+2. demographics_sex: male, female
+3. demographics_skin_type: fst1, fst2, fst3, fst4, fst5, fst6, fair, medium, olive, dark, deeply_pigmented
+4. demographics_ethnicity: as mentioned (e.g. caucasian, african_american, asian, hispanic)
 
-2. MORPHOLOGY - TEXTURE: 
-   - Elevated: raised, bumpy, papule, plaque, nodule, bump, wart, verruca, hives, wheal
+5. morphology_texture:
+   - Elevated: raised, papule, plaque, nodule, bump, wart, verruca, wheal
    - Flat: flat, macular, macule, patch
-   - Surface: rough, scaly, flaky, scale, desquamated, keratotic, hyperkeratotic
-   - Fluid-filled: vesicle, blister, bulla, pustule, fluid-filled, weeping, oozing
-   - Ulceration: ulcer, ulcerated, erosion, eroded, crusted, crust, excoriated
+   - Surface: rough, scaly, flaky, desquamated, keratotic, hyperkeratotic
+   - Fluid-filled: vesicle, blister, bulla, pustule, fluid_filled, weeping, oozing
+   - Ulceration: ulcer, erosion, crusted, excoriated
    - Smooth: smooth, shiny, glossy
-   - Other: cyst, abscess, scar, atrophy, cancerous, non-cancerous, benign, malignant, etc.
+   - Other: cyst, abscess, scar, atrophy, benign, malignant
 
-3. MORPHOLOGY - COLOR: 
-   - Red spectrum: red, erythematous, erythema, pink, violaceous, purple
-   - Pigment changes: brown, hyperpigmented, hypopigmented, white, depigmented, pale, dark
-   - Other colors: yellow, black, blue, grey/gray, slate, salmon-colored, skin-colored
+6. morphology_color:
+   - Red spectrum: red, erythematous, pink, violaceous, purple
+   - Pigment: brown, hyperpigmented, hypopigmented, white, depigmented, pale, dark
+   - Other: yellow, black, blue, grey, salmon_colored, skin_colored
 
+7. morphology_shape:
+   - Shape: round, oval, circular, irregular, annular, linear, serpiginous
+   - Border: well_defined, well_demarcated, ill_defined, irregular_border
+   - Size: small, medium, large
 
-4. MORPHOLOGY - SHAPE/BORDER/SIZE: 
-   - Shape: round, oval, circular, irregular, annular, ring-like, linear, serpiginous, snake-like
-   - Border: well-defined, well-demarcated, ill-defined, irregular border
-   - Size: small (<1cm), medium (1-5cm), large (>5cm), specific measurements
-   - Other: other shape, other information, other factors, other details, etc.
-
-5. MORPHOLOGY - DISTRIBUTION: 
+8. morphology_distribution:
    - Pattern: unilateral, bilateral, symmetric, asymmetric
-   - Arrangement: grouped, clustered, herpetiform, dermatomal, linear, streak-like
-   - Extent: localized, widespread, generalized, diffuse, all over, isolated
-   - Other: other distribution, other information, other factors, other details, etc.
+   - Arrangement: grouped, clustered, herpetiform, dermatomal, linear, streak_like
+   - Extent: localized, widespread, generalized, diffuse, isolated
 
-6. BODY LOCATION (be specific):
-   - Head: face, cheek, forehead, nose, perioral, periorbital, eyelid, lip, scalp, hairline
-   - Neck: neck, cervical
-   - Torso: chest, abdomen, back, flank, torso, trunk, sternum
-   - Upper limb: arm, forearm, elbow, wrist, hand, palm, dorsum, finger, knuckle, back of hand
-   - Lower limb: leg, thigh, shin, calf, knee, ankle, foot, sole, heel, toe, dorsum of foot
-   - Special areas: genitalia, groin, scrotum, vulva, perineum, perianal, buttocks, gluteal
-   - Other: mouth, oral, tongue, mucosa, nail, axilla, armpit, intertriginous
-   - Other: other body locations, other information, other factors, other details, etc.
+9. body_location:
+   - Head: face, cheek, forehead, nose, perioral, periorbital, eyelid, lip, scalp, hairline, ear
+   - Neck: neck
+   - Torso: chest, abdomen, back, flank, trunk
+   - Upper limb: arm, forearm, elbow, wrist, hand, palm, finger, back_of_hand
+   - Lower limb: leg, thigh, shin, calf, knee, ankle, foot, sole, heel, toe
+   - Special: genitalia, groin, scrotum, vulva, perineum, perianal, buttocks
+   - Other: mouth, oral_mucosal, tongue, nail, axilla, intertriginous
 
-7. SYMPTOMS - DERMATOLOGICAL:
-   - Sensations: itching, pruritus, burning, stinging, pain, tenderness, soreness, hurting
-   - Changes: increasing size, growing, spreading, expanding, darkening, lightening, bleeding
-   - Other: bothersome appearance, cosmetic concern, disfigurement, numbness, tingling
-   - Other: other dermatological symptoms, other information, other factors, other details, etc.
+10. symptoms_dermatological:
+    - Sensations: itching, burning, stinging, pain, tenderness, soreness
+    - Changes: increasing_size, spreading, darkening, lightening, bleeding
+    - Other: bothersome_appearance, cosmetic_concern, numbness, tingling
 
-8. SYMPTOMS - SYSTEMIC:
-   - General: fever, chills, fatigue, tiredness, malaise, lethargy, weight loss
-   - Specific: joint pain, arthralgia, arthritis, mouth sores, oral ulcers, shortness of breath, dyspnea
-   - Lymphatic: lymphadenopathy, swollen lymph nodes
-   - Other: other systemic symptoms, other information, other factors, other details, etc.
+11. symptoms_systemic:
+    - General: fever, chills, fatigue, malaise, weight_loss
+    - Specific: joint_pain, mouth_sores, shortness_of_breath
+    - Lymphatic: lymphadenopathy, swollen_lymph_nodes
 
-9. DURATION/ONSET:
-   - Duration: acute, chronic, subacute, hours, days, weeks, months, years, lifelong, congenital, since childhood, since birth
-   - Onset: sudden onset, abrupt onset, gradual onset, slow onset, overnight, within hours, within days
-   - Pattern: recurrent, relapsing, remitting, persistent, intermittent, first episode
+12. duration:
+    - Duration: acute, chronic, subacute, days, weeks, months, years, lifelong, congenital, since_childhood
+    - Onset: sudden_onset, gradual_onset
+    - Pattern: recurrent, relapsing, persistent, intermittent, first_episode
 
+13. triggers:
+    - Environmental: sun_exposure, uv_light, heat, cold, sweating, humidity, seasonal
+    - Contact: allergens, irritants, chemicals, cosmetics, metals, latex
+    - Medications: drug_reaction, antibiotic_reaction
+    - Biological: infection, bacteria, virus, fungus, insect_bite, trauma, friction
+    - Lifestyle: stress, hormonal_changes, pregnancy, diet
+    - Occupational: occupational_exposure
 
-10. TRIGGERS/EXACERBATING FACTORS:
-    - Environmental: sun exposure, UV light, heat, cold, sweating, humidity, seasonal changes
-    - Contact: allergens, irritants, chemicals, cosmetics, metals (nickel), latex, plants
-    - Medications: drugs, medications, antibiotics, new medications
-    - Biological: infection, bacteria, virus, fungus, insect bites, stings, trauma, friction, pressure
-    - Lifestyle: stress, anxiety, hormonal changes, pregnancy, menstruation, menopause, diet, food
-    - Occupational: occupational exposure, work-related
-    - Other: other triggers, other excacerbating factors, causes, etc.
+14. treatments:
+    - Topical: topical_steroids, corticosteroids, emollients, moisturizers
+    - Systemic: oral_steroids, antibiotics, antifungals, antihistamines, immunosuppressants, biologics, retinoids
+    - Physical: phototherapy, laser_therapy, surgery, excision, cryotherapy
+    - Supportive: home_remedies, otc, wound_care
 
-11. TREATMENTS (mentioned or suggested):
-    - Topical: topical steroids, corticosteroids, creams, ointments, lotions, gels, emollients, moisturizers
-    - Systemic medications: oral steroids, antibiotics, antifungals, antihistamines, immunosuppressants, biologics, retinoids, methotrexate
-    - Physical: phototherapy, UV therapy, laser therapy, surgery, excision, cryotherapy, freezing
-    - Supportive: home remedies, over-the-counter, OTC, self-care, wound care, dressings
-    - Other: chemotherapy, radiation therapy (for skin cancer), other treatments, other supportive measures, etc.
+15. clinical_signs:
+    - Specific: nikolsky_sign, auspitz_sign, koebner_phenomenon, darier_sign
+    - Patterns: dermoscopic_pattern, wickham_striae, target_lesions, pathergy
+    - Diagnostic: biopsy_proven, histologically_confirmed, clinically_diagnosed
 
-12. CLINICAL SIGNS:
-    - Specific signs: Nikolsky sign, Auspitz sign, Koebner phenomenon, Darier sign
-    - Patterns: dermoscopic patterns, Wickham striae, target lesions, iris lesions, pathergy
-    - Diagnostic: biopsy-proven, histologically confirmed, clinically diagnosed
+16. history:
+    - Personal: family_history, genetic_predisposition, atopy, allergies, asthma
+    - Disease: recurrence, previous_episodes, new_onset
+    - Immune: immunocompromised, immunosuppressed, hiv, diabetes, autoimmune
+    - Other: comorbidities, sun_damage, smoking, travel_history
 
-13. HISTORY/CONTEXT:
-    - Personal: family history, genetic predisposition, atopy, allergies, asthma
-    - Disease course: recurrence, previous episodes, chronic condition, new onset
-    - Immune status: immunocompromised, immunosuppressed, HIV, diabetes, autoimmune disease
-    - Comorbidities: associated diseases, concurrent conditions
-    - Risk factors: sun damage, smoking, occupational hazards, travel history
-    - Diagnosis source: self-diagnosed, patient-reported, clinician-diagnosed, dermatologist-confirmed, biopsy-proven
-    - Other: other history, other context, other factors, other information, etc.
+17. lesion_count:
+    - Number: single, few, multiple, numerous
+    - Extent: localized, scattered, generalized
 
-14. LESION COUNT/EXTENT:
-    - Number: single, solitary, one lesion, few, several, multiple, numerous, countless
-    - Distribution: localized to one area, scattered, generalized, universal
-    - Other: other count, other extent, other measurements, other information, etc.
+18. secondary_changes:
+    - Chronic: lichenification, thickening, atrophy
+    - Trauma: excoriation, scratch_marks, crusting, fissuring, maceration
+    - Post-inflammatory: post_inflammatory_hyperpigmentation, post_inflammatory_hypopigmentation, scarring, keloid
 
-15. SECONDARY CHANGES:
-    - Chronic changes: lichenification, thickening, atrophy
-    - Trauma: excoriation, scratch marks, crusting, erosion, fissuring, maceration
-    - Post-inflammatory: post-inflammatory hyperpigmentation, post-inflammatory hypopigmentation, scarring, keloid
-    - Other: other changes, other modifications, other information, other factors, etc.
+19. severity:
+    - Scale: mild, moderate, severe, very_severe, life_threatening
+    - Impact: asymptomatic, symptomatic, disabling, quality_of_life_impact
 
-16. SEVERITY:
-    - Scale: mild, moderate, severe, very severe, life-threatening
-    - Impact: asymptomatic, symptomatic, disabling, affecting daily activities, quality of life impact
+20. image_metadata:
+    - Type: clinical_image, dermoscopy, close_up, macro, microscopic
+    - Quality: clear, blurry, well_lit, poor_lighting
 
+21. other:
+    - Any specific clinical findings not covered above (e.g. contagious, autoimmune_nature, malignancy_risk)
 
-17. IMAGE/CONTEXT METADATA:
-    - Image type: clinical image, dermoscopy, close-up, at angle, macro, microscopic
-    - Image quality: clear, blurry, well-lit, poor lighting
-    - View: anterior, posterior, lateral, close-up view
-    - Other: other metadata, other information, other factors, other details, etc.
-
-18. OTHER UNIQUE FEATURES:
-    - Any other specific clinical findings, descriptors, or contextual information not covered above
-    - Look for medical terminology, anatomical terms, and disease-specific descriptors
-    - Other diseases, skin-diseases, or disease acronyms mentioned in captions
-    - Other: other unique features, other information, other factors, other details, etc.
-
-Return ONLY valid JSON — no markdown fences, no prose — in this structure:
-{
-  "feature_categories": [
-    {
-      "name": "snake_case_feature_name",
-      "category": "one of: demographics | morphology | body_location | symptoms | duration | triggers | treatments | clinical_signs | history | severity | image_metadata | other",
-      "description": "brief clinical description of what this feature captures",
-      "example_values": ["value1", "value2", "value3"],
-      "is_binary": true or false,
-      "extraction_examples": ["phrase from caption that indicated this feature"]
-    }
-  ]
-}
+Return ONLY valid JSON — no markdown fences, no prose.
+Output is a single object where each key is a subcategory name and each value is the list of snake_case feature values found in these captions:
+{"demographics_age":["adult","elderly"],"morphology_color":["red","hyperpigmented"],"body_location":["face","arm"],"symptoms_dermatological":["itching","pain"]}
+Omit subcategories with no findings. List every distinct value found.
 """
 
-# Shorter instructions for Qwen + vLLM --max-model-len 8192 (leaves room for captions + JSON).
 DISCOVERY_COMPACT_SYSTEM_PROMPT = """You are a clinical NLP expert for dermatology. From the captions, extract ONLY features explicitly stated (no guessing).
 
-Scan: demographics (age, sex, FST/skin tone, ethnicity); morphology (texture, color, shape, border, size, distribution); body_location; dermatologic + systemic symptoms; duration/onset; triggers; treatments; clinical signs; history; lesion count/extent; secondary changes; severity; image metadata; other distinct terms.
+Subcategory keys: demographics_age, demographics_sex, demographics_skin_type, demographics_ethnicity, morphology_texture, morphology_color, morphology_shape, morphology_distribution, body_location, symptoms_dermatological, symptoms_systemic, duration, triggers, treatments, clinical_signs, history, lesion_count, secondary_changes, severity, image_metadata, other.
 
-Rules: snake_case names; split compound findings; extraction_examples must quote caption phrases; merge duplicates.
+Rules: snake_case values; split compound findings; omit empty subcategories.
 
-Return ONLY valid JSON (no markdown fences):
-{
-  "feature_categories": [
-    {
-      "name": "snake_case_feature_name",
-      "category": "demographics | morphology | body_location | symptoms | duration | triggers | treatments | clinical_signs | history | severity | image_metadata | other",
-      "description": "brief clinical description",
-      "example_values": ["value1", "value2"],
-      "is_binary": true or false,
-      "extraction_examples": ["phrase from caption"]
-    }
-  ]
-}
+Return ONLY valid JSON (no markdown fences) — object mapping subcategory to list of values:
+{"body_location":["face","arm"],"morphology_color":["red"],"symptoms_dermatological":["itching"]}
 """
 
 
@@ -1170,41 +1106,51 @@ def build_discovery_user_prompt(captions: list[str], label_name: str) -> str:
     """User message (variable part) for discovery — keep separate from static system prompt for caching."""
     numbered = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(captions))
     return (
-        f"Extract all feature categories from these {len(captions)} dermatology captions "
+        f"Extract all binary features from these {len(captions)} dermatology captions "
         f"for the disease category '{label_name}':\n\n{numbered}"
     )
 
 
-def features_from_discovery_response_text(text: str) -> list[dict]:
-    """Parse discovery JSON into feature dicts (empty list if unparseable)."""
+def features_from_discovery_response_text(text: str) -> dict[str, list[str]]:
+    """Parse compact discovery JSON {subcategory: [values]} (empty dict if unparseable)."""
     parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-    if parsed is None:
-        return []
-    if isinstance(parsed, dict):
-        return list(parsed.get("feature_categories") or [])
-    if isinstance(parsed, list):
-        return parsed
-    return []
+    if not isinstance(parsed, dict):
+        return {}
+    if "feature_categories" in parsed and isinstance(parsed["feature_categories"], list):
+        parsed.pop("feature_categories")
+    out: dict[str, list[str]] = {}
+    for key, vals in parsed.items():
+        k = str(key).strip().lower().replace(" ", "_")
+        if not k:
+            continue
+        if isinstance(vals, list):
+            clean = [
+                str(v).strip().lower().replace(" ", "_")
+                for v in vals
+                if isinstance(v, (str, int, float)) and str(v).strip()
+            ]
+            if clean:
+                out[k] = clean
+        elif isinstance(vals, str) and vals.strip():
+            out[k] = [vals.strip().lower().replace(" ", "_")]
+    return out
 
 
 def discover_features_batch(
     captions: list[str], label_name: str, retries: int = 3
-) -> list[dict]:
-    """Send a batch of captions to LLM and extract feature categories."""
+) -> dict[str, list[str]]:
+    """Send a batch of captions to LLM and extract features as {subcategory: [values]}."""
     user_prompt = build_discovery_user_prompt(captions, label_name)
 
     for attempt in range(retries):
         try:
             text = call_llm(user_prompt, get_discovery_system_prompt())
-            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            if parsed is None:
+            result = features_from_discovery_response_text(text)
+            if not result:
                 print(f"    JSON parse error (attempt {attempt+1}), retrying...")
                 time.sleep(2 ** attempt)
                 continue
-            if isinstance(parsed, dict):
-                return parsed.get("feature_categories", [])
-            elif isinstance(parsed, list):
-                return parsed
+            return result
         except json.JSONDecodeError:
             print(f"    JSON parse error (attempt {attempt+1}), retrying...")
             time.sleep(2 ** attempt)
@@ -1213,7 +1159,7 @@ def discover_features_batch(
             time.sleep(2 ** attempt)
 
     print(f"    WARNING: All retries failed for batch, skipping.")
-    return []
+    return {}
 
 
 def _short_label_desc(label_name, max_len: int = 42) -> str:
@@ -1224,95 +1170,35 @@ def _short_label_desc(label_name, max_len: int = 42) -> str:
     return s[: max_len - 3] + "..."
 
 
-def _coerce_discovery_feature_items(items: list | None) -> list[dict]:
-    """
-    Some models (e.g. Qwen) return feature_categories as a mix of objects and bare strings.
-    Merge expects dicts with a "name" key; coerce strings into minimal dicts, skip junk.
-    """
-    if not items:
-        return []
-    out: list[dict] = []
-    for feat in items:
-        if isinstance(feat, dict):
-            out.append(feat)
-            continue
-        if isinstance(feat, str):
-            s = feat.strip()
-            if not s:
-                continue
-            out.append(
-                {
-                    "name": s,
-                    "category": "other",
-                    "description": "",
-                    "example_values": [],
-                    "is_binary": False,
-                    "extraction_examples": [],
-                }
-            )
-    return out
-
-
-def _stringify_listish(x) -> list[str]:
-    """Coerce example_values / extraction_examples to a list of strings (avoids set() on nested types)."""
-    if x is None:
-        return []
-    if isinstance(x, str):
-        return [x] if x.strip() else []
-    if isinstance(x, list):
-        return [str(i) for i in x]
-    return [str(x)]
-
-
-def _normalize_schema_feature_categories(items: list | None) -> list[dict]:
-    """Canonical schema list for phase 1 output and phase 2 input: dicts with non-empty names only."""
-    if not items:
-        return []
-    out: list[dict] = []
-    for feat in items:
-        if isinstance(feat, dict):
-            raw_name = feat.get("name")
-            name_s = str(raw_name).strip() if raw_name is not None else ""
-            if not name_s:
-                continue
-            d = dict(feat)
-            d["name"] = name_s
-            out.append(d)
-        elif isinstance(feat, str):
-            s = feat.strip()
-            if s:
-                out.append(
-                    {
-                        "name": s,
-                        "category": "other",
-                        "description": "",
-                        "example_values": [],
-                        "is_binary": True,
-                    }
-                )
-    return out
-
-
-def _merge_raw_label_features_into_global(
-    all_features: dict[str, dict], label_features: list, label_name
+def _merge_batch_features(
+    accumulator: dict[str, list[str]],
+    batch_result: dict[str, list[str]],
 ) -> None:
-    """Merge one label's discovery list into the global feature dict (by snake_case name)."""
-    for feat in _coerce_discovery_feature_items(label_features):
-        name = str(feat.get("name") or "").lower().strip().replace(" ", "_")
-        if not name:
-            continue
-        if name not in all_features:
-            all_features[name] = feat
-            all_features[name]["found_in_labels"] = [label_name]
-        else:
-            existing_ex = set(_stringify_listish(all_features[name].get("example_values")))
-            new_ex = set(_stringify_listish(feat.get("example_values")))
-            all_features[name]["example_values"] = list(existing_ex | new_ex)[:10]
-            existing_extr = set(_stringify_listish(all_features[name].get("extraction_examples")))
-            new_extr = set(_stringify_listish(feat.get("extraction_examples")))
-            all_features[name]["extraction_examples"] = list(existing_extr | new_extr)[:5]
-            if label_name not in all_features[name].get("found_in_labels", []):
-                all_features[name]["found_in_labels"].append(label_name)
+    """Merge one batch's {subcategory: [values]} into a label-level accumulator (list, not set, for JSON)."""
+    for subcat, vals in batch_result.items():
+        if subcat not in accumulator:
+            accumulator[subcat] = []
+        existing = set(accumulator[subcat])
+        for v in vals:
+            if v not in existing:
+                accumulator[subcat].append(v)
+                existing.add(v)
+
+
+def _merge_label_features_into_global(
+    all_features: dict[str, set[str]],
+    label_features: dict[str, list[str]],
+) -> None:
+    """Merge one label's {subcategory: [values]} into global accumulator {subcategory: set}."""
+    for subcat, vals in label_features.items():
+        if subcat not in all_features:
+            all_features[subcat] = set()
+        all_features[subcat].update(vals)
+
+
+def _count_total_values(features: dict[str, list[str] | set[str]]) -> int:
+    """Count total individual feature values across all subcategories."""
+    return sum(len(v) for v in features.values())
 
 
 def _prepare_label_captions_block(sample_df: pd.DataFrame, label_name) -> tuple[list[str], int, int]:
@@ -1347,12 +1233,12 @@ def _log_label_caption_counts(label_name, raw_caption_n: int, uniq_n: int, dup_s
         )
 
 
-def _discover_all_features_openai_batch(sample_df: pd.DataFrame) -> dict[str, dict]:
+def _discover_all_features_openai_batch(sample_df: pd.DataFrame) -> dict[str, set[str]]:
     """
     OpenAI-only: enqueue all discovery chat completions on the Batch API, then assemble results.
     Per-label disk cache is respected; only missing labels are batched.
     """
-    all_features: dict[str, dict] = {}
+    all_features: dict[str, set[str]] = {}
     label_names = sample_df["label_name"].unique()
     jobs: list[dict] = []
     job_meta: dict[str, dict] = {}
@@ -1370,11 +1256,12 @@ def _discover_all_features_openai_batch(sample_df: pd.DataFrame) -> dict[str, di
 
         if cache_path.exists():
             with open(cache_path, "r", encoding="utf-8") as f:
-                label_features = json.load(f)
+                label_features: dict[str, list[str]] = json.load(f)
             tqdm.write(
-                f"  [{label_name}] loaded {len(label_features)} cached features (skipped LLM)"
+                f"  [{label_name}] loaded {_count_total_values(label_features)} cached values "
+                f"in {len(label_features)} subcategories (skipped LLM)"
             )
-            _merge_raw_label_features_into_global(all_features, label_features, label_name)
+            _merge_label_features_into_global(all_features, label_features)
             continue
 
         for start in range(0, uniq_n, BATCH_SIZE):
@@ -1410,7 +1297,7 @@ def _discover_all_features_openai_batch(sample_df: pd.DataFrame) -> dict[str, di
         cache_path = meta0["cache_path"]
         uniq_n = meta0["uniq_n"]
         raw_caption_n = meta0["raw_caption_n"]
-        label_features: list = []
+        label_features: dict[str, list[str]] = {}
         for _start, cid, meta in entries:
             text = mapping.get(cid) or ""
             feats = features_from_discovery_response_text(text)
@@ -1420,7 +1307,7 @@ def _discover_all_features_openai_batch(sample_df: pd.DataFrame) -> dict[str, di
                     f"batch @ {meta['batch_start']}"
                 )
                 feats = discover_features_batch(meta["captions"], meta["label_name"])
-            label_features.extend(feats)
+            _merge_batch_features(label_features, feats)
 
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(label_features, f, indent=2)
@@ -1429,17 +1316,19 @@ def _discover_all_features_openai_batch(sample_df: pd.DataFrame) -> dict[str, di
             if DISCOVERY_DEDUPE_CAPTIONS and raw_caption_n != uniq_n
             else f"{uniq_n:,} captions"
         )
+        n_vals = _count_total_values(label_features)
         tqdm.write(
-            f"  [{label_name}] discovered {len(label_features)} feature(s) from {src_note} (batch)"
+            f"  [{label_name}] discovered {n_vals} values in {len(label_features)} subcategories "
+            f"from {src_note} (batch)"
         )
-        _merge_raw_label_features_into_global(all_features, label_features, label_name)
+        _merge_label_features_into_global(all_features, label_features)
 
     return all_features
 
 
-def _discover_all_features_sequential(sample_df: pd.DataFrame) -> dict[str, dict]:
+def _discover_all_features_sequential(sample_df: pd.DataFrame) -> dict[str, set[str]]:
     """Gemini / Qwen / OpenAI sync: one chat completion per caption batch."""
-    all_features: dict[str, dict] = {}
+    all_features: dict[str, set[str]] = {}
     label_names = sample_df["label_name"].unique()
 
     for label_name in tqdm(
@@ -1458,12 +1347,13 @@ def _discover_all_features_sequential(sample_df: pd.DataFrame) -> dict[str, dict
 
         if cache_path.exists():
             with open(cache_path, "r", encoding="utf-8") as f:
-                label_features = json.load(f)
+                label_features: dict[str, list[str]] = json.load(f)
             tqdm.write(
-                f"  [{label_name}] loaded {len(label_features)} cached features (skipped LLM)"
+                f"  [{label_name}] loaded {_count_total_values(label_features)} cached values "
+                f"in {len(label_features)} subcategories (skipped LLM)"
             )
         else:
-            label_features = []
+            label_features: dict[str, list[str]] = {}
             batch_starts = list(range(0, uniq_n, BATCH_SIZE))
             inner_desc = f"Batches [{_short_label_desc(label_name)}]"
             for start in tqdm(
@@ -1475,7 +1365,7 @@ def _discover_all_features_sequential(sample_df: pd.DataFrame) -> dict[str, dict
             ):
                 batch = label_captions[start : start + BATCH_SIZE]
                 feats = discover_features_batch(batch, label_name)
-                label_features.extend(feats)
+                _merge_batch_features(label_features, feats)
                 if LLM_PROVIDER == "qwen":
                     time.sleep(0.1)
                 elif LLM_PROVIDER == "openai":
@@ -1490,19 +1380,21 @@ def _discover_all_features_sequential(sample_df: pd.DataFrame) -> dict[str, dict
                 if DISCOVERY_DEDUPE_CAPTIONS and raw_caption_n != uniq_n
                 else f"{uniq_n:,} captions"
             )
+            n_vals = _count_total_values(label_features)
             tqdm.write(
-                f"  [{label_name}] discovered {len(label_features)} feature(s) from {src_note}"
+                f"  [{label_name}] discovered {n_vals} values in {len(label_features)} "
+                f"subcategories from {src_note}"
             )
 
-        _merge_raw_label_features_into_global(all_features, label_features, label_name)
+        _merge_label_features_into_global(all_features, label_features)
 
     return all_features
 
 
-def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
+def discover_all_features(sample_df: pd.DataFrame) -> dict[str, set[str]]:
     """
     Run per-label-name discovery across all sampled captions.
-    Returns a dict of {feature_name: feature_dict}.
+    Returns {subcategory: set_of_values} accumulated across all labels.
     """
     if LLM_PROVIDER == "openai" and OPENAI_USE_BATCH:
         return _discover_all_features_openai_batch(sample_df)
@@ -1513,534 +1405,203 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, dict]:
 # STEP 3: Consolidation via LLM
 # ──────────────────────────────────────────────────────────────────────────────
 
-CONSOLIDATION_SYSTEM_PROMPT = """You are a senior clinical NLP engineer building a canonical
-feature schema for a skin disease classification system.
+CONSOLIDATION_SYSTEM_PROMPT = """You deduplicate and standardize feature values for a dermatology classifier schema.
+
+You receive a JSON object mapping subcategory keys to lists of feature values.
+These were collected across many disease labels and contain synonyms, near-duplicates, and variant spellings.
 
 Your task:
-1. DEDUPLICATE synonyms (e.g. 'lesion_colour' and 'color_of_lesion' → 'lesion_color';
-   'itch' and 'pruritus' → 'symptom_itching')
-2. MERGE overlapping features into canonical names
-3. STANDARDISE names to snake_case
-4. DO NOT REMOVE any unique features that are useful for differential diagnosis
-5. ENSURE the following categories are well-represented:
-   - demographics (age, sex, ethnicity, fitzpatrick skin type, skin tone), morphology (texture, color, shape/border, distribution),
-   - body_location, symptoms (dermatological + systemic),
-   - duration/onset, triggers, treatments, clinical_signs, history
-   - lesion count/extent, secondary changes, severity, other
-6. For each feature, decide: is_binary (true = present/absent encoding)
-   or categorical (false = needs value strings like "topical|systemic|surgical")
+1. MERGE obvious synonyms within each subcategory (e.g. "itch" + "pruritus" → "itching"; "erythematous" + "red" → "red")
+2. STANDARDIZE all values to snake_case
+3. REMOVE junk/vague entries (e.g. "other", "unknown", "various")
+4. DO NOT merge clinically distinct concepts (e.g. keep "papule" and "plaque" separate)
+5. DO NOT move values between subcategories
+6. DO NOT add new subcategories or values not present in the input
 
-Return ONLY valid JSON — no markdown fences, no prose — with this structure:
-{
-  "feature_categories": [
-    {
-      "name": "snake_case_canonical_name",
-      "category": "demographics | morphology | body_location | symptoms | duration | triggers | treatments | clinical_signs | history | severity | other",
-      "description": "brief clinical description",
-      "example_values": ["val1", "val2"],
-      "is_binary": true/false,
-      "regex_extractable": true/false
-    }
-  ]
-}
+Return ONLY valid JSON — no markdown fences, no prose — same format as input:
+{"demographics_age":["child","adolescent","adult","elderly"],"morphology_color":["red","brown","hyperpigmented"],...}
 """
 
-# Batched reduce: caller sorts by category so synonyms are likelier to land in the same batch.
-CONSOLIDATION_CHUNK_SYSTEM_PROMPT = """You consolidate dermatology feature definitions for a classifier schema.
 
-You receive ONE BATCH that is part of a larger schema (other batches run separately). Rows are grouped by category.
-
-REQUIRED:
-- Merge duplicates and NEAR-synonyms WITHIN this batch (same clinical idea, different spelling → one feature).
-- Obey the HARD LIMIT on output count in the user message (ceil); prefer fewer, broader canonical names when unsure.
-- description ≤80 characters. At most 2 short strings in example_values.
-- snake_case names. Set is_binary and regex_extractable sensibly.
-
-Return ONLY valid JSON — no markdown:
-{"feature_categories":[{"name":"...","category":"...","description":"...","example_values":[],"is_binary":true,"regex_extractable":false}]}
-"""
-
-CONSOLIDATION_MINIMAL_DEDUPE_SYSTEM_PROMPT = """You deduplicate a long list of dermatology classifier features (name + category + is_binary only).
-
-Merge obvious synonyms globally (e.g. lesion_colour + lesion_color → lesion_color; itch + pruritus → symptom_itching).
-Do NOT merge clinically distinct concepts. Output SHORT JSON only — no markdown, no descriptions, no example_values.
-
-{"feature_categories":[{"name":"snake_case","category":"demographics|morphology|body_location|symptoms|duration|triggers|treatments|clinical_signs|history|severity|other","is_binary":true,"regex_extractable":false}]}
-
-regex_extractable: true only when a simple regex could extract it from text."""
-
-
-def _merge_consolidation_features_by_name(features: list) -> list[dict]:
-    """Collapse features that share the same normalised snake_case name."""
-    out: dict[str, dict] = {}
-    for raw in features:
-        if not isinstance(raw, dict):
-            continue
-        nm = str(raw.get("name") or "").strip()
-        if not nm:
-            continue
-        key = nm.lower().replace(" ", "_")
-        if key not in out:
-            d = dict(raw)
-            d["name"] = nm
-            if "n_labels_found" not in d:
-                d["n_labels_found"] = int(raw.get("n_labels_found", 0) or 0)
-            out[key] = d
-        else:
-            ex = out[key]
-            oev = _stringify_listish(ex.get("example_values"))
-            nev = _stringify_listish(raw.get("example_values"))
-            ex["example_values"] = list(dict.fromkeys(oev + nev))[:8]
-            d1 = str(ex.get("description") or "")
-            d2 = str(raw.get("description") or "")
-            if len(d2) > len(d1):
-                ex["description"] = d2
-            ex["n_labels_found"] = max(
-                int(ex.get("n_labels_found", 0) or 0),
-                int(raw.get("n_labels_found", 0) or 0),
-            )
-    return list(out.values())
-
-
-def _parsed_to_feature_list(parsed) -> list | None:
-    if parsed is None:
-        return None
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict) and "feature_categories" in parsed:
-        return parsed.get("feature_categories")
-    return None
-
-
-def _enrich_consolidated_from_pool(merged: list[dict], pool: list[dict]) -> list[dict]:
-    """Copy description / example_values from pool when output name matches a pool feature."""
-    pool_idx: dict[str, dict] = {}
-    for p in pool:
-        if not isinstance(p, dict):
-            continue
-        k = str(p.get("name") or "").strip().lower().replace(" ", "_")
-        if k and k not in pool_idx:
-            pool_idx[k] = dict(p)
-    out: list[dict] = []
-    for m in merged:
-        if not isinstance(m, dict):
-            continue
-        nm = str(m.get("name") or "").strip()
-        k = nm.lower().replace(" ", "_")
-        base = dict(pool_idx.get(k, {}))
-        base.update(m)
-        if not str(base.get("description") or "").strip():
-            base["description"] = nm.replace("_", " ")[:200]
-        base.setdefault("example_values", [])
-        out.append(base)
-    return _normalize_schema_feature_categories(out)
-
-
-def _consolidate_minimal_global_dedupe(current: list[dict]) -> list[dict] | None:
+def consolidate_schema(
+    all_features: dict[str, set[str]],
+    n_captions_sampled: int = 0,
+    n_disease_classes: int = 0,
+) -> dict[str, list[str]]:
     """
-    Single LLM call on compact name/category/is_binary rows (fits context + ~16k output).
-    Used when batched reduce stops shrinking (synonyms were mostly across batches).
+    Deduplicate feature values within each subcategory via LLM.
+    Input:  {subcategory: set_of_values}  (raw discovery output)
+    Output: {subcategory: sorted_list_of_canonical_values}
     """
-    rows = []
-    for f in current:
-        if not isinstance(f, dict):
-            continue
-        rows.append(
-            {
-                "name": str(f.get("name") or ""),
-                "category": str(f.get("category") or "other"),
-                "is_binary": bool(f.get("is_binary", True)),
-            }
-        )
-    body = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    raw: dict[str, list[str]] = {k: sorted(v) for k, v in all_features.items()}
+    total_vals = sum(len(v) for v in raw.values())
+    print(
+        f"  Sending {total_vals} raw values in {len(raw)} subcategories for consolidation..."
+    )
+
+    body = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
     user = (
-        f"There are {len(rows)} rows (name/category/is_binary). Globally merge synonyms into one row each.\n"
+        f"Consolidate this dermatology feature schema ({total_vals} total values "
+        f"across {len(raw)} subcategories), extracted from {n_captions_sampled:,} captions "
+        f"across {n_disease_classes} disease classes.\n\n"
         f"JSON:\n{body}"
     )
-    for attempt in range(2):
-        try:
-            text = call_llm(
-                user,
-                CONSOLIDATION_MINIMAL_DEDUPE_SYSTEM_PROMPT,
-                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY + "_minimal",
-                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
-            )
-            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            items = _parsed_to_feature_list(parsed)
-            if not items:
-                time.sleep(2)
-                continue
-            enriched = _enrich_consolidated_from_pool(
-                _normalize_schema_feature_categories(items), current
-            )
-            print(f"  Minimal global dedupe: {len(rows)} → {len(enriched)} features")
-            return enriched
-        except Exception as e:
-            print(f"  Minimal dedupe attempt {attempt+1} failed: {e}")
-            time.sleep(2)
-    return None
 
-
-def _consolidate_schema_single_pass(
-    compact: list[dict],
-    n_captions_sampled: int,
-    n_disease_classes: int,
-) -> dict | None:
-    """One full-schema LLM call; returns None on failure."""
-    raw_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
-    prompt = (
-        f"You are given a raw list of {len(compact)} clinical feature categories that were\n"
-        f"extracted by an LLM from {n_captions_sampled} dermatology case captions across\n"
-        f"{n_disease_classes} disease classes.\n\n"
-        f"Here is the raw feature list:\n{raw_json}"
-    )
     for attempt in range(3):
         try:
             text = call_llm(
-                prompt,
+                user,
                 CONSOLIDATION_SYSTEM_PROMPT,
                 openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY,
                 openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
             )
             parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            items = _parsed_to_feature_list(parsed)
-            if items is None:
-                print(
-                    f"  Consolidation JSON parse error (attempt {attempt+1}), retrying... "
-                    "(large lists use chunked consolidation automatically if this keeps failing)"
-                )
+            if not isinstance(parsed, dict):
+                print(f"  Consolidation parse error (attempt {attempt+1}), retrying...")
                 time.sleep(3)
                 continue
-            if isinstance(parsed, list):
-                parsed = {"feature_categories": items}
-            else:
-                parsed = dict(parsed)
-                parsed["feature_categories"] = items
-            parsed["feature_categories"] = _normalize_schema_feature_categories(
-                parsed.get("feature_categories")
+            result: dict[str, list[str]] = {}
+            for key, vals in parsed.items():
+                k = str(key).strip().lower().replace(" ", "_")
+                if not k or not isinstance(vals, list):
+                    continue
+                clean = sorted(set(
+                    str(v).strip().lower().replace(" ", "_")
+                    for v in vals
+                    if isinstance(v, (str, int, float)) and str(v).strip()
+                ))
+                if clean:
+                    result[k] = clean
+            new_total = sum(len(v) for v in result.values())
+            print(
+                f"  Consolidated: {total_vals} → {new_total} values "
+                f"in {len(result)} subcategories"
             )
-            print(f"  Consolidated to {len(parsed['feature_categories'])} features")
-            return parsed
+            return result
         except json.JSONDecodeError:
             print(f"  Consolidation JSON parse error (attempt {attempt+1}), retrying...")
             time.sleep(3)
         except Exception as e:
             print(f"  Consolidation API error (attempt {attempt+1}): {e}")
             time.sleep(3)
-    return None
 
-
-def _llm_consolidation_chunk(
-    batch: list[dict],
-    *,
-    round_idx: int,
-    batch_idx: int,
-    n_batches: int,
-) -> list[dict] | None:
-    n_in = len(batch)
-    # Force real shrink per batch (synonyms within batch); cap output to ~half of inputs.
-    target_cap = max(6, min(n_in, (n_in * 50 + 99) // 100))
-    body = json.dumps(batch, ensure_ascii=False, separators=(",", ":"))
-    user = (
-        f"Consolidation batch {batch_idx} of {n_batches} in reduce round {round_idx}.\n"
-        f"Inputs: {n_in} features. HARD LIMIT: output at most {target_cap} feature_categories "
-        f"(merge aggressively; you must output FEWER than {n_in} unless already minimal).\n\n"
-        f"JSON:\n{body}"
-    )
-    for attempt in range(3):
-        try:
-            text = call_llm(
-                user,
-                CONSOLIDATION_CHUNK_SYSTEM_PROMPT,
-                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY + "_chunk",
-                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
-            )
-            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            items = _parsed_to_feature_list(parsed)
-            if not items:
-                print(
-                    f"    Chunk r{round_idx} b{batch_idx}: parse failed "
-                    f"(attempt {attempt+1}), retrying..."
-                )
-                time.sleep(2)
-                continue
-            norm = _normalize_schema_feature_categories(items)
-            if OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON:
-                out_dir = DISCOVERY_DIR / "consolidation_batches"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = out_dir / f"round{round_idx}_batch{batch_idx}_of{n_batches}.json"
-                with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump({"feature_categories": norm}, f, indent=2, ensure_ascii=False)
-                print(f"    Wrote chunk response → {out_path}")
-            return norm
-        except Exception as e:
-            print(f"    Chunk r{round_idx} b{batch_idx} error (attempt {attempt+1}): {e}")
-            time.sleep(2)
-    return None
-
-
-def _consolidate_schema_final_polish(
-    current: list[dict],
-    n_captions_sampled: int,
-    n_disease_classes: int,
-) -> dict | None:
-    raw_json = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
-    prompt = (
-        f"After batched merging, there are {len(current)} candidate feature categories.\n"
-        f"Perform a GLOBAL polish: merge synonyms across the whole list, standardise snake_case, "
-        f"fix categories. Keep clinically distinct features.\n"
-        f"Corpus: {n_captions_sampled} captions sampled, {n_disease_classes} disease classes.\n\n"
-        f"JSON:\n{raw_json}"
-    )
-    for attempt in range(3):
-        try:
-            text = call_llm(
-                prompt,
-                CONSOLIDATION_SYSTEM_PROMPT,
-                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY,
-                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
-            )
-            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            items = _parsed_to_feature_list(parsed)
-            if items is None:
-                print(
-                    f"  Final polish JSON parse error (attempt {attempt+1}), retrying... "
-                    "(if truncated, lower OPENAI_CONSOLIDATION_SINGLE_CALL_MAX or CHUNK_SIZE)"
-                )
-                time.sleep(3)
-                continue
-            out = {
-                "feature_categories": _normalize_schema_feature_categories(items),
-            }
-            print(f"  Final polish: {len(out['feature_categories'])} features")
-            return out
-        except Exception as e:
-            print(f"  Final polish error (attempt {attempt+1}): {e}")
-            time.sleep(3)
-    return None
-
-
-def _consolidate_schema_chunked_reduce(
-    compact: list[dict],
-    n_captions_sampled: int,
-    n_disease_classes: int,
-) -> dict:
-    chunk_sz = OPENAI_CONSOLIDATION_CHUNK_SIZE
-    single_max = OPENAI_CONSOLIDATION_SINGLE_CALL_MAX
-    current = list(compact)
-    round_idx = 0
-    max_rounds = OPENAI_CONSOLIDATION_MAX_ROUNDS
-    stagnant_rounds = 0
-    minimal_tried = False
-
-    print(
-        f"  Chunked consolidation: CHUNK_SIZE={chunk_sz}, "
-        f"SINGLE_CALL_MAX={single_max}, MAX_ROUNDS={max_rounds} "
-        f"(gpt-4o-mini output ~16k tokens)."
-    )
-    if OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON:
-        batch_dir = DISCOVERY_DIR / "consolidation_batches"
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  Per-batch JSON → {batch_dir}/ (OPENAI_CONSOLIDATION_SAVE_CHUNK_JSON)")
-
-    while len(current) > single_max and round_idx < max_rounds:
-        round_idx += 1
-        prev_len = len(current)
-        # Group by category so cross-synonyms in the same domain land in one LLM batch.
-        current.sort(
-            key=lambda x: (
-                str(x.get("category") or ""),
-                str(x.get("name") or "").lower(),
-            )
-        )
-        n_batches = (len(current) + chunk_sz - 1) // chunk_sz
-        print(
-            f"  Reduce round {round_idx}: {len(current)} features in {n_batches} LLM batch(es)"
-        )
-        next_parts: list[dict] = []
-        for bi in range(n_batches):
-            sl = current[bi * chunk_sz : (bi + 1) * chunk_sz]
-            got = _llm_consolidation_chunk(
-                sl, round_idx=round_idx, batch_idx=bi + 1, n_batches=n_batches
-            )
-            if got is None:
-                print("  WARNING: Chunk LLM failed; using name-merged list without further LLM steps.")
-                return {
-                    "feature_categories": _normalize_schema_feature_categories(
-                        _merge_consolidation_features_by_name(current)
-                    ),
-                }
-            next_parts.extend(got)
-        current = _merge_consolidation_features_by_name(next_parts)
-        print(f"  → {len(current)} features after name-merge")
-
-        shrink = prev_len - len(current)
-        rel = shrink / prev_len if prev_len else 1.0
-        if shrink <= max(1, int(prev_len * 0.008)):  # < ~0.8% reduction
-            stagnant_rounds += 1
-        else:
-            stagnant_rounds = 0
-
-        if stagnant_rounds >= 2 and not minimal_tried:
-            print(
-                "  Stagnation: batches barely shrink (synonyms are mostly ACROSS batches). "
-                "Running one minimal global dedupe pass (name/category only)…"
-            )
-            alt = _consolidate_minimal_global_dedupe(current)
-            minimal_tried = True
-            if alt is not None:
-                current = alt
-                stagnant_rounds = 0
-                print(f"  → {len(current)} features after minimal global dedupe")
-                if len(current) <= single_max:
-                    break
-            else:
-                stagnant_rounds = 3
-
-        if stagnant_rounds >= 3:
-            print(
-                "  Stagnation persists — stopping reduce rounds (try smaller CHUNK_SIZE or re-run). "
-                "Proceeding to final polish / fallback."
-            )
-            break
-
-    if round_idx >= max_rounds and len(current) > single_max:
-        print(
-            f"  WARNING: Hit max reduce rounds ({max_rounds}); final polish may still truncate."
-        )
-
-    final = _consolidate_schema_final_polish(
-        current, n_captions_sampled, n_disease_classes
-    )
-    if final is not None:
-        return final
-
-    print(
-        "  WARNING: Final polish failed or truncated; returning merge-only feature list "
-        "(run again or tighten OPENAI_CONSOLIDATION_SINGLE_CALL_MAX)."
-    )
-    return {
-        "feature_categories": _normalize_schema_feature_categories(current),
-    }
-
-
-def consolidate_schema(
-    all_features: dict[str, dict],
-    n_captions_sampled: int = 0,
-    n_disease_classes: int = 0,
-) -> dict:
-    """Deduplicate discovered features via LLM (chunked when the list is large)."""
-    compact: list[dict] = []
-    for name, feat in all_features.items():
-        compact.append(
-            {
-                "name": name,
-                "category": feat.get("category", "other"),
-                "description": feat.get("description", ""),
-                "example_values": feat.get("example_values", [])[:5],
-                "is_binary": feat.get("is_binary", True),
-                "n_labels_found": len(feat.get("found_in_labels", [])),
-            }
-        )
-
-    print(f"  Sending {len(compact)} raw features for consolidation...")
-
-    if len(compact) <= OPENAI_CONSOLIDATION_SINGLE_CALL_MAX:
-        done = _consolidate_schema_single_pass(
-            compact, n_captions_sampled, n_disease_classes
-        )
-        if done is not None:
-            return done
-        print("  Single-pass consolidation failed; using chunked reduce on the full list...")
-
-    return _consolidate_schema_chunked_reduce(
-        compact, n_captions_sampled, n_disease_classes
-    )
+    print("  WARNING: All consolidation attempts failed; using raw deduplicated values.")
+    return {k: sorted(v) for k, v in all_features.items()}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 4: SCIN column alignment (AFTER final feature list is established)
 # ──────────────────────────────────────────────────────────────────────────────
-# SCIN column → canonical names: shared module scin_feature_map.SCIN_SCHEMA_FEATURES
 
-def add_scin_alignment(schema: dict) -> dict:
+# SCIN canonical name → (subcategory, feature_value)
+SCIN_TO_SUBCATEGORY: dict[str, tuple[str, str]] = {
+    "age_group":                       ("demographics_age", "age_group"),
+    "sex":                             ("demographics_sex", "sex"),
+    "fitzpatrick_skin_type":           ("demographics_skin_type", "fitzpatrick_skin_type"),
+    "race_american_indian_alaska_native": ("demographics_ethnicity", "american_indian_alaska_native"),
+    "race_asian":                      ("demographics_ethnicity", "asian"),
+    "race_black_african_american":     ("demographics_ethnicity", "black_african_american"),
+    "race_hispanic_latino":            ("demographics_ethnicity", "hispanic_latino"),
+    "race_middle_eastern_north_african": ("demographics_ethnicity", "middle_eastern_north_african"),
+    "race_native_hawaiian_pacific_islander": ("demographics_ethnicity", "native_hawaiian_pacific_islander"),
+    "race_white":                      ("demographics_ethnicity", "white"),
+    "race_other":                      ("demographics_ethnicity", "other_race"),
+    "race_prefer_not_to_answer":       ("demographics_ethnicity", "prefer_not_to_answer"),
+    "race_two_or_more":                ("demographics_ethnicity", "two_or_more_races"),
+    "texture_raised":                  ("morphology_texture", "raised"),
+    "texture_flat":                    ("morphology_texture", "flat"),
+    "texture_rough_flaky":             ("morphology_texture", "rough_flaky"),
+    "texture_fluid_filled":            ("morphology_texture", "fluid_filled"),
+    "location_head_neck":              ("body_location", "head_neck"),
+    "location_arm":                    ("body_location", "arm"),
+    "location_palm":                   ("body_location", "palm"),
+    "location_back_of_hand":           ("body_location", "back_of_hand"),
+    "location_torso_front":            ("body_location", "torso_front"),
+    "location_torso_back":             ("body_location", "torso_back"),
+    "location_genitalia_groin":        ("body_location", "genitalia_groin"),
+    "location_buttocks":               ("body_location", "buttocks"),
+    "location_leg":                    ("body_location", "leg"),
+    "location_foot_top_side":          ("body_location", "foot_top_side"),
+    "location_foot_sole":              ("body_location", "foot_sole"),
+    "location_other":                  ("body_location", "other_location"),
+    "symptom_bothersome_appearance":   ("symptoms_dermatological", "bothersome_appearance"),
+    "symptom_bleeding":                ("symptoms_dermatological", "bleeding"),
+    "symptom_increasing_size":         ("symptoms_dermatological", "increasing_size"),
+    "symptom_darkening":               ("symptoms_dermatological", "darkening"),
+    "symptom_itching":                 ("symptoms_dermatological", "itching"),
+    "symptom_burning":                 ("symptoms_dermatological", "burning"),
+    "symptom_pain":                    ("symptoms_dermatological", "pain"),
+    "symptom_no_relevant_experience":  ("symptoms_dermatological", "no_relevant_experience"),
+    "symptom_fever":                   ("symptoms_systemic", "fever"),
+    "symptom_chills":                  ("symptoms_systemic", "chills"),
+    "symptom_fatigue":                 ("symptoms_systemic", "fatigue"),
+    "symptom_joint_pain":              ("symptoms_systemic", "joint_pain"),
+    "symptom_mouth_sores":             ("symptoms_systemic", "mouth_sores"),
+    "symptom_shortness_of_breath":     ("symptoms_systemic", "shortness_of_breath"),
+    "symptom_no_relevant_symptoms":    ("symptoms_systemic", "no_relevant_symptoms"),
+    "duration":                        ("duration", "duration"),
+    "related_category":                ("other", "related_category"),
+}
+
+
+def add_scin_alignment(
+    consolidated: dict[str, list[str]],
+) -> tuple[dict[str, list[str]], dict[str, list[str]], int]:
     """
-    Tag each schema feature with its SCIN column counterpart (if any).
-    This is done AFTER the final feature list is established from Derm-1M.
+    Ensure SCIN features are present in the schema.
+    Returns (updated_schema, scin_map {subcategory: [scin_comparable_values]}, count_added).
     """
-    fc = schema.get("feature_categories")
-    schema["feature_categories"] = _normalize_schema_feature_categories(
-        fc if isinstance(fc, list) else []
-    )
-    if isinstance(fc, list) and len(fc) > 0 and len(schema["feature_categories"]) == 0:
-        print(
-            "  WARNING: feature_categories had no valid dict/string entries after normalization."
-        )
-
-    existing_names = {f["name"] for f in schema["feature_categories"]}
-
-    # Track which features are SCIN-comparable
-    scin_comparable_count = 0
+    scin_map: dict[str, list[str]] = defaultdict(list)
+    added = 0
 
     for scin_col, canonical in SCIN_SCHEMA_FEATURES.items():
-        # Find feature in schema or add it as SCIN-sourced
-        matched = next(
-            (f for f in schema["feature_categories"] if f["name"] == canonical), None
-        )
-        if matched:
-            matched["scin_column"] = scin_col
-            matched["scin_comparable"] = True
-            scin_comparable_count += 1
-        else:
-            # Add missing SCIN feature to schema so it gets extracted
-            schema["feature_categories"].append({
-                "name": canonical,
-                "category": _infer_category(canonical),
-                "description": f"Mapped from SCIN column: {scin_col}",
-                "example_values": [],
-                "is_binary": True,
-                "regex_extractable": _is_regex_extractable(canonical),
-                "scin_column": scin_col,
-                "scin_comparable": True,
-                "derm1m_sourced": False,
-            })
-            scin_comparable_count += 1
-    
-    print(f"  Aligned {scin_comparable_count} features with SCIN columns")
-    return schema
+        mapping = SCIN_TO_SUBCATEGORY.get(canonical)
+        if not mapping:
+            continue
+        subcat, value = mapping
+        if subcat not in consolidated:
+            consolidated[subcat] = []
+        if value not in consolidated[subcat]:
+            consolidated[subcat].append(value)
+            added += 1
+        scin_map[subcat].append(value)
 
-
-def _infer_category(name: str) -> str:
-    if name.startswith("symptom_"):   return "symptoms"
-    if name.startswith("location_"):  return "body_location"
-    if name.startswith("texture_"):   return "morphology"
-    if name.startswith("color_"):     return "morphology"
-    if name.startswith("trigger_"):   return "triggers"
-    if name.startswith("treatment_"): return "treatments"
-    if name.startswith("race_"):        return "demographics"
-    if name in ("age_group", "sex", "fitzpatrick_skin_type"): return "demographics"
-    if name == "duration":            return "duration"
-    if name == "related_category":    return "condition_metadata"
-    return "other"
-
-
-def _is_regex_extractable(name: str) -> bool:
-    """Heuristic: features that can be reliably extracted via keyword/regex."""
-    regex_prefixes = (
-        "symptom_", "location_", "texture_", "color_",
-        "distribution_", "race_",
-    )
-    regex_names = {
-        "age_group", "sex", "fitzpatrick_skin_type", "duration",
-        "onset_sudden", "lesion_count", "diagnosis_confidence",
-        "related_category",
-    }
-    return name.startswith(regex_prefixes) or name in regex_names
+    n_scin = sum(len(v) for v in scin_map.values())
+    print(f"  Aligned {n_scin} SCIN features across {len(scin_map)} subcategories")
+    if added:
+        print(f"  Added {added} missing SCIN feature values to schema")
+    return consolidated, dict(scin_map), n_scin
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
+CATEGORY_DESCRIPTIONS: dict[str, str] = {
+    "demographics_age": "Patient age groups or specific ages",
+    "demographics_sex": "Patient sex or gender",
+    "demographics_skin_type": "Fitzpatrick skin type or skin tone descriptions",
+    "demographics_ethnicity": "Patient ethnicity or race as mentioned",
+    "morphology_texture": "Surface texture and elevation of lesions",
+    "morphology_color": "Color characteristics of lesions",
+    "morphology_shape": "Shape, border, and size of lesions",
+    "morphology_distribution": "Spatial distribution and arrangement of lesions",
+    "morphology_other": "Other morphological features not covered above",
+    "body_location": "Specific body locations affected by the condition",
+    "symptoms_dermatological": "Skin-related symptoms and sensations",
+    "symptoms_systemic": "Systemic symptoms beyond the skin",
+    "duration": "Duration, onset, and temporal pattern of the condition",
+    "triggers": "Triggering or exacerbating factors",
+    "treatments": "Treatments mentioned, attempted, or suggested",
+    "clinical_signs": "Specific clinical signs and diagnostic findings",
+    "history": "Patient history, comorbidities, and risk factors",
+    "lesion_count": "Number and extent of lesions",
+    "secondary_changes": "Secondary changes including post-inflammatory effects",
+    "severity": "Severity scale and functional impact",
+    "image_metadata": "Image type, quality, and photographic context",
+    "other": "Other clinically relevant features not covered above",
+}
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  PHASE 1: Feature Schema Discovery (Bottom-Up)")
@@ -2055,7 +1616,6 @@ if __name__ == "__main__":
     )
     sample_df = load_and_sample(CSV_PATH, CAPTION_COLUMN, DISCOVERY_SAMPLING_MODE)
 
-    # Save sample for reference
     sample_path = DISCOVERY_DIR / "sampled_captions.csv"
     sample_df.to_csv(sample_path, index=False)
     print(f"  Saved sample to {sample_path}\n")
@@ -2063,67 +1623,75 @@ if __name__ == "__main__":
     # ── Step 2: Per-label discovery ───────────────────────────────────────────
     print("STEP 2: Running per-label-name LLM feature discovery...\n")
     all_features = discover_all_features(sample_df)
-    print(f"\n  Total raw features discovered: {len(all_features)}\n")
+    total_raw = sum(len(v) for v in all_features.values())
+    print(
+        f"\n  Total raw values discovered: {total_raw} "
+        f"across {len(all_features)} subcategories\n"
+    )
 
-    # Save raw features
     raw_path = DISCOVERY_DIR / "raw_features_all.json"
-    # Convert for JSON serialization (found_in_labels might cause issues)
-    raw_serializable = {}
-    for k, v in all_features.items():
-        entry = dict(v)
-        entry["found_in_labels"] = list(entry.get("found_in_labels", []))
-        raw_serializable[k] = entry
+    raw_serializable = {k: sorted(v) for k, v in all_features.items()}
     with open(raw_path, "w", encoding="utf-8") as f:
         json.dump(raw_serializable, f, indent=2)
     print(f"  Saved raw features to {raw_path}\n")
 
     # ── Step 3: Consolidation ─────────────────────────────────────────────────
     print("STEP 3: Consolidating features via LLM...\n")
-    schema = consolidate_schema(
+    consolidated = consolidate_schema(
         all_features,
         n_captions_sampled=len(sample_df),
         n_disease_classes=int(sample_df["label_name"].nunique()),
     )
 
-    # ── Step 4: SCIN alignment (AFTER final feature list is established) ─────
-    print("\nSTEP 4: Aligning with SCIN columns (after final feature list established)...\n")
-    schema = add_scin_alignment(schema)
+    # ── Step 4: SCIN alignment ────────────────────────────────────────────────
+    print("\nSTEP 4: Aligning with SCIN columns...\n")
+    consolidated, scin_map, n_scin_comparable = add_scin_alignment(consolidated)
 
-    n_total = len(schema["feature_categories"])
-    n_comparable = sum(
-        1 for f in schema["feature_categories"] if f.get("scin_comparable")
-    )
-    n_regex = sum(
-        1 for f in schema["feature_categories"] if f.get("regex_extractable")
-    )
-    n_llm_only = n_total - n_regex
+    # ── Build final schema ────────────────────────────────────────────────────
+    n_categories = len(consolidated)
+    n_total_features = sum(len(v) for v in consolidated.values())
 
-    print(f"  Total canonical features:     {n_total}")
-    print(f"  SCIN-comparable features:     {n_comparable}")
-    print(f"  Regex-extractable features:   {n_regex}")
-    print(f"  LLM-only features:            {n_llm_only}\n")
+    feature_categories = []
+    for subcat in sorted(consolidated.keys()):
+        feature_categories.append({
+            "category": subcat,
+            "description": CATEGORY_DESCRIPTIONS.get(subcat, ""),
+            "features": sorted(consolidated[subcat]),
+            "scin_comparable_features": sorted(scin_map.get(subcat, [])),
+        })
 
-    # ── Save schema ───────────────────────────────────────────────────────────
-    # Add metadata
-    schema["metadata"] = {
-        "source_csv": CSV_PATH,
-        "caption_column": CAPTION_COLUMN,
-        "discovery_sampling_mode": DISCOVERY_SAMPLING_MODE,
-        "n_captions_sampled": len(sample_df),
-        "n_rows_used": len(sample_df),
-        "n_label_names": int(sample_df["label_name"].nunique()),
-        "n_total_features": n_total,
-        "n_scin_comparable": n_comparable,
-        "n_regex_extractable": n_regex,
-        "n_llm_only": n_llm_only,
-        "model_used": DISCOVERY_MODEL,
-        "llm_provider": LLM_PROVIDER,
-        "openai_use_batch": bool(LLM_PROVIDER == "openai" and OPENAI_USE_BATCH),
-        "openai_prompt_cache_key": OPENAI_PROMPT_CACHE_KEY if LLM_PROVIDER == "openai" else "",
+    schema = {
+        "feature_categories": feature_categories,
+        "metadata": {
+            "source_csv": CSV_PATH,
+            "caption_column": CAPTION_COLUMN,
+            "discovery_sampling_mode": DISCOVERY_SAMPLING_MODE,
+            "n_captions_sampled": len(sample_df),
+            "n_rows_used": len(sample_df),
+            "n_label_names": int(sample_df["label_name"].nunique()),
+            "n_categories": n_categories,
+            "n_total_features": n_total_features,
+            "n_scin_comparable": n_scin_comparable,
+            "model_used": DISCOVERY_MODEL,
+            "llm_provider": LLM_PROVIDER,
+            "openai_use_batch": bool(LLM_PROVIDER == "openai" and OPENAI_USE_BATCH),
+            "openai_prompt_cache_key": OPENAI_PROMPT_CACHE_KEY if LLM_PROVIDER == "openai" else "",
+        },
     }
+
+    print(f"\n  Total subcategories:          {n_categories}")
+    print(f"  Total binary features:        {n_total_features}")
+    print(f"  SCIN-comparable features:     {n_scin_comparable}")
+    print(f"  Feature breakdown by subcategory:")
+    for cat_entry in feature_categories:
+        c = cat_entry["category"]
+        n = len(cat_entry["features"])
+        scin_n = len(cat_entry.get("scin_comparable_features", []))
+        scin_part = f" ({scin_n} SCIN)" if scin_n else ""
+        print(f"    - {c}: {n}{scin_part}")
 
     with open(SCHEMA_OUT, "w", encoding="utf-8") as fp:
         json.dump(schema, fp, indent=2)
 
-    print(f"  Schema saved to {SCHEMA_OUT}")
+    print(f"\n  Schema saved to {SCHEMA_OUT}")
     print(f"  Next: run phase2_bulk_extraction.py")

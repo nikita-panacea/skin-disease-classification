@@ -1,14 +1,14 @@
 """
-PHASE 2: Bulk Feature Extraction (LLM ONLY - SLOW LANE)
+PHASE 2: Bulk Feature Extraction (LLM) — Cost-Optimized
 =======================================================
 Strategy:
-  - SLOW LANE ONLY: All features extracted via LLM (OpenAI GPT-4o-mini, Gemini,
-    or Qwen 3.5 9B served locally) for every caption in the dataset.
-  - No rule-based extraction - everything goes through the LLM for consistency.
-  - Organized per label_name with checkpointing.
-  - Encoding: 0 = explicitly absent, 1 = present, 2 = unknown/not mentioned.
-  - Output: New CSV with all feature columns added (one-hot encoded).
-  - Includes validation, statistics tracking, and robust error handling.
+  - Deduplicate captions first: only process ~72K unique captions instead of ~182K rows.
+  - Use numeric feature indices (0-N) with sparse output format to minimize output tokens.
+  - Category-aware encoding: 0=absent/inferably absent, 1=present, 2=truly unknown.
+  - Prompt caching: static system prompt (>1024 tokens) cached across all API calls.
+  - Batch API: 50% cost discount on all token rates.
+  - Replicate one-hot encoding back to all rows with duplicate captions.
+  - Output: CSV with all original columns + one feature column per schema feature.
 
 Prerequisites:
   pip install pandas numpy tqdm google-generativeai openai python-dotenv
@@ -29,12 +29,16 @@ Env (optional):
   OPENAI_PROMPT_CACHE_KEY — stable key for automatic prompt caching (default phase2_extraction_v1)
   OPENAI_PROMPT_CACHE_RETENTION — optional: in_memory | 24h
   OPENAI_BATCH_POLL_SEC — batch status poll interval (default 20)
-  OPENAI_BATCH_MAX_REQUESTS — max lines per batch file (default 50000, API cap; larger runs split into multiple batches)
+  OPENAI_BATCH_MAX_REQUESTS — max lines per batch file (default 50000, API cap)
   OPENAI_BATCH_MAX_FILE_BYTES — max UTF-8 bytes per batch JSONL (default ~195 MiB; API cap 200 MB)
   OPENAI_LOG_USAGE — 1/true: print token usage when available
 
-Prompt caching: static system prompt (full schema) first, numbered captions in user message last.
-  See https://developers.openai.com/api/docs/guides/prompt-caching (~1024+ token prefixes; OPENAI_PROMPT_CACHE_KEY).
+Cost optimizations applied:
+  1. Caption deduplication: ~60% fewer API calls
+  2. Sparse output format: ~97% fewer output tokens per caption
+  3. Batch API: 50% discount on all rates
+  4. Prompt caching: system prompt cached after 1st request (~41% of input tokens)
+  Estimated cost: ~$1.50-2.00 for 72K unique captions with gpt-4o-mini
 """
 
 import pandas as pd
@@ -64,8 +68,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CAPTION_COLUMN   = os.getenv("CAPTION_COLUMN", "truncated_caption")
 
 # ── LLM Provider Selection ─────────────────────────────────────────────────
-# Options: "gemini", "openai", or "qwen"
-LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")  # Default to openai for cost efficiency
+LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")
 
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
 OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase2_extraction_v1").strip()
@@ -153,10 +156,11 @@ SCHEMA_PATH      = "feature_schema.json"
 OUTPUT_CSV       = "derm1m_features.csv"
 STATS_FILE       = "extraction_stats.json"
 CHECKPOINT_DIR   = Path("checkpoints")
-LLM_BATCH_SIZE = _safe_int_env("LLM_BATCH_SIZE", 25, vmin=1)
-MAX_CAPTION_LEN  = 500             # truncate before sending to LLM (chars)
-MAX_RETRIES      = 5               # max retries per batch
+LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 25, vmin=1)
+MAX_CAPTION_LEN  = 500
+MAX_RETRIES      = 5
 RATE_LIMIT_SLEEP = 0.1 if LLM_PROVIDER == "qwen" else 0.5
+DEDUP_CKPT_FILE  = "dedup_caption_features.json"
 
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
@@ -444,154 +448,159 @@ def call_llm(
 # SCHEMA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _normalize_schema_feature_categories(items: list | None) -> list[dict]:
-    """
-    Phase 1 may emit string entries in feature_categories (some local LLMs).
-    Phase 2 requires dicts with string names.
-    """
-    if not items:
-        return []
-    out: list[dict] = []
-    for feat in items:
-        if isinstance(feat, dict):
-            raw_name = feat.get("name")
-            name_s = str(raw_name).strip() if raw_name is not None else ""
-            if not name_s:
-                continue
-            d = dict(feat)
-            d["name"] = name_s
-            out.append(d)
-        elif isinstance(feat, str):
-            s = feat.strip()
-            if s:
-                out.append(
-                    {
-                        "name": s,
-                        "category": "other",
-                        "description": "",
-                        "example_values": [],
-                        "is_binary": True,
-                    }
-                )
-    return out
-
-
 def load_schema(schema_path: str) -> dict:
-    """Load the feature schema produced by Phase 1."""
+    """
+    Load the feature schema produced by Phase 1.
+    New format: feature_categories is a list of {category, description, features: [values]}.
+    Feature names are constructed as {category}_{value}.
+    """
     with open(schema_path, "r", encoding="utf-8") as f:
         schema = json.load(f)
     raw = schema.get("feature_categories")
     if not isinstance(raw, list):
         print(f"  WARNING: feature_categories is not a list (got {type(raw).__name__}); using [].")
         raw = []
-    n_raw = len(raw)
-    features = _normalize_schema_feature_categories(raw)
-    schema["feature_categories"] = features
-    if n_raw and len(features) < n_raw:
-        print(
-            f"  WARNING: dropped {n_raw - len(features)} invalid feature_categories entr(y/ies)"
-        )
-    print(f"  Loaded schema: {len(features)} features")
 
-    # Show feature breakdown by category
-    categories = defaultdict(int)
-    for feat in features:
-        cat = feat.get("category", "other") if isinstance(feat, dict) else "other"
-        categories[str(cat)] += 1
+    n_total = 0
+    for entry in raw:
+        if isinstance(entry, dict) and isinstance(entry.get("features"), list):
+            n_total += len(entry["features"])
 
-    print(f"  Feature breakdown by category:")
-    for cat, count in sorted(categories.items()):
-        print(f"    - {cat}: {count}")
+    print(f"  Loaded schema: {n_total} features across {len(raw)} subcategories")
+    print(f"  Feature breakdown by subcategory:")
+    for entry in raw:
+        if isinstance(entry, dict):
+            cat = entry.get("category", "?")
+            feats = entry.get("features", [])
+            print(f"    - {cat}: {len(feats)}")
 
     return schema
 
 
 def get_all_feature_names(schema: dict) -> list[str]:
-    """Get list of all feature names from the schema."""
+    """
+    Build flat list of feature names as {category}_{value} from the schema.
+    Order: sorted by category, then sorted values within each category.
+    """
     names: list[str] = []
-    for f in schema.get("feature_categories", []):
-        if isinstance(f, dict) and f.get("name"):
-            names.append(str(f["name"]))
+    for entry in schema.get("feature_categories", []):
+        if not isinstance(entry, dict):
+            continue
+        cat = str(entry.get("category", "other"))
+        for val in entry.get("features", []):
+            v = str(val).strip()
+            if v:
+                names.append(f"{cat}_{v}")
     return names
 
 
 def get_feature_categories(schema: dict) -> dict[str, str]:
-    """Get mapping of feature name to category."""
+    """Get mapping of full feature name -> subcategory."""
     m: dict[str, str] = {}
-    for f in schema.get("feature_categories", []):
-        if isinstance(f, dict) and f.get("name"):
-            m[str(f["name"])] = str(f.get("category", "other"))
+    for entry in schema.get("feature_categories", []):
+        if not isinstance(entry, dict):
+            continue
+        cat = str(entry.get("category", "other"))
+        for val in entry.get("features", []):
+            v = str(val).strip()
+            if v:
+                m[f"{cat}_{v}"] = cat
     return m
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM EXTRACTION - SLOW LANE (ALL FEATURES)
+# CATEGORY GROUPING (for category-aware encoding inference)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_llm_system_prompt(all_feature_names: list[str], feature_categories: dict) -> str:
-    """Build the extraction prompt for ALL features from the schema."""
-    feature_list_str = json.dumps(all_feature_names, indent=2)
-    
-    # Group features by category for better organization
-    features_by_cat = defaultdict(list)
-    for feat in all_feature_names:
-        cat = feature_categories.get(feat, "other")
-        features_by_cat[cat].append(feat)
-    
-    cat_summary = "\n".join([
-        f"  {cat}: {', '.join(features[:5])}{'...' if len(features) > 5 else ''}"
-        for cat, features in sorted(features_by_cat.items())
-    ])
-    
-    return f"""You are a clinical dermatology NLP specialist performing one-hot encoding feature extraction.
+def build_category_groups(
+    all_feature_names: list[str],
+    feature_categories: dict[str, str],
+) -> dict[str, list[int]]:
+    """
+    Build category groups for encoding inference rules.
+    With the new schema, subcategories are already fine-grained (e.g. morphology_color,
+    symptoms_dermatological), so we simply group by subcategory directly.
+    """
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, name in enumerate(all_feature_names):
+        cat = feature_categories.get(name, "other")
+        groups[cat].append(i)
+    return dict(groups)
 
-Your task: Extract ALL of the following features from each skin disease caption and return ONE-HOT ENCODED values.
 
-FEATURE LIST ({len(all_feature_names)} total):
-{feature_list_str}
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM EXTRACTION — SYSTEM PROMPT (indices + sparse + category-aware encoding)
+# ══════════════════════════════════════════════════════════════════════════════
 
-FEATURES BY CATEGORY:
-{cat_summary}
+def build_llm_system_prompt(
+    all_feature_names: list[str],
+    feature_categories: dict[str, str],
+) -> str:
+    """
+    Build the extraction system prompt with:
+    - Numeric feature index map (0..N-1)
+    - Category groups for encoding inference
+    - Category-aware 0/1/2 encoding rules
+    - Sparse output format: {"1":[indices], "2":[indices]}
+    """
+    n_feat = len(all_feature_names)
 
-=== ONE-HOT ENCODING RULES (STRICT) ===
-For EACH feature, you MUST return one of these exact values:
+    index_lines = [f"{i}: {name}" for i, name in enumerate(all_feature_names)]
+    index_map_str = "\n".join(index_lines)
 
-  1 = PRESENT/MENTIONED
-      - Use when the caption explicitly states the feature is present
-      - Examples: "itchy rash" → symptom_itching=1, "raised lesion" → texture_raised=1
-      - "red patches" → color_red=1, "on the face" → location_face=1
+    cat_groups = build_category_groups(all_feature_names, feature_categories)
+    group_lines = []
+    for gname, indices in sorted(cat_groups.items()):
+        sample_names = [all_feature_names[i] for i in indices[:4]]
+        suffix = ", ..." if len(indices) > 4 else ""
+        group_lines.append(
+            f"  {gname} (indices {indices[0]}-{indices[-1]}, {len(indices)} features): "
+            f"{', '.join(sample_names)}{suffix}"
+        )
+    groups_str = "\n".join(group_lines)
 
-  0 = EXPLICITLY ABSENT
-      - Use ONLY when the caption explicitly states the feature is NOT present
-      - Examples: "non-itchy", "no fever", "not raised", "absence of pain"
-      - This is rare - most features will be 1 or 2
+    return f"""You are a clinical dermatology NLP specialist performing sparse one-hot feature extraction from skin disease captions.
 
-  2 = UNKNOWN/NOT MENTIONED (default)
-      - Use when the caption says nothing about this feature
-      - This is the DEFAULT for most features
-      - If you're unsure, use 2
+FEATURE INDEX MAP ({n_feat} features — reference by index number only):
+{index_map_str}
 
-=== EXTRACTION GUIDELINES ===
-1. EXTRACT ONLY what is ACTUALLY STATED - do not infer or guess
-2. Look for EXACT phrases and keywords in the caption
-3. For body locations: extract ALL locations mentioned (face AND arm → both=1)
-4. For symptoms: extract ALL symptoms mentioned
-5. For morphology: note color, texture, shape, size descriptors
-6. For treatments: note any medications or therapies mentioned
-7. For triggers: note sun, stress, allergens, infections, etc.
-8. For demographics: extract age, sex, skin type if mentioned
+CATEGORY GROUPS (for encoding inference):
+{groups_str}
 
-=== OUTPUT FORMAT ===
-Return ONLY a valid JSON array with EXACTLY one object per caption.
-Each object MUST contain ALL {len(all_feature_names)} feature keys with values 0, 1, or 2.
+=== ENCODING VALUES ===
+  1 = PRESENT — feature is explicitly mentioned or clearly described in the caption
+  0 = ABSENT  — feature is either explicitly negated OR inferably absent (DEFAULT for unlisted indices)
+  2 = TRULY UNKNOWN — ONLY when the caption provides ZERO information about the feature's entire category group
 
-Example output for 2 captions:
+=== CATEGORY-AWARE INFERENCE (CRITICAL) ===
+When a caption mentions ANY feature or features within a category group encode them as 1, ALL OTHER features in that SAME group
+must be 0 (inferably absent), NOT 2. Use 2 ONLY when the caption says NOTHING AT ALL about an
+entire category group.
+
+Examples:
+- "red rash on face" → color_red=1, ALL other morphology_color features=0, location_face=1,
+  ALL other body_location features=0. If no symptoms mentioned at all → all symptom features=2.
+- "itchy raised lesion" → symptom_itching=1, ALL other symptoms_dermatological=0,
+  texture_raised=1, ALL other morphology_texture=0. If no body location mentioned → all body_location=2.
+- "non-itchy" → symptom_itching=0 (explicitly absent), other symptoms_dermatological=0.
+
+=== OUTPUT FORMAT (SPARSE — minimizes tokens) ===
+For EACH caption, output a JSON object with exactly two keys:
+  "1": [list of feature INDICES that are PRESENT]
+  "2": [list of feature INDICES that are TRULY UNKNOWN]
+All indices NOT listed default to 0 (absent).
+
+Return a JSON array with one object per input caption. Example for 2 captions:
 [
-  {{"symptom_itching": 1, "texture_raised": 1, "color_red": 1, "location_face": 1, ...}},
-  {{"symptom_itching": 2, "texture_raised": 0, "color_red": 2, "location_face": 2, ...}}
+  {{"1": [0, 8, 45, 88], "2": [150, 155, 160]}},
+  {{"1": [3, 12], "2": []}}
 ]
 
-No preamble, no markdown fences, no explanations - ONLY the JSON array.
+RULES:
+- Each index must be an integer in range 0 to {n_feat - 1}
+- An index must NOT appear in both "1" and "2"
+- If ALL features in a category group are unknown, list those indices in "2"
+- No preamble, no markdown fences, no explanations — ONLY the JSON array
 """
 
 
@@ -600,98 +609,116 @@ def build_extraction_user_prompt(truncated_captions: list[str]) -> str:
     return "\n\n".join(f"[{i}] {c}" for i, c in enumerate(truncated_captions))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SPARSE OUTPUT PARSING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _expand_sparse_to_dict(
+    sparse: dict,
+    all_feature_names: list[str],
+) -> dict[str, int]:
+    """
+    Expand a sparse object {"1": [indices], "2": [indices]} into a full
+    {feature_name: 0|1|2} dict.  Unlisted indices default to 0.
+    """
+    n = len(all_feature_names)
+    result = {name: 0 for name in all_feature_names}
+
+    present = sparse.get("1") or sparse.get(1) or []
+    unknown = sparse.get("2") or sparse.get(2) or []
+
+    if not isinstance(present, list):
+        present = []
+    if not isinstance(unknown, list):
+        unknown = []
+
+    for idx in present:
+        idx = int(idx)
+        if 0 <= idx < n:
+            result[all_feature_names[idx]] = 1
+
+    for idx in unknown:
+        idx = int(idx)
+        if 0 <= idx < n:
+            result[all_feature_names[idx]] = 2
+
+    return result
+
+
 def parse_extraction_response_text(
     text: str,
     captions: list[str],
     all_feature_names: list[str],
 ) -> tuple[list[dict], dict]:
     """
-    Parse LLM JSON array into per-caption feature dicts.
-    Returns (results, stats) with stats keys: success, validation_fixes (mirrors extract_features_batch).
+    Parse sparse JSON array from LLM into per-caption feature dicts.
+    Expected format: [{"1":[...], "2":[...]}, ...]
+    Returns (results, stats).
     """
-    stats = {"success": False, "validation_fixes": 0}
+    stats: dict = {"success": False, "validation_fixes": 0}
+    n_feat = len(all_feature_names)
+    fallback_row = {k: 2 for k in all_feature_names}
+
     try:
         text = (text or "").strip()
         text = re.sub(r"```json\s*|```\s*", "", text).strip()
         parsed = json.loads(text)
 
+        if isinstance(parsed, dict) and ("1" in parsed or "2" in parsed or 1 in parsed or 2 in parsed):
+            parsed = [parsed]
         if not isinstance(parsed, list):
-            if isinstance(parsed, dict) and "feature_categories" in parsed:
-                parsed = [{} for _ in range(len(captions))]
-            else:
-                raise ValueError(f"Expected list, got {type(parsed).__name__}")
+            raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
 
-        valid_results, num_fixed = validate_batch_results(
-            parsed, all_feature_names, len(captions)
-        )
-        stats["validation_fixes"] = num_fixed
+        results: list[dict] = []
+        fixes = 0
+        for i, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                results.append(dict(fallback_row))
+                fixes += 1
+                continue
 
-        if len(valid_results) != len(captions):
-            if len(valid_results) < len(captions):
-                fallback = {k: 2 for k in all_feature_names}
-                valid_results.extend([fallback] * (len(captions) - len(valid_results)))
-            valid_results = valid_results[: len(captions)]
+            present = item.get("1") or item.get(1) or []
+            unknown = item.get("2") or item.get(2) or []
+            if not isinstance(present, list):
+                present = []
+            if not isinstance(unknown, list):
+                unknown = []
 
+            overlap = set(int(x) for x in present if _is_valid_idx(x, n_feat)) & \
+                       set(int(x) for x in unknown if _is_valid_idx(x, n_feat))
+            if overlap:
+                for idx in overlap:
+                    unknown = [x for x in unknown if int(x) != idx]
+                fixes += 1
+
+            results.append(_expand_sparse_to_dict(item, all_feature_names))
+
+        if len(results) < len(captions):
+            results.extend([dict(fallback_row)] * (len(captions) - len(results)))
+            fixes += len(captions) - len(parsed)
+        results = results[:len(captions)]
+
+        stats["validation_fixes"] = fixes
         stats["success"] = True
-        return valid_results, stats
+        return results, stats
+
     except (json.JSONDecodeError, ValueError, TypeError) as e:
-        print(f"    parse_extraction_response_text: {str(e)[:100]}")
+        print(f"    parse_extraction_response_text: {str(e)[:120]}")
         stats["success"] = False
-        fallback = [{k: 2 for k in all_feature_names} for _ in captions]
-        return fallback, stats
+        return [dict(fallback_row) for _ in captions], stats
 
 
-def validate_batch_results(
-    results: list[dict], 
-    expected_features: list[str], 
-    batch_size: int
-) -> tuple[list[dict], int]:
-    """
-    Validate that batch results contain all expected features.
-    Returns (valid_results, num_fixed).
-    """
-    valid_results = []
-    num_fixed = 0
-    
-    for i, result in enumerate(results):
-        if not isinstance(result, dict):
-            # Invalid result type - create fallback
-            valid_results.append({k: 2 for k in expected_features})
-            num_fixed += 1
-            continue
-        
-        # Check for missing features
-        missing_features = set(expected_features) - set(result.keys())
-        
-        if missing_features:
-            # Add missing features with value 2 (unknown)
-            for feat in missing_features:
-                result[feat] = 2
-            num_fixed += 1
-        
-        # Check for extra features (keep them but log if needed)
-        extra_features = set(result.keys()) - set(expected_features)
-        if extra_features:
-            # Remove extra features not in schema
-            for feat in list(extra_features):
-                del result[feat]
-        
-        # Validate values are 0, 1, or 2 (coerce bool / float from JSON)
-        for feat in expected_features:
-            val = result.get(feat, 2)
-            if isinstance(val, bool):
-                val = int(val)
-                result[feat] = val
-            elif isinstance(val, (int, float)) and float(val).is_integer():
-                val = int(val)
-                result[feat] = val
-            if val not in (0, 1, 2):
-                result[feat] = 2  # Default to unknown for invalid values
-        
-        valid_results.append(result)
-    
-    return valid_results, num_fixed
+def _is_valid_idx(val, n: int) -> bool:
+    try:
+        v = int(val)
+        return 0 <= v < n
+    except (ValueError, TypeError):
+        return False
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNC EXTRACTION (single batch LLM call with retries)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def extract_features_batch(
     captions: list[str],
@@ -700,8 +727,8 @@ def extract_features_batch(
     retries: int = MAX_RETRIES,
 ) -> tuple[list[dict], dict]:
     """
-    Batch LLM call. Returns (list of dicts aligned to input captions, stats dict).
-    OpenAI/Qwen: system = static schema/rules, user = numbered captions (prompt caching on OpenAI).
+    Batch LLM call for one chunk of captions.
+    Returns (list of feature dicts aligned to input captions, stats dict).
     """
     truncated = [c[:MAX_CAPTION_LEN] for c in captions]
     user_prompt = build_extraction_user_prompt(truncated)
@@ -741,145 +768,139 @@ def extract_features_batch(
     return fallback, stats
 
 
-def _phase2_run_openai_batch_extraction(
-    df: pd.DataFrame,
-    label_names,
+# ══════════════════════════════════════════════════════════════════════════════
+# DEDUP EXTRACTION PIPELINES (Batch API + Sync)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_dedup_openai_batch(
+    unique_captions: list[str],
     all_feature_names: list[str],
     system_prompt: str,
-    all_results_list: list,
     global_stats: dict,
-) -> None:
+) -> dict[str, dict]:
     """
-    Collect all non-checkpointed caption batches into one OpenAI Batch job, then
-    write per-label checkpoints and fill all_results_list.
+    Process deduplicated captions via OpenAI Batch API.
+    Returns {caption_text: {feature_name: value}}.
     """
     jobs: list[dict] = []
-    job_meta: dict[str, dict] = {}
-    job_seq = 0
+    job_batches: dict[str, list[str]] = {}
 
-    for label_idx, label_name in enumerate(tqdm(label_names, desc="Collecting OpenAI batch jobs"), 1):
-        safe_name = re.sub(r"[^\w\-]", "_", str(label_name))[:60]
-        ckpt_path = CHECKPOINT_DIR / f"llm_{safe_name}.json"
-
-        label_mask = df["label_name"] == label_name
-        label_indices = df.index[label_mask].tolist()
-        label_captions = df.loc[label_indices, CAPTION_COLUMN].tolist()
-        n_label = len(label_captions)
-        n_batches_label = (n_label + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
-
-        if ckpt_path.exists():
-            try:
-                with open(ckpt_path, "r", encoding="utf-8") as f:
-                    label_results = json.load(f)
-                if len(label_results) == len(label_indices):
-                    print(
-                        f"  [{label_idx}/{len(label_names)}] {label_name}: "
-                        f"Loaded {len(label_results):,} results from checkpoint"
-                    )
-                    for idx, result in zip(label_indices, label_results):
-                        all_results_list[idx] = result
-                    global_stats["labels_skipped"].append(label_name)
-                    continue
-                print(
-                    f"  [{label_idx}/{len(label_names)}] {label_name}: "
-                    f"Checkpoint incomplete, re-extracting..."
-                )
-            except Exception as e:
-                print(
-                    f"  [{label_idx}/{len(label_names)}] {label_name}: "
-                    f"Checkpoint error {e}, re-extracting..."
-                )
-
-        print(
-            f"  [{label_idx}/{len(label_names)}] {label_name}: "
-            f"queuing {n_label:,} captions in {n_batches_label} batch job(s)..."
+    for batch_idx, batch_start in enumerate(range(0, len(unique_captions), LLM_BATCH_SIZE)):
+        batch = unique_captions[batch_start : batch_start + LLM_BATCH_SIZE]
+        truncated = [c[:MAX_CAPTION_LEN] for c in batch]
+        user_prompt = build_extraction_user_prompt(truncated)
+        cid = f"p2_{batch_idx}"
+        jobs.append(
+            {"custom_id": cid, "body": _openai_extraction_chat_body(system_prompt, user_prompt)}
         )
+        job_batches[cid] = batch
 
-        for b_start in range(0, n_label, LLM_BATCH_SIZE):
-            batch_end = min(b_start + LLM_BATCH_SIZE, n_label)
-            batch = label_captions[b_start:batch_end]
-            idx_slice = label_indices[b_start:batch_end]
-            truncated = [c[:MAX_CAPTION_LEN] for c in batch]
-            user_prompt = build_extraction_user_prompt(truncated)
-            cid = f"p2_{job_seq}"
-            job_seq += 1
-            jobs.append(
-                {"custom_id": cid, "body": _openai_extraction_chat_body(system_prompt, user_prompt)}
-            )
-            job_meta[cid] = {
-                "label_name": label_name,
-                "b_start": b_start,
-                "batch": batch,
-                "indices": idx_slice,
-                "ckpt_path": ckpt_path,
-                "label_indices": label_indices,
-                "n_label": n_label,
-            }
-
-    if not jobs:
-        tqdm.write("  No OpenAI batch jobs (all labels had valid checkpoints).")
-        return
-
-    mapping, _acc = _run_openai_extraction_batch(jobs)
     global_stats["total_batches"] = len(jobs)
     global_stats["total_api_calls"] = len(jobs)
 
-    label_pending: dict[str, list] = defaultdict(list)
-    for cid, meta in job_meta.items():
-        label_pending[meta["label_name"]].append((meta["b_start"], cid, meta))
+    mapping, _acc = _run_openai_extraction_batch(jobs)
 
-    for label_name in label_names:
-        if label_name not in label_pending:
-            continue
-        entries = sorted(label_pending[label_name], key=lambda x: x[0])
-        meta0 = entries[0][2]
-        ckpt_path = meta0["ckpt_path"]
-        label_indices = meta0["label_indices"]
+    results: dict[str, dict] = {}
+    for cid, batch in job_batches.items():
+        text = mapping.get(cid) or ""
+        batch_results, pst = parse_extraction_response_text(text, batch, all_feature_names)
+        ok = pst.get("success", False)
+        global_stats["total_validation_fixes"] += pst.get("validation_fixes", 0)
 
-        label_results: list = []
-        sync_fallbacks = 0
-        fixes_label = 0
-        for _b_start, cid, meta in entries:
-            text = mapping.get(cid) or ""
-            batch_results, pst = parse_extraction_response_text(
-                text, meta["batch"], all_feature_names
-            )
-            ok = bool(pst.get("success"))
-            fixes_label += int(pst.get("validation_fixes", 0))
-            if not ok:
-                tqdm.write(
-                    f"    Sync fallback: label={label_name!r} batch @ {meta['b_start']}"
-                )
-                batch_results, st2 = extract_features_batch(
-                    meta["batch"], all_feature_names, system_prompt
-                )
-                sync_fallbacks += 1
-                ok = bool(st2.get("success"))
-                fixes_label += int(st2.get("validation_fixes", 0))
-            label_results.extend(batch_results)
-            if ok:
-                global_stats["successful_batches"] += 1
-            else:
-                global_stats["failed_batches"] += 1
+        if not ok:
+            tqdm.write(f"    Sync fallback for batch {cid}")
+            batch_results, st2 = extract_features_batch(batch, all_feature_names, system_prompt)
+            ok = st2.get("success", False)
+            global_stats["total_retries"] += 1
+            global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
 
-        global_stats["total_retries"] += sync_fallbacks
-        global_stats["total_validation_fixes"] += fixes_label
+        if ok:
+            global_stats["successful_batches"] += 1
+        else:
+            global_stats["failed_batches"] += 1
 
-        with open(ckpt_path, "w", encoding="utf-8") as f:
-            json.dump(label_results, f)
+        for cap, feats in zip(batch, batch_results):
+            results[cap] = feats
 
-        for idx, result in zip(label_indices, label_results):
-            all_results_list[idx] = result
+    return results
 
-        global_stats["labels_processed"].append(
-            {
-                "label": label_name,
-                "captions": meta0["n_label"],
-                "batches": len(entries),
-                "retries": sync_fallbacks,
-                "fixes": fixes_label,
-            }
-        )
+
+def _run_dedup_sync(
+    unique_captions: list[str],
+    all_feature_names: list[str],
+    system_prompt: str,
+    global_stats: dict,
+    ckpt_save_fn,
+) -> dict[str, dict]:
+    """
+    Process deduplicated captions via synchronous LLM calls.
+    Saves checkpoint after every 50 batches via ckpt_save_fn.
+    Returns {caption_text: {feature_name: value}}.
+    """
+    results: dict[str, dict] = {}
+    n_batches = (len(unique_captions) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
+    batch_count = 0
+
+    for batch_start in tqdm(
+        range(0, len(unique_captions), LLM_BATCH_SIZE),
+        desc="Extracting features (sync)",
+        total=n_batches,
+    ):
+        batch = unique_captions[batch_start : batch_start + LLM_BATCH_SIZE]
+        batch_results, stats = extract_features_batch(batch, all_feature_names, system_prompt)
+
+        for cap, feats in zip(batch, batch_results):
+            results[cap] = feats
+
+        global_stats["total_batches"] += 1
+        global_stats["total_api_calls"] += stats.get("attempts", 1)
+        global_stats["total_retries"] += max(0, stats.get("attempts", 1) - 1)
+        global_stats["total_validation_fixes"] += stats.get("validation_fixes", 0)
+        if stats.get("success"):
+            global_stats["successful_batches"] += 1
+        else:
+            global_stats["failed_batches"] += 1
+
+        batch_count += 1
+        if batch_count % 50 == 0:
+            ckpt_save_fn(results)
+
+        time.sleep(RATE_LIMIT_SLEEP)
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECKPOINT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _save_dedup_checkpoint(
+    caption_features: dict[str, dict],
+    all_feature_names: list[str],
+    ckpt_path: Path,
+) -> None:
+    """Save caption->values checkpoint as compact {caption: [int, ...]} JSON."""
+    compact: dict[str, list[int]] = {}
+    for cap, feats in caption_features.items():
+        compact[cap] = [feats.get(fn, 2) for fn in all_feature_names]
+    with open(ckpt_path, "w", encoding="utf-8") as f:
+        json.dump(compact, f, ensure_ascii=False)
+
+
+def _load_dedup_checkpoint(
+    ckpt_path: Path,
+    all_feature_names: list[str],
+) -> dict[str, dict]:
+    """Load checkpoint back to {caption: {feature_name: value}}."""
+    with open(ckpt_path, "r", encoding="utf-8") as f:
+        compact = json.load(f)
+    result: dict[str, dict] = {}
+    for cap, vals in compact.items():
+        if len(vals) == len(all_feature_names):
+            result[cap] = dict(zip(all_feature_names, vals))
+        else:
+            result[cap] = {fn: (vals[i] if i < len(vals) else 2) for i, fn in enumerate(all_feature_names)}
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -888,7 +909,7 @@ def _phase2_run_openai_batch_extraction(
 
 def run_extraction(csv_path: str, schema_path: str):
     print("=" * 70)
-    print("  PHASE 2: Bulk Feature Extraction (LLM ONLY - One-Hot Encoding)")
+    print("  PHASE 2: Bulk Feature Extraction (Cost-Optimized)")
     print("=" * 70 + "\n")
 
     # ── Load schema ───────────────────────────────────────────────────────────
@@ -896,9 +917,10 @@ def run_extraction(csv_path: str, schema_path: str):
     schema = load_schema(schema_path)
     all_feature_names = get_all_feature_names(schema)
     feature_categories = get_feature_categories(schema)
-    
+
     print(f"\n  Total features to extract: {len(all_feature_names)}")
-    print(f"  Batch size: {LLM_BATCH_SIZE} captions per API call\n")
+    print(f"  Batch size: {LLM_BATCH_SIZE} captions per API call")
+    print(f"  Output format: sparse JSON (indices only)\n")
 
     # ── Load data ─────────────────────────────────────────────────────────────
     print(f"Loading CSV: {csv_path}")
@@ -918,219 +940,138 @@ def run_extraction(csv_path: str, schema_path: str):
     n = len(df)
     print(f"  {n:,} records loaded (caption={CAPTION_COLUMN!r})\n")
 
-    # ── LLM extraction for ALL features ──────────────────────────────────────────
-    print(f"Running LLM extraction for ALL {len(all_feature_names)} features...")
-    print(f"  Provider: {LLM_PROVIDER} | Model: {MODEL_NAME}")
-    print(f"  This will process all {n:,} captions in batches of {LLM_BATCH_SIZE}\n")
+    # ── Deduplicate captions ──────────────────────────────────────────────────
+    print("Deduplicating captions...")
+    stripped = df[CAPTION_COLUMN].str.strip()
+    unique_caps_series = stripped[stripped != ""].unique()
+    unique_caps_list: list[str] = list(unique_caps_series)
+    n_unique = len(unique_caps_list)
+    n_empty = int((stripped == "").sum())
+    n_dupes = n - n_unique - n_empty
 
+    print(f"  Total rows: {n:,}")
+    print(f"  Unique non-empty captions: {n_unique:,}")
+    print(f"  Duplicate rows saved: {n_dupes:,} ({100 * n_dupes / max(1, n):.1f}%)")
+    if n_empty:
+        print(f"  Empty captions (all features=2): {n_empty:,}")
+    print()
+
+    # ── Build system prompt ───────────────────────────────────────────────────
     system_prompt = build_llm_system_prompt(all_feature_names, feature_categories)
 
-    # Pre-allocate results array aligned to df index
-    all_results_list = [None] * n
-    
-    # Statistics tracking
+    # ── Load checkpoint if exists ─────────────────────────────────────────────
+    dedup_ckpt = CHECKPOINT_DIR / DEDUP_CKPT_FILE
+    caption_features: dict[str, dict] = {}
+    if dedup_ckpt.exists():
+        try:
+            caption_features = _load_dedup_checkpoint(dedup_ckpt, all_feature_names)
+            print(f"  Loaded {len(caption_features):,} caption results from checkpoint")
+        except Exception as e:
+            print(f"  WARNING: checkpoint load failed ({e}), re-extracting all")
+            caption_features = {}
+
+    remaining = [c for c in unique_caps_list if c not in caption_features]
+
+    # ── Statistics tracking ───────────────────────────────────────────────────
     global_stats = {
         "caption_column": CAPTION_COLUMN,
-        "total_captions": n,
+        "total_rows": n,
+        "unique_captions": n_unique,
+        "duplicates_saved": n_dupes,
+        "empty_captions": n_empty,
+        "captions_from_checkpoint": len(caption_features),
+        "captions_to_process": len(remaining),
         "total_batches": 0,
         "successful_batches": 0,
         "failed_batches": 0,
         "total_api_calls": 0,
         "total_retries": 0,
         "total_validation_fixes": 0,
-        "labels_processed": [],
-        "labels_skipped": [],
         "start_time": time.time(),
         "openai_use_batch": bool(LLM_PROVIDER == "openai" and OPENAI_USE_BATCH),
         "openai_prompt_cache_key": OPENAI_PROMPT_CACHE_KEY if LLM_PROVIDER == "openai" else "",
+        "output_format": "sparse",
     }
 
-    # Process per label_name for checkpointing
-    label_names = df["label_name"].unique()
+    # ── Run extraction on remaining unique captions ───────────────────────────
+    if remaining:
+        n_api_calls_est = (len(remaining) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
+        print(f"Processing {len(remaining):,} unique captions in ~{n_api_calls_est:,} API calls...")
+        print(f"  Provider: {LLM_PROVIDER} | Model: {MODEL_NAME}\n")
 
-    if LLM_PROVIDER == "openai" and OPENAI_USE_BATCH:
-        _phase2_run_openai_batch_extraction(
-            df,
-            label_names,
-            all_feature_names,
-            system_prompt,
-            all_results_list,
-            global_stats,
-        )
+        def _ckpt_saver(results):
+            merged = dict(caption_features)
+            merged.update(results)
+            _save_dedup_checkpoint(merged, all_feature_names, dedup_ckpt)
+
+        if LLM_PROVIDER == "openai" and OPENAI_USE_BATCH:
+            new_results = _run_dedup_openai_batch(
+                remaining, all_feature_names, system_prompt, global_stats
+            )
+        else:
+            new_results = _run_dedup_sync(
+                remaining, all_feature_names, system_prompt, global_stats, _ckpt_saver
+            )
+
+        caption_features.update(new_results)
+        _save_dedup_checkpoint(caption_features, all_feature_names, dedup_ckpt)
+        print(f"  Checkpoint saved: {len(caption_features):,} unique caption results\n")
     else:
-        for label_idx, label_name in enumerate(tqdm(label_names, desc="Processing labels"), 1):
-            safe_name = re.sub(r"[^\w\-]", "_", str(label_name))[:60]
-            ckpt_path = CHECKPOINT_DIR / f"llm_{safe_name}.json"
+        print("  All unique captions already in checkpoint — skipping extraction.\n")
 
-            label_mask = df["label_name"] == label_name
-            label_indices = df.index[label_mask].tolist()
-            label_captions = df.loc[label_indices, CAPTION_COLUMN].tolist()
-
-            n_label = len(label_captions)
-            n_batches_label = (n_label + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
-
-            if ckpt_path.exists():
-                try:
-                    with open(ckpt_path, "r", encoding="utf-8") as f:
-                        label_results = json.load(f)
-                    if len(label_results) == len(label_indices):
-                        print(
-                            f"  [{label_idx}/{len(label_names)}] {label_name}: "
-                            f"Loaded {len(label_results):,} results from checkpoint"
-                        )
-                        for idx, result in zip(label_indices, label_results):
-                            all_results_list[idx] = result
-                        global_stats["labels_skipped"].append(label_name)
-                        continue
-                    print(
-                        f"  [{label_idx}/{len(label_names)}] {label_name}: "
-                        f"Checkpoint incomplete ({len(label_results)}/{len(label_indices)}), re-extracting..."
-                    )
-                except Exception as e:
-                    print(
-                        f"  [{label_idx}/{len(label_names)}] {label_name}: "
-                        f"Error loading checkpoint: {e}, re-extracting..."
-                    )
-
-            print(
-                f"  [{label_idx}/{len(label_names)}] {label_name}: "
-                f"Processing {n_label:,} captions in {n_batches_label} batches..."
-            )
-
-            label_results = []
-            label_stats = {
-                "batches": 0,
-                "retries": 0,
-                "validation_fixes": 0,
-            }
-
-            batch_pbar = tqdm(
-                range(0, len(label_captions), LLM_BATCH_SIZE),
-                desc="  Batches",
-                leave=False,
-                total=n_batches_label,
-            )
-
-            for b_start in batch_pbar:
-                batch_end = min(b_start + LLM_BATCH_SIZE, len(label_captions))
-                batch = label_captions[b_start:batch_end]
-
-                batch_results, stats = extract_features_batch(
-                    batch, all_feature_names, system_prompt
-                )
-
-                label_results.extend(batch_results)
-                label_stats["batches"] += 1
-                label_stats["retries"] += stats["attempts"] - 1 if stats["attempts"] > 0 else 0
-                label_stats["validation_fixes"] += stats["validation_fixes"]
-
-                global_stats["total_batches"] += 1
-                global_stats["total_api_calls"] += stats["attempts"]
-                global_stats["total_retries"] += max(0, stats["attempts"] - 1)
-                global_stats["total_validation_fixes"] += stats["validation_fixes"]
-
-                if stats["success"]:
-                    global_stats["successful_batches"] += 1
-                else:
-                    global_stats["failed_batches"] += 1
-
-                batch_pbar.set_postfix(
-                    {
-                        "retries": label_stats["retries"],
-                        "fixes": label_stats["validation_fixes"],
-                    }
-                )
-
-                time.sleep(RATE_LIMIT_SLEEP)
-
-            with open(ckpt_path, "w", encoding="utf-8") as f:
-                json.dump(label_results, f)
-
-            for idx, result in zip(label_indices, label_results):
-                all_results_list[idx] = result
-
-            global_stats["labels_processed"].append(
-                {
-                    "label": label_name,
-                    "captions": n_label,
-                    "batches": label_stats["batches"],
-                    "retries": label_stats["retries"],
-                    "fixes": label_stats["validation_fixes"],
-                }
-            )
-
-    # Fill any remaining None entries with unknown
-    fallback = {k: 2 for k in all_feature_names}
-    none_count = sum(1 for r in all_results_list if r is None)
-    if none_count > 0:
-        print(f"\n  Warning: {none_count:,} records have no results, filling with unknown (2)")
-        for i in range(n):
-            if all_results_list[i] is None:
-                all_results_list[i] = fallback
-
-    # Normalize rows (checkpoints / edge cases may have non-dicts or bad values)
-    all_results_list, row_fixes = validate_batch_results(
-        all_results_list, all_feature_names, n
-    )
-    if row_fixes > 0:
-        print(f"  Row validation: applied {row_fixes} fix(es) before building feature matrix")
-
-    # Create features DataFrame
-    features_df = pd.DataFrame(all_results_list)
-    
-    # Calculate elapsed time
+    # ── Replicate to all rows ─────────────────────────────────────────────────
     elapsed_time = time.time() - global_stats["start_time"]
     global_stats["elapsed_seconds"] = elapsed_time
-    global_stats["elapsed_formatted"] = f"{elapsed_time/3600:.1f} hours"
-    
-    print(f"\n  Extraction complete!")
-    print(f"  Time elapsed: {elapsed_time/60:.1f} minutes ({elapsed_time/3600:.2f} hours)")
+    global_stats["elapsed_formatted"] = f"{elapsed_time / 3600:.1f} hours"
+
+    print(f"  Extraction complete!")
+    print(f"  Time elapsed: {elapsed_time / 60:.1f} minutes ({elapsed_time / 3600:.2f} hours)")
     print(f"  Total API calls: {global_stats['total_api_calls']:,}")
     print(f"  Total retries: {global_stats['total_retries']:,}")
     print(f"  Validation fixes: {global_stats['total_validation_fixes']:,}")
     print(f"  Failed batches: {global_stats['failed_batches']:,}")
 
-    # ── Combine and save ───────────────────────────────────────────────────────
-    print("\nCreating feature matrix...")
-    
-    # Keep original metadata columns
-    meta_cols = df[["image", "label_name", "disease_label"]].reset_index(drop=True)
-    
-    # Combine with extracted features
+    print("\nReplicating features to all rows (including duplicates)...")
+    fallback_row = {k: 2 for k in all_feature_names}
+    feature_rows: list[dict] = []
+    for cap in stripped:
+        if cap and cap in caption_features:
+            feature_rows.append(caption_features[cap])
+        else:
+            feature_rows.append(fallback_row)
+
+    features_df = pd.DataFrame(feature_rows, columns=all_feature_names)
+
+    # ── Combine with original columns and save ────────────────────────────────
+    print("Creating output CSV...")
+    desired_meta = ["image", "image_path", "label", "label_name", CAPTION_COLUMN, "disease_label"]
+    meta_cols = [c for c in desired_meta if c in df.columns]
     final_df = pd.concat(
-        [meta_cols,
-         features_df.reset_index(drop=True)],
+        [df[meta_cols].reset_index(drop=True), features_df.reset_index(drop=True)],
         axis=1,
     )
 
-    # Validate and clean feature columns
-    print("  Validating feature columns...")
     for col in all_feature_names:
         if col in final_df.columns:
-            # Convert to numeric, coerce errors to NaN
             final_df[col] = pd.to_numeric(final_df[col], errors="coerce")
-            # Fill NaN with 2 (unknown)
             final_df[col] = final_df[col].fillna(2).astype(int)
-            # Ensure only 0, 1, 2 values
             final_df[col] = final_df[col].clip(0, 2)
 
-    # Save the new CSV with all feature columns
     final_df.to_csv(OUTPUT_CSV, index=False)
-    
-    # Save statistics
+
     with open(STATS_FILE, "w") as f:
         json.dump(global_stats, f, indent=2, default=str)
-    
-    print(f"\n{'='*70}")
+
+    print(f"\n{'=' * 70}")
     print(f"  OUTPUT SUMMARY")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print(f"  Feature matrix saved: {OUTPUT_CSV}")
     print(f"  Shape: {final_df.shape}")
-    print(f"  Total features: {len(all_feature_names)}")
-    print(f"  Total rows: {len(final_df):,}")
+    print(f"  Columns: {', '.join(meta_cols)} + {len(all_feature_names)} feature columns")
+    print(f"  Total rows: {len(final_df):,} (all original rows, duplicates replicated)")
+    print(f"  Unique captions processed: {n_unique:,}")
     print(f"  Statistics saved: {STATS_FILE}")
-    
-    # Print feature value distribution summary
+
     print(f"\n  Feature value distribution (sample of first 10):")
     for col in all_feature_names[:10]:
         vc = final_df[col].value_counts().to_dict()
@@ -1138,20 +1079,22 @@ def run_extraction(csv_path: str, schema_path: str):
         absent = vc.get(0, 0)
         unknown = vc.get(2, 0)
         pct_present = 100 * present / len(final_df)
-        print(f"    {col:40s}: present={present:6,} ({pct_present:4.1f}%), "
-              f"absent={absent:6,}, unknown={unknown:6,}")
-    
+        print(
+            f"    {col:40s}: present={present:6,} ({pct_present:4.1f}%), "
+            f"absent={absent:6,}, unknown={unknown:6,}"
+        )
+
     if len(all_feature_names) > 10:
         print(f"    ... and {len(all_feature_names) - 10} more features")
-    
+
     return final_df, global_stats
 
 
 if __name__ == "__main__":
     result_df, stats = run_extraction(CSV_PATH, SCHEMA_PATH)
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Extraction complete!")
     print(f"Output saved to: {OUTPUT_CSV}")
     print(f"Statistics saved to: {STATS_FILE}")
-    print("="*70)
+    print("=" * 70)
