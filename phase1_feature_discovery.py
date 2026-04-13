@@ -111,6 +111,38 @@ OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY = os.getenv(
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
 ESTIMATE_ONLY = os.getenv("ESTIMATE_ONLY", "").strip().lower() in ("1", "true", "yes")
 
+_MODEL_COSTS = {
+    "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
+    "gpt-4.1": {"input": 2.00, "cached_input": 0.50, "output": 8.00},
+    "gpt-4.1-mini": {"input": 0.40, "cached_input": 0.10, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "cached_input": 0.025, "output": 0.40},
+}
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int,
+                   cached_fraction: float = 0.8) -> dict:
+    """Estimate USD cost for a given model and token counts."""
+    costs = _MODEL_COSTS.get(model, _MODEL_COSTS.get("gpt-4o-mini"))
+    cached_input = int(input_tokens * cached_fraction)
+    uncached_input = input_tokens - cached_input
+    input_cost = (uncached_input / 1_000_000) * costs["input"]
+    cached_cost = (cached_input / 1_000_000) * costs["cached_input"]
+    output_cost = (output_tokens / 1_000_000) * costs["output"]
+    total = input_cost + cached_cost + output_cost
+    return {
+        "model": model,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input,
+        "uncached_input_tokens": uncached_input,
+        "output_tokens": output_tokens,
+        "input_cost_usd": round(input_cost, 4),
+        "cached_cost_usd": round(cached_cost, 4),
+        "output_cost_usd": round(output_cost, 4),
+        "total_cost_usd": round(total, 4),
+        "batch_api_cost_usd": round(total * 0.5, 4),
+    }
+
+
 _EXTENDED_CACHE_MODELS = frozenset({
     "gpt-4.1", "gpt-5", "gpt-5-codex", "gpt-5.1", "gpt-5.1-codex",
     "gpt-5.1-codex-mini", "gpt-5.1-codex-max", "gpt-5.1-chat-latest",
@@ -1906,28 +1938,101 @@ if __name__ == "__main__":
     if ESTIMATE_ONLY:
         n_labels = int(sample_df["label_name"].nunique())
         n_captions = len(sample_df)
-        est_discovery_calls = n_labels
-        est_input_tokens = est_discovery_calls * 3000
-        est_output_tokens = est_discovery_calls * 2000
-        print("  Cost Estimate (ESTIMATE_ONLY=1):")
-        print(f"    Labels to process:  {n_labels:,}")
-        print(f"    Captions sampled:   {n_captions:,}")
-        print(f"    Est. discovery API calls:  {est_discovery_calls:,}")
-        print(f"    Est. input tokens:  ~{est_input_tokens:,}")
-        print(f"    Est. output tokens: ~{est_output_tokens:,}")
 
+        # Simulate per-label deduplication and batching to get accurate API call count
+        discovery_api_calls = 0
+        total_unique_per_label = 0
+        cached_labels = 0
+        for label_name in sample_df["label_name"].unique():
+            safe_name = re.sub(r"[^\w\-]", "_", str(label_name))[:60]
+            cache_path = DISCOVERY_DIR / f"discovery_{safe_name}_{DISCOVERY_SAMPLING_MODE}.json"
+            if cache_path.exists():
+                cached_labels += 1
+                continue
+            label_caps = sample_df[sample_df["label_name"] == label_name][CAPTION_COLUMN].tolist()
+            if DISCOVERY_DEDUPE_CAPTIONS:
+                unique_caps = set(str(x).strip() for x in label_caps if str(x).strip())
+                n_unique = len(unique_caps)
+            else:
+                n_unique = len(label_caps)
+            total_unique_per_label += n_unique
+            discovery_api_calls += (n_unique + BATCH_SIZE - 1) // BATCH_SIZE
+
+        sys_prompt_words = len(DISCOVERY_SYSTEM_PROMPT.split())
+        sys_prompt_tokens = int(sys_prompt_words * 1.3)
+        avg_caption_tokens = 120
+        avg_input_per_call = sys_prompt_tokens + (BATCH_SIZE * avg_caption_tokens) + 50
+        avg_output_per_call = 1500
+        disc_input_tokens = discovery_api_calls * avg_input_per_call
+        disc_output_tokens = discovery_api_calls * avg_output_per_call
+
+        # Consolidation: 1 call with the full raw schema
+        consol_input_tokens = 2000
+        consol_output_tokens = OPENAI_CONSOLIDATION_MAX_TOKENS
+
+        # Tagging: all unique captions from full CSV
         full_df = pd.read_csv(CSV_PATH)
         n_all = len(full_df)
         n_unique_all = full_df[CAPTION_COLUMN].nunique()
-        tag_calls = (n_unique_all + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
-        tag_input = tag_calls * 1500
-        tag_output = tag_calls * 500
-        print(f"\n    Tagging step (all captions):")
-        print(f"      Total rows: {n_all:,}, unique captions: {n_unique_all:,}")
-        print(f"      Est. tagging API calls: {tag_calls:,}")
-        print(f"      Est. input tokens:  ~{tag_input:,}")
-        print(f"      Est. output tokens: ~{tag_output:,}")
-        print("\n  Exiting without running discovery. Set ESTIMATE_ONLY=0 to proceed.")
+        tag_api_calls = (n_unique_all + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
+        tag_sys_tokens = 800
+        tag_input_per_call = tag_sys_tokens + (TAGGING_BATCH_SIZE * avg_caption_tokens) + 30
+        tag_output_per_call = TAGGING_BATCH_SIZE * 15
+        tag_input_tokens = tag_api_calls * tag_input_per_call
+        tag_output_tokens = tag_api_calls * tag_output_per_call
+
+        total_input = disc_input_tokens + consol_input_tokens + tag_input_tokens
+        total_output = disc_output_tokens + consol_output_tokens + tag_output_tokens
+
+        model_name = DISCOVERY_MODEL if LLM_PROVIDER == "openai" else "gpt-4o-mini"
+        est = _estimate_cost(model_name, total_input, total_output, cached_fraction=0.8)
+
+        print("  Cost Estimate (ESTIMATE_ONLY=1):")
+        print(f"    Model: {model_name}")
+        print()
+        print(f"    ── Discovery Step ──")
+        print(f"    Labels to process:     {n_labels:,} ({cached_labels} already cached on disk)")
+        print(f"    Labels needing LLM:    {n_labels - cached_labels:,}")
+        print(f"    Captions sampled:      {n_captions:,}")
+        print(f"    Unique captions (deduped per label): {total_unique_per_label:,}")
+        print(f"    Batch size:            {BATCH_SIZE}")
+        print(f"    Est. API calls:        {discovery_api_calls:,}")
+        print(f"    Est. input tokens:     ~{disc_input_tokens:,} "
+              f"(~{sys_prompt_tokens:,} system prompt cached per call)")
+        print(f"    Est. output tokens:    ~{disc_output_tokens:,}")
+        print()
+        print(f"    ── Consolidation Step ──")
+        print(f"    Est. API calls:        1")
+        print(f"    Est. input tokens:     ~{consol_input_tokens:,}")
+        print(f"    Est. output tokens:    ~{consol_output_tokens:,}")
+        print()
+        print(f"    ── Tagging Step (all captions) ──")
+        print(f"    Total rows:            {n_all:,}")
+        print(f"    Unique captions:       {n_unique_all:,}")
+        print(f"    Batch size:            {TAGGING_BATCH_SIZE}")
+        print(f"    Est. API calls:        {tag_api_calls:,}")
+        print(f"    Est. input tokens:     ~{tag_input_tokens:,} "
+              f"(~{tag_sys_tokens:,} system prompt cached per call)")
+        print(f"    Est. output tokens:    ~{tag_output_tokens:,}")
+        print()
+        print(f"    ── Total ──")
+        print(f"    Total API calls:       {discovery_api_calls + 1 + tag_api_calls:,}")
+        print(f"    Total input tokens:    ~{total_input:,}")
+        print(f"      Cached (~80%):       ~{est['cached_input_tokens']:,} "
+              f"@ ${_MODEL_COSTS.get(model_name, _MODEL_COSTS['gpt-4o-mini'])['cached_input']}/1M")
+        print(f"      Uncached (~20%):     ~{est['uncached_input_tokens']:,} "
+              f"@ ${_MODEL_COSTS.get(model_name, _MODEL_COSTS['gpt-4o-mini'])['input']}/1M")
+        print(f"    Total output tokens:   ~{total_output:,} "
+              f"@ ${_MODEL_COSTS.get(model_name, _MODEL_COSTS['gpt-4o-mini'])['output']}/1M")
+        print()
+        print(f"    ── Estimated Cost ──")
+        print(f"    Sync API cost:         ${est['total_cost_usd']:.4f}")
+        print(f"    Batch API cost (~50%): ${est['batch_api_cost_usd']:.4f}")
+        if OPENAI_USE_BATCH:
+            print(f"    → Using Batch API (OPENAI_USE_BATCH=1)")
+        else:
+            print(f"    → Using sync API (set OPENAI_USE_BATCH=1 for ~50% discount)")
+        print("\n  Exiting without running. Set ESTIMATE_ONLY=0 to proceed.")
         import sys
         sys.exit(0)
 
