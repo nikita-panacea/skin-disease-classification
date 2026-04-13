@@ -973,103 +973,104 @@ CRITICAL RULES:
 
 You MUST scan for features in ALL of these subcategories (use these exact keys), if present:
 
-1. demographics_age: child, adolescent, adult, middle_aged, elderly, infant, neonate, specific ages
-2. demographics_sex: male, female
-3. demographics_skin_type: fst1, fst2, fst3, fst4, fst5, fst6, fair, medium, olive, dark, deeply_pigmented
-4. demographics_ethnicity: as mentioned (e.g. caucasian, african_american, asian, hispanic)
+1. demographics_age: child, adolescent, adult, middle_aged, elderly, infant, neonate, specific ages, age groups, etc.
+2. demographics_sex: male, female, gender, etc.
+3. demographics_skin_type: fst1, fst2, fst3, fst4, fst5, fst6, fair, medium, olive, dark, deeply_pigmented, etc.
+4. demographics_ethnicity: as mentioned (e.g. caucasian, african_american, asian, hispanic, etc.)
 
 5. morphology_texture:
-   - Elevated: raised, papule, plaque, nodule, bump, wart, verruca, wheal
-   - Flat: flat, macular, macule, patch
-   - Surface: rough, scaly, flaky, desquamated, keratotic, hyperkeratotic
-   - Fluid-filled: vesicle, blister, bulla, pustule, fluid_filled, weeping, oozing
-   - Ulceration: ulcer, erosion, crusted, excoriated
-   - Smooth: smooth, shiny, glossy
-   - Other: cyst, abscess, scar, atrophy, benign, malignant
+   - Elevated: raised, papule, plaque, nodule, bump, wart, verruca, wheal, etc.
+   - Flat: flat, macular, macule, patch, etc.
+   - Surface: rough, scaly, flaky, desquamated, keratotic, hyperkeratotic, etc.
+   - Fluid-filled: vesicle, blister, bulla, pustule, fluid_filled, weeping, oozing, etc.
+   - Ulceration: ulcer, erosion, crusted, excoriated, etc.
+   - Smooth: smooth, shiny, glossy, etc.
+   - Other: cyst, abscess, scar, atrophy, benign, malignant, etc.
 
 6. morphology_color:
-   - Red spectrum: red, erythematous, pink, violaceous, purple
-   - Pigment: brown, hyperpigmented, hypopigmented, white, depigmented, pale, dark
-   - Other: yellow, black, blue, grey, salmon_colored, skin_colored
+   - Red spectrum: red, erythematous, pink, violaceous, purple, etc.
+   - Pigment: brown, hyperpigmented, hypopigmented, white, depigmented, pale, dark, etc.
+   - Other: yellow, black, blue, grey, salmon_colored, skin_colored, etc.
 
 7. morphology_shape:
-   - Shape: round, oval, circular, irregular, annular, linear, serpiginous
-   - Border: well_defined, well_demarcated, ill_defined, irregular_border
-   - Size: small, medium, large
+   - Shape: round, oval, circular, irregular, annular, linear, serpiginous, etc.
+   - Border: well_defined, well_demarcated, ill_defined, irregular_border, etc.
+   - Size: small, medium, large, etc.
 
 8. morphology_distribution:
-   - Pattern: unilateral, bilateral, symmetric, asymmetric
-   - Arrangement: grouped, clustered, herpetiform, dermatomal, linear, streak_like
-   - Extent: localized, widespread, generalized, diffuse, isolated
+   - Pattern: unilateral, bilateral, symmetric, asymmetric, etc.
+   - Arrangement: grouped, clustered, herpetiform, dermatomal, linear, streak_like, etc.
+   - Extent: localized, widespread, generalized, diffuse, isolated, etc.
 
 9. body_location:
-   - Head: face, cheek, forehead, nose, perioral, periorbital, eyelid, lip, scalp, hairline, ear
-   - Neck: neck
-   - Torso: chest, abdomen, back, flank, trunk
-   - Upper limb: arm, forearm, elbow, wrist, hand, palm, finger, back_of_hand
-   - Lower limb: leg, thigh, shin, calf, knee, ankle, foot, sole, heel, toe
-   - Special: genitalia, groin, scrotum, vulva, perineum, perianal, buttocks
-   - Other: mouth, oral_mucosal, tongue, nail, axilla, intertriginous
+   - Head: face, cheek, forehead, nose, perioral, periorbital, eyelid, lip, scalp, hairline, ear, etc.
+   - Neck: neck, etc.
+   - Torso: chest, abdomen, back, flank, trunk, etc.
+   - Upper limb: arm, forearm, elbow, wrist, hand, palm, finger, back_of_hand, etc.
+   - Lower limb: leg, thigh, shin, calf, knee, ankle, foot, sole, heel, toe, etc.
+   - Special: genitalia, groin, scrotum, vulva, perineum, perianal, buttocks, etc.
+   - Other: mouth, oral_mucosal, tongue, nail, axilla, intertriginous, etc.
 
 10. symptoms_dermatological:
-    - Sensations: itching, burning, stinging, pain, tenderness, soreness
-    - Changes: increasing_size, spreading, darkening, lightening, bleeding
-    - Other: bothersome_appearance, cosmetic_concern, numbness, tingling
+    - Sensations: itching, burning, stinging, pain, tenderness, soreness, etc.
+    - Changes: increasing_size, spreading, darkening, lightening, bleeding, etc.
+    - Other: bothersome_appearance, cosmetic_concern, numbness, tingling, etc.
 
 11. symptoms_systemic:
-    - General: fever, chills, fatigue, malaise, weight_loss
-    - Specific: joint_pain, mouth_sores, shortness_of_breath
-    - Lymphatic: lymphadenopathy, swollen_lymph_nodes
+    - General: fever, chills, fatigue, malaise, weight_loss, etc.
+    - Specific: joint_pain, mouth_sores, shortness_of_breath, etc.
+    - Lymphatic: lymphadenopathy, swollen_lymph_nodes, etc.
 
 12. duration:
-    - Duration: acute, chronic, subacute, days, weeks, months, years, lifelong, congenital, since_childhood
-    - Onset: sudden_onset, gradual_onset
-    - Pattern: recurrent, relapsing, persistent, intermittent, first_episode
+    - Duration: acute, chronic, subacute, days, weeks, months, years, lifelong, congenital, since_childhood, etc.
+    - Onset: sudden_onset, gradual_onset, etc.
+    - Pattern: recurrent, relapsing, persistent, intermittent, first_episode, etc.
 
 13. triggers:
-    - Environmental: sun_exposure, uv_light, heat, cold, sweating, humidity, seasonal
+    - Environmental: sun_exposure, uv_light, heat, cold, sweating, humidity, seasonal, etc. 
     - Contact: allergens, irritants, chemicals, cosmetics, metals, latex
-    - Medications: drug_reaction, antibiotic_reaction
-    - Biological: infection, bacteria, virus, fungus, insect_bite, trauma, friction
-    - Lifestyle: stress, hormonal_changes, pregnancy, diet
-    - Occupational: occupational_exposure
+    - Medications: drug_reaction, antibiotic_reaction, etc.
+    - Biological: infection, bacteria, virus, fungus, insect_bite, trauma, friction, etc.
+    - Lifestyle: stress, hormonal_changes, pregnancy, diet, etc.
+    - Occupational: occupational_exposure, etc.
 
 14. treatments:
-    - Topical: topical_steroids, corticosteroids, emollients, moisturizers
-    - Systemic: oral_steroids, antibiotics, antifungals, antihistamines, immunosuppressants, biologics, retinoids
-    - Physical: phototherapy, laser_therapy, surgery, excision, cryotherapy
-    - Supportive: home_remedies, otc, wound_care
+    - Topical: topical_steroids, corticosteroids, emollients, moisturizers, etc.
+    - Systemic: oral_steroids, antibiotics, antifungals, antihistamines, immunosuppressants, biologics, retinoids, etc.
+    - Physical: phototherapy, laser_therapy, surgery, excision, cryotherapy, etc.
+    - Supportive: home_remedies, otc, wound_care, etc.
 
 15. clinical_signs:
-    - Specific: nikolsky_sign, auspitz_sign, koebner_phenomenon, darier_sign
-    - Patterns: dermoscopic_pattern, wickham_striae, target_lesions, pathergy
-    - Diagnostic: biopsy_proven, histologically_confirmed, clinically_diagnosed
+    - Specific: nikolsky_sign, auspitz_sign, koebner_phenomenon, darier_sign, etc.
+    - Patterns: dermoscopic_pattern, wickham_striae, target_lesions, pathergy, etc.     
+    - Diagnostic: biopsy_proven, histologically_confirmed, clinically_diagnosed, etc.
 
 16. history:
-    - Personal: family_history, genetic_predisposition, atopy, allergies, asthma
-    - Disease: recurrence, previous_episodes, new_onset
-    - Immune: immunocompromised, immunosuppressed, hiv, diabetes, autoimmune
-    - Other: comorbidities, sun_damage, smoking, travel_history
+    - Personal: family_history, genetic_predisposition, atopy, allergies, asthma, etc.
+    - Disease: recurrence, previous_episodes, new_onset, etc.
+    - Immune: immunocompromised, immunosuppressed, hiv, diabetes, autoimmune, etc.
+    - Other: comorbidities, sun_damage, smoking, travel_history, etc.
 
 17. lesion_count:
-    - Number: single, few, multiple, numerous
-    - Extent: localized, scattered, generalized
+    - Number: single, few, multiple, numerous, etc.
+    - Extent: localized, scattered, generalized, etc.
 
 18. secondary_changes:
-    - Chronic: lichenification, thickening, atrophy
-    - Trauma: excoriation, scratch_marks, crusting, fissuring, maceration
-    - Post-inflammatory: post_inflammatory_hyperpigmentation, post_inflammatory_hypopigmentation, scarring, keloid
+    - Chronic: lichenification, thickening, atrophy, etc.
+    - Trauma: excoriation, scratch_marks, crusting, fissuring, maceration, etc.
+    - Post-inflammatory: post_inflammatory_hyperpigmentation, post_inflammatory_hypopigmentation, scarring, keloid, etc.
 
 19. severity:
-    - Scale: mild, moderate, severe, very_severe, life_threatening
-    - Impact: asymptomatic, symptomatic, disabling, quality_of_life_impact
+    - Scale: mild, moderate, severe, very_severe, life_threatening, etc.
+    - Impact: asymptomatic, symptomatic, disabling, quality_of_life_impact, etc.
 
 20. image_metadata:
-    - Type: clinical_image, dermoscopy, close_up, macro, microscopic
-    - Quality: clear, blurry, well_lit, poor_lighting
+    - Type: clinical_image, dermoscopy, close_up, macro, microscopic, etc.
+    - Quality: clear, blurry, well_lit, poor_lighting, etc.
 
 21. other:
-    - Any specific clinical findings not covered above (e.g. contagious, autoimmune_nature, malignancy_risk)
+    - Any specific clinical findings not covered above (e.g. contagious, autoimmune_nature, malignancy_risk, etc.)
+    - Include any other relevant clinical features found in captions that are not covered by the above subcategories.
 
 Return ONLY valid JSON — no markdown fences, no prose.
 Output is a single object where each key is a subcategory name and each value is the list of snake_case feature values found in these captions:
@@ -1412,7 +1413,9 @@ These were collected across many disease labels and contain synonyms, near-dupli
 
 Your task:
 1. MERGE obvious synonyms within each subcategory (e.g. "itch" + "pruritus" → "itching"; "erythematous" + "red" → "red")
-2. STANDARDIZE all values to snake_case
+2. Use one form of terminology/scale to group similar values for a subcategory, eg. for demographics_age, use "child", "adolescent", "adult", "elderly", etc. or age groups like "0-10", "11-20", "21-30", etc., but not both or mix and match.
+Similary eg. for skin tone either use "fair", "medium", "olive", "dark", "deeply_pigmented", etc. or Fitzpatrick skin type like "fst1", "fst2", "fst3", "fst4", "fst5", "fst6", but not both or mix and match.
+3. STANDARDIZE all values to snake_case
 3. REMOVE junk/vague entries (e.g. "other", "unknown", "various")
 4. DO NOT merge clinically distinct concepts (e.g. keep "papule" and "plaque" separate)
 5. DO NOT move values between subcategories
@@ -1577,7 +1580,7 @@ def add_scin_alignment(
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
-    "demographics_age": "Patient age groups or specific ages",
+    "demographics_age": "Patient age groups",
     "demographics_sex": "Patient sex or gender",
     "demographics_skin_type": "Fitzpatrick skin type or skin tone descriptions",
     "demographics_ethnicity": "Patient ethnicity or race as mentioned",

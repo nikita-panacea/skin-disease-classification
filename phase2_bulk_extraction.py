@@ -157,7 +157,7 @@ OUTPUT_CSV       = "derm1m_features.csv"
 STATS_FILE       = "extraction_stats.json"
 CHECKPOINT_DIR   = Path("checkpoints")
 LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 25, vmin=1)
-MAX_CAPTION_LEN  = 500
+MAX_CAPTION_LEN  = 3000
 MAX_RETRIES      = 5
 RATE_LIMIT_SLEEP = 0.1 if LLM_PROVIDER == "qwen" else 0.5
 DEDUP_CKPT_FILE  = "dedup_caption_features.json"
