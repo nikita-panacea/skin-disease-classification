@@ -546,6 +546,155 @@ def generate_signature_summary_table(all_signatures: dict[str, dict],
     return summary_df
 
 
+def compute_hierarchical_disease_clusters(
+    all_signatures: dict[str, dict],
+    top_k: int = 20,
+) -> tuple[pd.DataFrame, list[list[str]]]:
+    """
+    Build a disease similarity matrix based on Jaccard similarity of top-K features.
+    Returns (similarity_df, discovered_clusters).
+    """
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import squareform
+
+    diseases = sorted(all_signatures.keys())
+    n = len(diseases)
+
+    disease_top_feats: dict[str, set[str]] = {}
+    for d in diseases:
+        sig = all_signatures[d]
+        singles = sorted(sig.get("singles", []), key=lambda s: -s["support"])[:top_k]
+        disease_top_feats[d] = {s["feature"] for s in singles}
+
+    sim_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                sim_matrix[i, j] = 1.0
+            elif i < j:
+                a, b = disease_top_feats[diseases[i]], disease_top_feats[diseases[j]]
+                union = len(a | b)
+                jaccard = len(a & b) / union if union > 0 else 0.0
+                sim_matrix[i, j] = jaccard
+                sim_matrix[j, i] = jaccard
+
+    sim_df = pd.DataFrame(sim_matrix, index=diseases, columns=diseases)
+
+    dist_matrix = 1.0 - sim_matrix
+    np.fill_diagonal(dist_matrix, 0)
+    condensed = squareform(dist_matrix, checks=False)
+    Z = linkage(condensed, method="average")
+    labels = fcluster(Z, t=0.7, criterion="distance")
+
+    clusters: dict[int, list[str]] = {}
+    for d, cl in zip(diseases, labels):
+        clusters.setdefault(int(cl), []).append(d)
+
+    multi_clusters = [members for members in clusters.values() if len(members) >= 2]
+
+    fig, ax = plt.subplots(figsize=(14, max(6, n * 0.25)))
+    sns.heatmap(sim_df, cmap="YlOrRd", vmin=0, vmax=1, annot=False,
+                linewidths=0.3, ax=ax, square=True)
+    ax.set_title(f"Disease Similarity (Jaccard of Top-{top_k} Features)")
+    plt.tight_layout()
+    plt.savefig(EDA_DIR / "disease_similarity_matrix.png", dpi=130, bbox_inches="tight")
+    plt.close()
+
+    sim_df.to_csv(EDA_DIR / "disease_similarity_matrix.csv")
+    return sim_df, multi_clusters
+
+
+def compute_cross_dataset_signature_comparison(
+    derm_signatures: dict[str, dict],
+    scin_df: pd.DataFrame,
+    scin_features: pd.DataFrame,
+    feature_cols: list[str],
+    scin_label_col: str = "skin_condition_label",
+    top_k: int = 15,
+) -> pd.DataFrame:
+    """
+    For diseases present in both Derm-1M and SCIN, compare top-K feature signatures
+    using Jaccard similarity.
+    """
+    canonical_in_scin = set(scin_features.columns)
+
+    if scin_label_col not in scin_df.columns:
+        for candidate in ("condition", "label", "skin_condition"):
+            if candidate in scin_df.columns:
+                scin_label_col = candidate
+                break
+
+    scin_diseases = set()
+    if scin_label_col in scin_df.columns:
+        scin_diseases = set(scin_df[scin_label_col].dropna().unique())
+
+    rows = []
+    for disease, sig in derm_signatures.items():
+        derm_singles = sorted(sig.get("singles", []), key=lambda s: -s["support"])[:top_k]
+        derm_top = {s["feature"] for s in derm_singles}
+
+        scin_top: set[str] = set()
+        n_scin_cases = 0
+        if disease in scin_diseases and scin_label_col in scin_df.columns:
+            scin_sub = scin_df[scin_df[scin_label_col] == disease]
+            n_scin_cases = len(scin_sub)
+            if n_scin_cases >= 10:
+                feat_prev = {}
+                for f in feature_cols:
+                    if f in scin_features.columns:
+                        scin_vals = scin_features.loc[scin_sub.index, f]
+                        feat_prev[f] = (scin_vals == 1).mean()
+                scin_top = set(
+                    sorted(feat_prev, key=feat_prev.get, reverse=True)[:top_k]
+                )
+
+        overlap = derm_top & scin_top
+        union = derm_top | scin_top
+        jaccard = len(overlap) / len(union) if union else 0.0
+        derm_only = derm_top - scin_top
+        scin_only = scin_top - derm_top
+
+        rows.append({
+            "disease": disease,
+            "n_derm1m_cases": sig.get("n_cases", 0),
+            "n_scin_cases": n_scin_cases,
+            "derm_top_k": len(derm_top),
+            "scin_top_k": len(scin_top),
+            "overlap": len(overlap),
+            "jaccard_similarity": round(jaccard, 3),
+            "derm_only_features": ", ".join(sorted(derm_only)[:5]),
+            "scin_only_features": ", ".join(sorted(scin_only)[:5]),
+        })
+
+    return pd.DataFrame(rows).sort_values("jaccard_similarity")
+
+
+def weight_confusion_gaps_by_importance(
+    conf_gaps: list[dict],
+    mi_df: pd.DataFrame | None = None,
+) -> list[dict]:
+    """
+    Weight discriminating features in confusion gaps by global MI score
+    to prioritize diagnostically valuable gaps.
+    """
+    if mi_df is None:
+        return conf_gaps
+    mi_map = dict(zip(mi_df["feature"], mi_df["mutual_information"]))
+
+    for gap in conf_gaps:
+        for d in gap.get("discriminating_singles", []):
+            feat = d["feature"]
+            d["global_mi"] = round(mi_map.get(feat, 0.0), 5)
+            d["weighted_lift"] = round(
+                d["discriminating_lift"] * (1.0 + mi_map.get(feat, 0.0) * 10), 4
+            )
+        gap["discriminating_singles"] = sorted(
+            gap.get("discriminating_singles", []),
+            key=lambda x: -x.get("weighted_lift", x.get("discriminating_lift", 0)),
+        )
+    return conf_gaps
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PLOTTING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -679,8 +828,11 @@ if __name__ == "__main__":
 
     # Meta columns to exclude from feature analysis (matches phase2 output)
     META_COLS = {
-        "image", "label_name", "disease_label", "age_numeric",
-        "age_group", "duration_bucket", "diagnosis_confidence", "lesion_count",
+        "image", "image_path", "label", "label_name", "disease_label",
+        "age_numeric", "age_group", "duration_bucket",
+        "diagnosis_confidence", "lesion_count",
+        "truncated_caption", "caption", "text_caption",
+        "extracted_features",
     }
     feature_cols = [
         c for c in derm_df.columns
@@ -774,6 +926,18 @@ if __name__ == "__main__":
         print(f"  Loaded confusion pairs from {CONFUSION_PAIRS_CSV} (merged with defaults)")
     print(f"\nComputing confusion-aware gaps for {len(confusion_pairs)} pairs...")
     conf_gaps = confusion_aware_gap(all_signatures, confusion_pairs)
+
+    # Weight confusion gaps by global MI if available
+    mi_path = Path("analysis_outputs/feature_importance_global.csv")
+    mi_df = None
+    if mi_path.exists():
+        try:
+            mi_df = pd.read_csv(mi_path)
+            conf_gaps = weight_confusion_gaps_by_importance(conf_gaps, mi_df)
+            print(f"  Weighted confusion gaps by global MI scores from {mi_path}")
+        except Exception:
+            pass
+
     with open(OUTPUT_DIR / "confusion_aware_gaps.json", "w") as f:
         json.dump(conf_gaps, f, indent=2)
 
@@ -781,10 +945,11 @@ if __name__ == "__main__":
         print(f"\n  [{gap['true_label']}] confused with [{gap['confused_with']}]:")
         print(f"    {gap['n_discriminators']} discriminating features, top 3:")
         for d in gap["discriminating_singles"][:3]:
+            mi_str = f"  MI={d.get('global_mi', 0):.4f}" if "global_mi" in d else ""
             print(
                 f"      {d['feature']:35s}  "
                 f"A={d['support_in_A']:.2f}  B={d['support_in_B']:.2f}  "
-                f"lift={d['discriminating_lift']:.2f}"
+                f"lift={d['discriminating_lift']:.2f}{mi_str}"
             )
         if gap["discriminating_pairs"]:
             print(f"    Top discriminating pair unique to [{gap['true_label']}]:")
@@ -822,6 +987,40 @@ if __name__ == "__main__":
         plot_feature_correlation_matrix(derm_df, feature_cols, disease, top_n=25)
     print(f"  Generated correlation matrices for top 5 diseases\n")
 
+    # 9. Hierarchical disease clustering
+    print("9. Computing hierarchical disease clusters...")
+    sim_df, disease_clusters = compute_hierarchical_disease_clusters(
+        all_signatures, top_k=20
+    )
+    print(f"  Found {len(disease_clusters)} multi-disease clusters:")
+    for ci, cluster in enumerate(disease_clusters):
+        print(f"    Cluster {ci + 1}: {', '.join(cluster)}")
+    cluster_path = OUTPUT_DIR / "disease_clusters.json"
+    with open(cluster_path, "w") as f:
+        json.dump(
+            {"clusters": disease_clusters, "n_clusters": len(disease_clusters)},
+            f, indent=2,
+        )
+    print()
+
+    # 10. Cross-dataset signature comparison
+    print("10. Computing cross-dataset signature comparison (Derm-1M vs SCIN)...")
+    cross_comparison = compute_cross_dataset_signature_comparison(
+        all_signatures, scin_raw, scin_features, feature_cols, top_k=15
+    )
+    cross_comparison.to_csv(OUTPUT_DIR / "cross_dataset_signature_comparison.csv", index=False)
+    n_with_scin = (cross_comparison["n_scin_cases"] > 0).sum()
+    if n_with_scin > 0:
+        avg_jaccard = cross_comparison[cross_comparison["n_scin_cases"] > 0]["jaccard_similarity"].mean()
+        print(f"  {n_with_scin} diseases have cases in both datasets")
+        print(f"  Average signature Jaccard similarity: {avg_jaccard:.3f}")
+        worst = cross_comparison[cross_comparison["n_scin_cases"] > 0].head(5)
+        print(f"  Lowest overlap diseases:")
+        for _, row in worst.iterrows():
+            print(f"    {row['disease']:35s} Jaccard={row['jaccard_similarity']:.3f} "
+                  f"(Derm={row['n_derm1m_cases']}, SCIN={row['n_scin_cases']})")
+    print()
+
     print("=" * 60)
     print("  ANALYSIS COMPLETE")
     print("=" * 60)
@@ -834,6 +1033,9 @@ if __name__ == "__main__":
     print("   - confusion_aware_gaps.json          -- exact missing signal per confused pair")
     print("   - cooccurrence_<disease>.png         -- heatmaps for worst-reproducibility diseases")
     print("   - signature_gap_<disease>.png        -- Derm-1M vs SCIN bar charts per disease")
+    print("   - disease_clusters.json              -- hierarchical disease clusters")
+    print("   - disease_similarity_matrix.png      -- disease similarity heatmap")
+    print("   - cross_dataset_signature_comparison.csv -- Derm-1M vs SCIN signature overlap")
     print("   - eda/signature_network_*.png        -- feature co-occurrence networks")
     print("   - eda/correlation_matrix_*.png       -- feature correlation matrices")
     print("   - eda/signature_summary_all_diseases.csv -- comprehensive signature summary")

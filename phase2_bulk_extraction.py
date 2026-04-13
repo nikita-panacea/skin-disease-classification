@@ -71,8 +71,27 @@ CAPTION_COLUMN   = os.getenv("CAPTION_COLUMN", "truncated_caption")
 LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")
 
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
+OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "1").lower() in ("1", "true", "yes")
 OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase2_extraction_v1").strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
+
+_EXTENDED_CACHE_MODELS = frozenset({
+    "gpt-4.1", "gpt-5", "gpt-5-codex", "gpt-5.1", "gpt-5.1-codex",
+    "gpt-5.1-codex-mini", "gpt-5.1-codex-max", "gpt-5.1-chat-latest",
+    "gpt-5.2", "gpt-5.4",
+})
+
+
+def _warn_cache_retention_if_unsupported(model_name: str) -> None:
+    if OPENAI_PROMPT_CACHE_RETENTION != "24h":
+        return
+    if model_name not in _EXTENDED_CACHE_MODELS:
+        print(
+            f"  WARNING: OPENAI_PROMPT_CACHE_RETENTION=24h is set but model {model_name!r} "
+            "does not support extended retention (only gpt-4.1+ and gpt-5+ do). "
+            "Falling back to in-memory caching (5-10 min active, max 1hr). "
+            "Set OPENAI_MODEL_NAME to gpt-4.1 or newer for 24h retention."
+        )
 
 
 def _safe_int_env(key: str, default: int, *, vmin: int | None = None, vmax: int | None = None) -> int:
@@ -119,6 +138,7 @@ elif LLM_PROVIDER == "openai":
 
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
     MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    _warn_cache_retention_if_unsupported(MODEL_NAME)
     model = None
 elif LLM_PROVIDER == "qwen":
     from openai import OpenAI as QwenClient
@@ -157,8 +177,43 @@ OUTPUT_CSV       = "derm1m_features.csv"
 STATS_FILE       = "extraction_stats.json"
 CHECKPOINT_DIR   = Path("checkpoints")
 LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 25, vmin=1)
-MAX_CAPTION_LEN  = 3000
 MAX_RETRIES      = 5
+
+TAGGED_CSV_PATH  = Path("discovery_outputs/caption_features_tagged.csv")
+USE_TAGGED_FEATURES = os.getenv("USE_TAGGED_FEATURES", "1").strip().lower() in ("1", "true", "yes")
+ESTIMATE_ONLY = os.getenv("ESTIMATE_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+# Approximate cost per 1M tokens (input/output) for common models
+_MODEL_COSTS = {
+    "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
+    "gpt-4.1": {"input": 2.00, "cached_input": 0.50, "output": 8.00},
+    "gpt-4.1-mini": {"input": 0.40, "cached_input": 0.10, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "cached_input": 0.025, "output": 0.40},
+}
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int,
+                   cached_fraction: float = 0.8) -> dict:
+    """Estimate USD cost for a given model and token counts."""
+    costs = _MODEL_COSTS.get(model, _MODEL_COSTS.get("gpt-4o-mini"))
+    cached_input = int(input_tokens * cached_fraction)
+    uncached_input = input_tokens - cached_input
+    input_cost = (uncached_input / 1_000_000) * costs["input"]
+    cached_cost = (cached_input / 1_000_000) * costs["cached_input"]
+    output_cost = (output_tokens / 1_000_000) * costs["output"]
+    total = input_cost + cached_cost + output_cost
+    return {
+        "model": model,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input,
+        "uncached_input_tokens": uncached_input,
+        "output_tokens": output_tokens,
+        "input_cost_usd": round(input_cost, 4),
+        "cached_cost_usd": round(cached_cost, 4),
+        "output_cost_usd": round(output_cost, 4),
+        "total_cost_usd": round(total, 4),
+        "batch_api_cost_usd": round(total * 0.5, 4),
+    }
 RATE_LIMIT_SLEEP = 0.1 if LLM_PROVIDER == "qwen" else 0.5
 DEDUP_CKPT_FILE  = "dedup_caption_features.json"
 
@@ -192,6 +247,8 @@ def _openai_extraction_chat_body(system_prompt: str, user_prompt: str) -> dict:
         "max_tokens": 4096,
         "stream": False,
     }
+    if OPENAI_JSON_RESPONSE:
+        body["response_format"] = {"type": "json_object"}
     _openai_apply_prompt_caching(body, OPENAI_PROMPT_CACHE_KEY)
     return body
 
@@ -400,6 +457,8 @@ def call_llm(
                     max_tokens=4096,
                     stream=False,
                 )
+                if OPENAI_JSON_RESPONSE:
+                    create_kw["response_format"] = {"type": "json_object"}
                 ck = (
                     openai_prompt_cache_key
                     if openai_prompt_cache_key is not None
@@ -604,9 +663,69 @@ RULES:
 """
 
 
-def build_extraction_user_prompt(truncated_captions: list[str]) -> str:
+def build_extraction_user_prompt(captions: list[str]) -> str:
     """Variable user message: numbered captions only (system holds full extraction rules)."""
-    return "\n\n".join(f"[{i}] {c}" for i, c in enumerate(truncated_captions))
+    return "\n\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
+
+
+def build_tagged_system_prompt(
+    all_feature_names: list[str],
+    feature_categories: dict[str, str],
+) -> str:
+    """
+    Shorter system prompt when pre-tagged feature lists are available.
+    No feature index map needed — input is already feature names.
+    Only category groups and encoding rules are needed.
+    """
+    n_feat = len(all_feature_names)
+    name_to_idx = {name: i for i, name in enumerate(all_feature_names)}
+    cat_groups = build_category_groups(all_feature_names, feature_categories)
+    group_lines = []
+    for gname, indices in sorted(cat_groups.items()):
+        group_lines.append(
+            f"  {gname} (indices {indices[0]}-{indices[-1]}, {len(indices)} features)"
+        )
+    groups_str = "\n".join(group_lines)
+
+    idx_lines = [f"{i}: {name}" for i, name in enumerate(all_feature_names)]
+    idx_map_str = "\n".join(idx_lines)
+
+    return f"""You are a clinical dermatology NLP specialist performing sparse one-hot encoding from pre-extracted feature tags.
+
+Each input is a list of feature names already extracted from a skin disease caption.
+Your task: convert these to sparse index-based encoding using category-aware rules.
+
+FEATURE INDEX MAP ({n_feat} features):
+{idx_map_str}
+
+CATEGORY GROUPS:
+{groups_str}
+
+=== ENCODING RULES ===
+  1 = PRESENT — feature name appears in the input list
+  0 = ABSENT  — feature is NOT in the list BUT another feature from the SAME category group IS present (inferably absent)
+  2 = TRULY UNKNOWN — NO features from the entire category group appear in the input list
+
+=== OUTPUT FORMAT (SPARSE) ===
+For EACH input, output: {{"1": [indices], "2": [indices]}}
+Unlisted indices default to 0.
+
+Return a JSON array with one object per input. Example:
+[{{"1": [0, 8, 45], "2": [150, 155]}}, {{"1": [3], "2": []}}]
+
+RULES:
+- Each index must be an integer in range 0 to {n_feat - 1}
+- An index must NOT appear in both "1" and "2"
+- No preamble, no markdown fences — ONLY the JSON array
+"""
+
+
+def build_tagged_user_prompt(tag_lists: list[list[str]]) -> str:
+    """User message when using pre-tagged feature lists instead of captions."""
+    return "\n".join(
+        f"[{i}] {', '.join(tags) if tags else '(empty)'}"
+        for i, tags in enumerate(tag_lists)
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -725,13 +844,17 @@ def extract_features_batch(
     all_feature_names: list[str],
     system_prompt: str,
     retries: int = MAX_RETRIES,
+    *,
+    tag_lists: list[list[str]] | None = None,
 ) -> tuple[list[dict], dict]:
     """
-    Batch LLM call for one chunk of captions.
+    Batch LLM call for one chunk of captions (or pre-tagged feature lists).
     Returns (list of feature dicts aligned to input captions, stats dict).
     """
-    truncated = [c[:MAX_CAPTION_LEN] for c in captions]
-    user_prompt = build_extraction_user_prompt(truncated)
+    if tag_lists is not None:
+        user_prompt = build_tagged_user_prompt(tag_lists)
+    else:
+        user_prompt = build_extraction_user_prompt(captions)
 
     stats = {
         "attempts": 0,
@@ -777,6 +900,8 @@ def _run_dedup_openai_batch(
     all_feature_names: list[str],
     system_prompt: str,
     global_stats: dict,
+    *,
+    caption_to_tags: dict[str, list[str]] | None = None,
 ) -> dict[str, dict]:
     """
     Process deduplicated captions via OpenAI Batch API.
@@ -787,8 +912,11 @@ def _run_dedup_openai_batch(
 
     for batch_idx, batch_start in enumerate(range(0, len(unique_captions), LLM_BATCH_SIZE)):
         batch = unique_captions[batch_start : batch_start + LLM_BATCH_SIZE]
-        truncated = [c[:MAX_CAPTION_LEN] for c in batch]
-        user_prompt = build_extraction_user_prompt(truncated)
+        if caption_to_tags is not None:
+            tag_lists = [caption_to_tags.get(c, []) for c in batch]
+            user_prompt = build_tagged_user_prompt(tag_lists)
+        else:
+            user_prompt = build_extraction_user_prompt(batch)
         cid = f"p2_{batch_idx}"
         jobs.append(
             {"custom_id": cid, "body": _openai_extraction_chat_body(system_prompt, user_prompt)}
@@ -809,7 +937,13 @@ def _run_dedup_openai_batch(
 
         if not ok:
             tqdm.write(f"    Sync fallback for batch {cid}")
-            batch_results, st2 = extract_features_batch(batch, all_feature_names, system_prompt)
+            batch_tags = (
+                [caption_to_tags.get(c, []) for c in batch]
+                if caption_to_tags is not None else None
+            )
+            batch_results, st2 = extract_features_batch(
+                batch, all_feature_names, system_prompt, tag_lists=batch_tags
+            )
             ok = st2.get("success", False)
             global_stats["total_retries"] += 1
             global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
@@ -831,6 +965,8 @@ def _run_dedup_sync(
     system_prompt: str,
     global_stats: dict,
     ckpt_save_fn,
+    *,
+    caption_to_tags: dict[str, list[str]] | None = None,
 ) -> dict[str, dict]:
     """
     Process deduplicated captions via synchronous LLM calls.
@@ -847,7 +983,13 @@ def _run_dedup_sync(
         total=n_batches,
     ):
         batch = unique_captions[batch_start : batch_start + LLM_BATCH_SIZE]
-        batch_results, stats = extract_features_batch(batch, all_feature_names, system_prompt)
+        batch_tags = (
+            [caption_to_tags.get(c, []) for c in batch]
+            if caption_to_tags is not None else None
+        )
+        batch_results, stats = extract_features_batch(
+            batch, all_feature_names, system_prompt, tag_lists=batch_tags
+        )
 
         for cap, feats in zip(batch, batch_results):
             results[cap] = feats
@@ -956,8 +1098,46 @@ def run_extraction(csv_path: str, schema_path: str):
         print(f"  Empty captions (all features=2): {n_empty:,}")
     print()
 
+    # ── Detect pre-tagged features from Phase 1 ─────────────────────────────
+    caption_to_tags: dict[str, list[str]] | None = None
+    use_tags = False
+    if USE_TAGGED_FEATURES and TAGGED_CSV_PATH.exists():
+        try:
+            tagged_df = pd.read_csv(TAGGED_CSV_PATH)
+            if "extracted_features" in tagged_df.columns and CAPTION_COLUMN in tagged_df.columns:
+                tagged_df[CAPTION_COLUMN] = tagged_df[CAPTION_COLUMN].fillna("").astype(str)
+                tagged_df["extracted_features"] = tagged_df["extracted_features"].fillna("[]").astype(str)
+                _tag_map: dict[str, list[str]] = {}
+                for cap_val, tag_val in zip(
+                    tagged_df[CAPTION_COLUMN].str.strip(),
+                    tagged_df["extracted_features"],
+                ):
+                    if cap_val and cap_val not in _tag_map:
+                        try:
+                            parsed_tags = json.loads(tag_val)
+                            if isinstance(parsed_tags, list):
+                                _tag_map[cap_val] = [str(t) for t in parsed_tags if isinstance(t, str)]
+                            else:
+                                _tag_map[cap_val] = []
+                        except (json.JSONDecodeError, TypeError):
+                            _tag_map[cap_val] = []
+                caption_to_tags = _tag_map
+                use_tags = True
+                n_with_tags = sum(1 for v in caption_to_tags.values() if v)
+                print(f"  Loaded pre-tagged features for {len(caption_to_tags):,} unique captions "
+                      f"({n_with_tags:,} with tags)")
+                print(f"  Using TAGGED input mode (shorter prompts, ~60-80% input token reduction)")
+        except Exception as e:
+            print(f"  WARNING: Could not load tagged CSV ({e}), falling back to full captions")
+
+    if not use_tags:
+        print(f"  Using CAPTION input mode (full captions)")
+
     # ── Build system prompt ───────────────────────────────────────────────────
-    system_prompt = build_llm_system_prompt(all_feature_names, feature_categories)
+    if use_tags:
+        system_prompt = build_tagged_system_prompt(all_feature_names, feature_categories)
+    else:
+        system_prompt = build_llm_system_prompt(all_feature_names, feature_categories)
 
     # ── Load checkpoint if exists ─────────────────────────────────────────────
     dedup_ckpt = CHECKPOINT_DIR / DEDUP_CKPT_FILE
@@ -991,11 +1171,32 @@ def run_extraction(csv_path: str, schema_path: str):
         "openai_use_batch": bool(LLM_PROVIDER == "openai" and OPENAI_USE_BATCH),
         "openai_prompt_cache_key": OPENAI_PROMPT_CACHE_KEY if LLM_PROVIDER == "openai" else "",
         "output_format": "sparse",
+        "using_tagged_features": use_tags,
     }
+
+    # ── Cost estimation ────────────────────────────────────────────────────────
+    if remaining:
+        n_api_calls_est = (len(remaining) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
+        sys_prompt_tokens = len(system_prompt.split()) * 1.5
+        avg_cap_tokens = 80 if use_tags else 200
+        est_input = int(n_api_calls_est * (sys_prompt_tokens + LLM_BATCH_SIZE * avg_cap_tokens))
+        est_output = int(n_api_calls_est * 300)
+        est = _estimate_cost(MODEL_NAME, est_input, est_output)
+        print(f"\n  Cost estimate ({MODEL_NAME}):")
+        print(f"    Est. input tokens:  {est['input_tokens']:>12,}")
+        print(f"    Est. output tokens: {est['output_tokens']:>12,}")
+        print(f"    Sync API cost:      ${est['total_cost_usd']:.4f}")
+        print(f"    Batch API cost:     ${est['batch_api_cost_usd']:.4f}")
+        if use_tags:
+            print(f"    (using tagged features — ~60-80% fewer input tokens vs raw captions)")
+        print()
+
+        if ESTIMATE_ONLY:
+            print("  ESTIMATE_ONLY=1 — skipping actual extraction. Exiting.")
+            return
 
     # ── Run extraction on remaining unique captions ───────────────────────────
     if remaining:
-        n_api_calls_est = (len(remaining) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
         print(f"Processing {len(remaining):,} unique captions in ~{n_api_calls_est:,} API calls...")
         print(f"  Provider: {LLM_PROVIDER} | Model: {MODEL_NAME}\n")
 
@@ -1004,13 +1205,16 @@ def run_extraction(csv_path: str, schema_path: str):
             merged.update(results)
             _save_dedup_checkpoint(merged, all_feature_names, dedup_ckpt)
 
+        _tags_arg = caption_to_tags if use_tags else None
         if LLM_PROVIDER == "openai" and OPENAI_USE_BATCH:
             new_results = _run_dedup_openai_batch(
-                remaining, all_feature_names, system_prompt, global_stats
+                remaining, all_feature_names, system_prompt, global_stats,
+                caption_to_tags=_tags_arg,
             )
         else:
             new_results = _run_dedup_sync(
-                remaining, all_feature_names, system_prompt, global_stats, _ckpt_saver
+                remaining, all_feature_names, system_prompt, global_stats, _ckpt_saver,
+                caption_to_tags=_tags_arg,
             )
 
         caption_features.update(new_results)

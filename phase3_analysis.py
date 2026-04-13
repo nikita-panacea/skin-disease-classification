@@ -45,6 +45,36 @@ EDA_DIR.mkdir(exist_ok=True)
 # Target column for MI / chi-square / classwise OR (label_name = merged class; disease_label = fine-grained)
 LABEL_COL = os.getenv("LABEL_COL", "label_name")
 
+
+def load_schema_category_map(schema_path: str = SCHEMA_PATH) -> dict[str, str]:
+    """
+    Load feature schema and return {feature_full_name: category} mapping.
+    Feature names are constructed as {category}_{value}.
+    Falls back to prefix-based heuristic if schema file is missing.
+    """
+    if not Path(schema_path).exists():
+        return {}
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+    mapping: dict[str, str] = {}
+    for entry in schema.get("feature_categories", []):
+        if not isinstance(entry, dict):
+            continue
+        cat = str(entry.get("category", "other"))
+        for val in entry.get("features", []):
+            v = str(val).strip()
+            if v:
+                mapping[f"{cat}_{v}"] = cat
+    return mapping
+
+
+def get_feature_category(feature_name: str, schema_map: dict[str, str]) -> str:
+    """Get the category for a feature, using schema map with prefix fallback."""
+    if schema_map and feature_name in schema_map:
+        return schema_map[feature_name]
+    parts = feature_name.split("_", 1)
+    return parts[0] if parts else "other"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ANALYSIS 1: Feature Coverage in Derm-1M
 # ──────────────────────────────────────────────────────────────────────────────
@@ -381,8 +411,11 @@ def generate_questionnaire_for_cluster(
 # DETAILED EDA FUNCTIONS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def plot_feature_distribution(coverage_df: pd.DataFrame, top_n: int = 50):
+def plot_feature_distribution(
+    coverage_df: pd.DataFrame, top_n: int = 50, schema_map: dict[str, str] | None = None
+):
     """Plot distribution of feature informativeness across all features."""
+    _smap = schema_map or load_schema_category_map()
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
     # 1. Top N most informative features
@@ -420,23 +453,9 @@ def plot_feature_distribution(coverage_df: pd.DataFrame, top_n: int = 50):
     ax3.set_title("Present vs Unknown by Feature")
     plt.colorbar(ax3.collections[0], ax=ax3, label="Informativeness")
     
-    # 4. Feature category breakdown (if category info available)
+    # 4. Feature category breakdown using schema
     ax4 = axes[1, 1]
-    # Extract category from feature name
-    categories = []
-    for feat in coverage_df["feature"]:
-        if feat.startswith("symptom_"):
-            categories.append("symptoms")
-        elif feat.startswith("location_"):
-            categories.append("location")
-        elif feat.startswith("texture_") or feat.startswith("color_"):
-            categories.append("morphology")
-        elif feat.startswith("trigger_"):
-            categories.append("triggers")
-        elif feat.startswith("treatment_"):
-            categories.append("treatments")
-        else:
-            categories.append("other")
+    categories = [get_feature_category(f, _smap) for f in coverage_df["feature"]]
     
     coverage_df_copy = coverage_df.copy()
     coverage_df_copy["category"] = categories
@@ -631,6 +650,120 @@ def plot_derm_vs_scin_comparison(cmp_df: pd.DataFrame):
     plt.close()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ADDITIONAL ANALYSIS FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def detect_feature_redundancy(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    phi_threshold: float = 0.8,
+) -> pd.DataFrame:
+    """
+    Identify highly correlated feature pairs (phi > threshold) that may be redundant.
+    Returns DataFrame of redundant pairs sorted by correlation strength.
+    """
+    from scipy.stats import pearsonr
+
+    pairs = []
+    for i, f1 in enumerate(feature_cols):
+        for j, f2 in enumerate(feature_cols):
+            if j <= i:
+                continue
+            mask = (df[f1] != 2) & (df[f2] != 2)
+            if mask.sum() < 50:
+                continue
+            x = (df.loc[mask, f1] == 1).astype(int).values
+            y = (df.loc[mask, f2] == 1).astype(int).values
+            if x.std() == 0 or y.std() == 0:
+                continue
+            r, _ = pearsonr(x, y)
+            if abs(r) >= phi_threshold:
+                pairs.append({
+                    "feature_1": f1,
+                    "feature_2": f2,
+                    "phi_coefficient": round(float(r), 4),
+                    "n_informed": int(mask.sum()),
+                })
+    return pd.DataFrame(pairs).sort_values("phi_coefficient", ascending=False, key=abs)
+
+
+def generate_scin_coverage_report(
+    feature_cols: list[str],
+    coverage_df: pd.DataFrame,
+    schema_map: dict[str, str],
+) -> pd.DataFrame:
+    """
+    For each feature in the schema, report: category, SCIN equivalent exists,
+    SCIN column name, informativeness in Derm-1M.
+    """
+    scin_canonical_set = set(SCIN_TO_CANONICAL.values())
+    scin_reverse = {v: k for k, v in SCIN_TO_CANONICAL.items()}
+
+    rows = []
+    for feat in feature_cols:
+        cat = get_feature_category(feat, schema_map)
+        has_scin = feat in scin_canonical_set
+        scin_col = scin_reverse.get(feat, "")
+        cov_row = coverage_df[coverage_df["feature"] == feat]
+        info = float(cov_row["informativeness"].iloc[0]) if len(cov_row) > 0 else 0.0
+        pct_present = float(cov_row["pct_present"].iloc[0]) if len(cov_row) > 0 else 0.0
+
+        rows.append({
+            "feature": feat,
+            "category": cat,
+            "has_scin_equivalent": has_scin,
+            "scin_column": scin_col,
+            "derm1m_informativeness": round(info, 2),
+            "derm1m_pct_present": round(pct_present, 2),
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["has_scin_equivalent", "derm1m_informativeness"],
+        ascending=[True, False],
+    )
+
+
+def generate_confusion_cluster_questionnaires(
+    classwise_importance: dict[str, pd.DataFrame],
+    confusion_pairs_csv: str | None = None,
+) -> dict[str, list[dict]]:
+    """
+    Generate questionnaires for disease clusters derived from confusion pairs.
+    If confusion_pairs_csv is available, use it; otherwise use default pairs.
+    """
+    default_clusters = {
+        "eczema_dermatitis_psoriasis": ["eczema", "dermatitis", "psoriasis"],
+        "skin_cancer": ["melanoma", "basal cell carcinoma", "squamous cell carcinoma"],
+        "viral_skin": ["herpes simplex virus", "herpes zoster (shingles)", "warts"],
+        "acne_folliculitis": ["acne", "folliculitis (inflamed hair follicles)"],
+    }
+
+    if confusion_pairs_csv and Path(confusion_pairs_csv).is_file():
+        try:
+            pairs_df = pd.read_csv(confusion_pairs_csv)
+            if "true_label" in pairs_df.columns and "confused_with" in pairs_df.columns:
+                cluster_members: dict[str, set[str]] = {}
+                for _, row in pairs_df.iterrows():
+                    a, b = str(row["true_label"]).strip(), str(row["confused_with"]).strip()
+                    key = a
+                    if key not in cluster_members:
+                        cluster_members[key] = {a}
+                    cluster_members[key].add(b)
+                for key, members in cluster_members.items():
+                    safe_key = key.replace(" ", "_").replace("/", "_")[:40]
+                    default_clusters[safe_key] = sorted(members)
+        except Exception:
+            pass
+
+    all_questionnaires: dict[str, list[dict]] = {}
+    for cluster_name, cluster_diseases in default_clusters.items():
+        q = generate_questionnaire_for_cluster(cluster_diseases, classwise_importance, top_n=10)
+        if q:
+            all_questionnaires[cluster_name] = q
+    return all_questionnaires
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -651,14 +784,23 @@ if __name__ == "__main__":
             f"Use label_name or disease_label, or add column."
         )
 
+    # Load schema-based category mapping
+    schema_map = load_schema_category_map(SCHEMA_PATH)
+    if schema_map:
+        print(f"  Loaded schema: {len(schema_map)} feature→category mappings")
+    else:
+        print(f"  WARNING: Schema not found at {SCHEMA_PATH}, using prefix-based category inference")
+
     # Meta columns to exclude from feature analysis
-    META_COLS = {"image", "label_name", "disease_label", "age_numeric",
-                 "age_group", "duration_bucket", "diagnosis_confidence",
-                 "lesion_count"}
+    META_COLS = {"image", "image_path", "label", "label_name", "disease_label",
+                 "age_numeric", "age_group", "duration_bucket",
+                 "diagnosis_confidence", "lesion_count",
+                 "truncated_caption", "caption", "text_caption",
+                 "extracted_features"}
     feature_cols = [
         c for c in derm_df.columns
         if c not in META_COLS
-        and derm_df[c].isin([0, 1, 2]).mean() > 0.8  # binary/ternary cols
+        and derm_df[c].isin([0, 1, 2]).mean() > 0.8
     ]
     print(f"  Total features to analyze: {len(feature_cols)}\n")
 
@@ -714,23 +856,41 @@ if __name__ == "__main__":
     )
     print(f"  Saved {len(cw_importance)} class-wise CSVs + classwise_importance_all.csv\n")
 
-    # 5. Example questionnaire for a confusion cluster
-    print("5. Generating example questionnaire for confusion cluster...")
-    example_cluster = [
-        "eczema", "dermatitis", "psoriasis",
-    ]
-    questionnaire = generate_questionnaire_for_cluster(
-        example_cluster, cw_importance
+    # 5. Questionnaires for all confusion clusters
+    print("5. Generating questionnaires for confusion clusters...")
+    confusion_csv = os.getenv("CONFUSION_PAIRS_CSV", "").strip() or None
+    all_questionnaires = generate_confusion_cluster_questionnaires(
+        cw_importance, confusion_pairs_csv=confusion_csv
     )
-    q_path = OUTPUT_DIR / "questionnaire_eczema_cluster.json"
-    with open(q_path, "w") as f:
-        json.dump(
-            {"cluster": example_cluster, "questions": questionnaire},
-            f, indent=2,
-        )
-    print(f"Example questionnaire for cluster {example_cluster}:")
-    for item in questionnaire:
-        print(f"  [{item['discriminatory_score']:.3f}] {item['question']}")
+    q_all_path = OUTPUT_DIR / "questionnaires_all_clusters.json"
+    with open(q_all_path, "w") as f:
+        json.dump(all_questionnaires, f, indent=2)
+    print(f"  Generated questionnaires for {len(all_questionnaires)} clusters")
+    for cluster_name, q_items in all_questionnaires.items():
+        print(f"  [{cluster_name}]: {len(q_items)} questions")
+        for item in q_items[:3]:
+            print(f"    [{item['discriminatory_score']:.3f}] {item['question']}")
+    print()
+
+    # 5b. Feature redundancy detection
+    print("5b. Detecting redundant feature pairs (phi >= 0.8)...")
+    redundancy_df = detect_feature_redundancy(derm_df, feature_cols, phi_threshold=0.8)
+    redundancy_df.to_csv(OUTPUT_DIR / "feature_redundancy.csv", index=False)
+    print(f"  Found {len(redundancy_df)} highly correlated feature pairs")
+    if len(redundancy_df) > 0:
+        for _, row in redundancy_df.head(5).iterrows():
+            print(f"    {row['feature_1']} <-> {row['feature_2']}  phi={row['phi_coefficient']:.3f}")
+    print()
+
+    # 5c. SCIN feature coverage report
+    print("5c. Generating SCIN feature coverage report...")
+    scin_coverage_report = generate_scin_coverage_report(
+        feature_cols, coverage, schema_map
+    )
+    scin_coverage_report.to_csv(OUTPUT_DIR / "scin_feature_coverage_report.csv", index=False)
+    n_with_scin = scin_coverage_report["has_scin_equivalent"].sum()
+    n_without = len(scin_coverage_report) - n_with_scin
+    print(f"  {n_with_scin} features have SCIN equivalents, {n_without} do not")
     print()
 
     # 6. Features only in Derm-1M (not available in SCIN)
@@ -763,7 +923,7 @@ if __name__ == "__main__":
 
     # 7. Feature distribution analysis
     print("7. Generating feature distribution analysis...")
-    plot_feature_distribution(coverage, top_n=50)
+    plot_feature_distribution(coverage, top_n=50, schema_map=schema_map)
     print()
 
     # 8. Disease-wise feature heatmap

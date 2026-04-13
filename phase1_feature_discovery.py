@@ -102,13 +102,33 @@ DISCOVERY_DEDUPE_CAPTIONS = os.getenv("DISCOVERY_DEDUPE_CAPTIONS", "1").strip().
     "no",
     "off",
 )
-OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "").lower() in ("1", "true", "yes")
+OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "1").lower() in ("1", "true", "yes")
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
 OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase1_discovery_v1").strip()
 OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY = os.getenv(
     "OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY", "phase1_consolidation_v1"
 ).strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
+ESTIMATE_ONLY = os.getenv("ESTIMATE_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+_EXTENDED_CACHE_MODELS = frozenset({
+    "gpt-4.1", "gpt-5", "gpt-5-codex", "gpt-5.1", "gpt-5.1-codex",
+    "gpt-5.1-codex-mini", "gpt-5.1-codex-max", "gpt-5.1-chat-latest",
+    "gpt-5.2", "gpt-5.4",
+})
+
+
+def _warn_cache_retention_if_unsupported(model_name: str) -> None:
+    """Warn if prompt_cache_retention=24h is set on a model that only supports in-memory."""
+    if OPENAI_PROMPT_CACHE_RETENTION != "24h":
+        return
+    if model_name not in _EXTENDED_CACHE_MODELS:
+        print(
+            f"  WARNING: OPENAI_PROMPT_CACHE_RETENTION=24h is set but model {model_name!r} "
+            "does not support extended retention (only gpt-4.1+ and gpt-5+ do). "
+            "Falling back to in-memory caching (5-10 min active, max 1hr). "
+            "Set OPENAI_MODEL_NAME to gpt-4.1 or newer for 24h retention."
+        )
 
 
 def _safe_int_env(key: str, default: int, *, vmin: int | None = None, vmax: int | None = None) -> int:
@@ -193,6 +213,7 @@ elif LLM_PROVIDER == "openai":
 
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
     DISCOVERY_MODEL = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    _warn_cache_retention_if_unsupported(DISCOVERY_MODEL)
     model = None
 elif LLM_PROVIDER == "qwen":
     from openai import OpenAI as QwenClient
@@ -1409,17 +1430,19 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, set[str]]:
 CONSOLIDATION_SYSTEM_PROMPT = """You deduplicate and standardize feature values for a dermatology classifier schema.
 
 You receive a JSON object mapping subcategory keys to lists of feature values.
-These were collected across many disease labels and contain synonyms, near-duplicates, and variant spellings.
+These were collected from two sources: Derm-1M captions (majority) and SCIN questionnaire fields.
+They contain synonyms, near-duplicates, and variant spellings that must be consolidated.
 
 Your task:
 1. MERGE obvious synonyms within each subcategory (e.g. "itch" + "pruritus" → "itching"; "erythematous" + "red" → "red")
+   This includes merging SCIN-sourced values with Derm-1M equivalents when they refer to the same concept.
 2. Use one form of terminology/scale to group similar values for a subcategory, eg. for demographics_age, use "child", "adolescent", "adult", "elderly", etc. or age groups like "0-10", "11-20", "21-30", etc., but not both or mix and match.
-Similary eg. for skin tone either use "fair", "medium", "olive", "dark", "deeply_pigmented", etc. or Fitzpatrick skin type like "fst1", "fst2", "fst3", "fst4", "fst5", "fst6", but not both or mix and match.
+   Similarly eg. for skin tone either use "fair", "medium", "olive", "dark", "deeply_pigmented", etc. or Fitzpatrick skin type like "fst1", "fst2", "fst3", "fst4", "fst5", "fst6", but not both or mix and match.
 3. STANDARDIZE all values to snake_case
-3. REMOVE junk/vague entries (e.g. "other", "unknown", "various")
-4. DO NOT merge clinically distinct concepts (e.g. keep "papule" and "plaque" separate)
-5. DO NOT move values between subcategories
-6. DO NOT add new subcategories or values not present in the input
+4. REMOVE junk/vague entries (e.g. "other", "unknown", "various")
+5. DO NOT merge clinically distinct concepts (e.g. keep "papule" and "plaque" separate)
+6. DO NOT move values between subcategories
+7. DO NOT add new subcategories or values not present in the input
 
 Return ONLY valid JSON — no markdown fences, no prose — same format as input:
 {"demographics_age":["child","adolescent","adult","elderly"],"morphology_color":["red","brown","hyperpigmented"],...}
@@ -1547,15 +1570,39 @@ SCIN_TO_SUBCATEGORY: dict[str, tuple[str, str]] = {
 }
 
 
-def add_scin_alignment(
+def inject_scin_into_raw_features(
+    all_features: dict[str, set[str]],
+) -> int:
+    """
+    Inject SCIN feature values into raw discovery features BEFORE consolidation,
+    so the LLM can merge synonyms between Derm-1M and SCIN during consolidation.
+    Returns count of SCIN values injected.
+    """
+    injected = 0
+    for scin_col, canonical in SCIN_SCHEMA_FEATURES.items():
+        mapping = SCIN_TO_SUBCATEGORY.get(canonical)
+        if not mapping:
+            continue
+        subcat, value = mapping
+        if subcat not in all_features:
+            all_features[subcat] = set()
+        if value not in all_features[subcat]:
+            all_features[subcat].add(value)
+            injected += 1
+    return injected
+
+
+def verify_scin_post_consolidation(
     consolidated: dict[str, list[str]],
 ) -> tuple[dict[str, list[str]], dict[str, list[str]], int]:
     """
-    Ensure SCIN features are present in the schema.
-    Returns (updated_schema, scin_map {subcategory: [scin_comparable_values]}, count_added).
+    After consolidation, verify SCIN features are still present (the LLM may have
+    merged some into Derm-1M equivalents). Re-add any that were lost, and build
+    the scin_map tracking which features have SCIN equivalents.
+    Returns (updated_schema, scin_map {subcategory: [scin_comparable_values]}, count_re_added).
     """
     scin_map: dict[str, list[str]] = defaultdict(list)
-    added = 0
+    re_added = 0
 
     for scin_col, canonical in SCIN_SCHEMA_FEATURES.items():
         mapping = SCIN_TO_SUBCATEGORY.get(canonical)
@@ -1566,14 +1613,247 @@ def add_scin_alignment(
             consolidated[subcat] = []
         if value not in consolidated[subcat]:
             consolidated[subcat].append(value)
-            added += 1
+            re_added += 1
         scin_map[subcat].append(value)
 
     n_scin = sum(len(v) for v in scin_map.values())
-    print(f"  Aligned {n_scin} SCIN features across {len(scin_map)} subcategories")
-    if added:
-        print(f"  Added {added} missing SCIN feature values to schema")
+    print(f"  Verified {n_scin} SCIN features across {len(scin_map)} subcategories")
+    if re_added:
+        print(f"  Re-added {re_added} SCIN feature values lost during consolidation")
+    else:
+        print(f"  All SCIN features survived consolidation (no re-adds needed)")
     return consolidated, dict(scin_map), n_scin
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 5: Per-Caption Feature Tagging (reduces Phase 2 input tokens)
+# ──────────────────────────────────────────────────────────────────────────────
+
+TAGGING_BATCH_SIZE = _safe_int_env("TAGGING_BATCH_SIZE", 30, vmin=1)
+TAGGING_CKPT_FILE = "tagging_checkpoint.json"
+TAGGED_CAPTIONS_CSV = "caption_features_tagged.csv"
+OPENAI_TAGGING_PROMPT_CACHE_KEY = os.getenv(
+    "OPENAI_TAGGING_PROMPT_CACHE_KEY", "phase1_tagging_v1"
+).strip()
+
+
+def build_tagging_system_prompt(consolidated: dict[str, list[str]]) -> str:
+    """
+    Short system prompt for per-caption feature tagging.
+    Lists all valid feature names so the LLM can match captions to the schema.
+    """
+    feature_lines = []
+    for subcat in sorted(consolidated.keys()):
+        names = [f"{subcat}_{v}" for v in sorted(consolidated[subcat])]
+        feature_lines.append(f"  {subcat}: {', '.join(names)}")
+    schema_str = "\n".join(feature_lines)
+
+    return f"""You are a clinical NLP specialist for dermatology. Given skin disease captions,
+list ONLY the features from the schema that are explicitly mentioned or clearly described in each caption.
+
+FEATURE SCHEMA (use exact feature names):
+{schema_str}
+
+OUTPUT: A JSON array of arrays — one inner array per input caption.
+Each inner array contains the feature names (strings) that are PRESENT in that caption.
+Omit features that are absent or not mentioned.
+
+Example for 2 captions:
+[["morphology_color_red", "body_location_face"], ["symptoms_dermatological_itching"]]
+
+RULES:
+- Use EXACT feature names from the schema above
+- Include ONLY features explicitly mentioned or clearly described
+- Do NOT infer features not stated in the caption
+- No preamble, no markdown fences — ONLY the JSON array
+"""
+
+
+def build_tagging_user_prompt(captions: list[str]) -> str:
+    """User message for tagging — numbered captions."""
+    return "\n\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
+
+
+def _openai_tagging_chat_body(system_prompt: str, user_prompt: str) -> dict:
+    """Chat body for tagging: static schema system first, variable captions last."""
+    body: dict = {
+        "model": DISCOVERY_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 4096,
+        "stream": False,
+    }
+    if OPENAI_JSON_RESPONSE:
+        body["response_format"] = {"type": "json_object"}
+    _openai_apply_prompt_caching(body, OPENAI_TAGGING_PROMPT_CACHE_KEY)
+    return body
+
+
+def parse_tagging_response(text: str, n_captions: int) -> list[list[str]]:
+    """Parse tagging LLM response into list of feature-name lists."""
+    parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+    if isinstance(parsed, dict) and len(parsed) == 1:
+        val = next(iter(parsed.values()))
+        if isinstance(val, list):
+            parsed = val
+    if not isinstance(parsed, list):
+        return [[] for _ in range(n_captions)]
+    result: list[list[str]] = []
+    for item in parsed:
+        if isinstance(item, list):
+            result.append([str(v).strip() for v in item if isinstance(v, str) and v.strip()])
+        else:
+            result.append([])
+    while len(result) < n_captions:
+        result.append([])
+    return result[:n_captions]
+
+
+def tag_captions_batch_sync(
+    captions: list[str],
+    system_prompt: str,
+    retries: int = 3,
+) -> list[list[str]]:
+    """Tag a batch of captions via sync LLM call."""
+    user_prompt = build_tagging_user_prompt(captions)
+    for attempt in range(retries):
+        try:
+            text = call_llm(
+                user_prompt,
+                system_prompt,
+                retries=1,
+                openai_prompt_cache_key=OPENAI_TAGGING_PROMPT_CACHE_KEY,
+            )
+            result = parse_tagging_response(text, len(captions))
+            if any(len(r) > 0 for r in result):
+                return result
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"    Tagging error (attempt {attempt + 1}): {str(e)[:120]}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return [[] for _ in captions]
+
+
+def _save_tagging_checkpoint(
+    caption_tags: dict[str, list[str]], ckpt_path: Path
+) -> None:
+    with open(ckpt_path, "w", encoding="utf-8") as f:
+        json.dump(caption_tags, f, ensure_ascii=False)
+
+
+def _load_tagging_checkpoint(ckpt_path: Path) -> dict[str, list[str]]:
+    with open(ckpt_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run_per_caption_tagging(
+    csv_path: str,
+    caption_col: str,
+    consolidated: dict[str, list[str]],
+) -> pd.DataFrame:
+    """
+    Process ALL captions through lightweight LLM tagging.
+    Returns DataFrame with original columns + 'extracted_features' column.
+    Supports checkpoint resume and Batch API.
+    """
+    print("Loading full CSV for tagging...")
+    df = pd.read_csv(csv_path)
+    df[caption_col] = df[caption_col].fillna("").astype(str)
+    df_valid = df[df[caption_col].str.strip().ne("")]
+
+    stripped = df[caption_col].str.strip()
+    unique_caps = list(stripped[stripped != ""].unique())
+    n_unique = len(unique_caps)
+    print(f"  {len(df):,} total rows, {n_unique:,} unique non-empty captions to tag")
+
+    system_prompt = build_tagging_system_prompt(consolidated)
+
+    ckpt_path = DISCOVERY_DIR / TAGGING_CKPT_FILE
+    caption_tags: dict[str, list[str]] = {}
+    if ckpt_path.exists():
+        try:
+            caption_tags = _load_tagging_checkpoint(ckpt_path)
+            print(f"  Loaded {len(caption_tags):,} tagged captions from checkpoint")
+        except Exception as e:
+            print(f"  WARNING: checkpoint load failed ({e}), re-tagging all")
+            caption_tags = {}
+
+    remaining = [c for c in unique_caps if c not in caption_tags]
+
+    if remaining:
+        print(f"  Tagging {len(remaining):,} remaining unique captions...")
+
+        if LLM_PROVIDER == "openai" and OPENAI_USE_BATCH:
+            jobs: list[dict] = []
+            job_batches: dict[str, list[str]] = {}
+            for bi, batch_start in enumerate(range(0, len(remaining), TAGGING_BATCH_SIZE)):
+                batch = remaining[batch_start : batch_start + TAGGING_BATCH_SIZE]
+                cid = f"tag_{bi}"
+                user_prompt = build_tagging_user_prompt(batch)
+                jobs.append({
+                    "custom_id": cid,
+                    "body": _openai_tagging_chat_body(system_prompt, user_prompt),
+                })
+                job_batches[cid] = batch
+
+            mapping, _acc = _run_openai_discovery_batch(jobs)
+
+            for cid, batch in job_batches.items():
+                text = mapping.get(cid) or ""
+                tags = parse_tagging_response(text, len(batch))
+                if not any(len(t) > 0 for t in tags):
+                    tags = tag_captions_batch_sync(batch, system_prompt)
+                for cap, tag_list in zip(batch, tags):
+                    caption_tags[cap] = tag_list
+        else:
+            n_batches = (len(remaining) + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
+            batch_count = 0
+            for batch_start in tqdm(
+                range(0, len(remaining), TAGGING_BATCH_SIZE),
+                desc="Tagging captions",
+                total=n_batches,
+            ):
+                batch = remaining[batch_start : batch_start + TAGGING_BATCH_SIZE]
+                tags = tag_captions_batch_sync(batch, system_prompt)
+                for cap, tag_list in zip(batch, tags):
+                    caption_tags[cap] = tag_list
+
+                batch_count += 1
+                if batch_count % 50 == 0:
+                    _save_tagging_checkpoint(caption_tags, ckpt_path)
+
+                if LLM_PROVIDER == "openai":
+                    time.sleep(0.5)
+                elif LLM_PROVIDER == "qwen":
+                    time.sleep(0.1)
+                else:
+                    time.sleep(1)
+
+        _save_tagging_checkpoint(caption_tags, ckpt_path)
+        print(f"  Tagging complete: {len(caption_tags):,} unique captions tagged")
+    else:
+        print(f"  All {n_unique:,} unique captions already tagged (checkpoint)")
+
+    feature_col_values = []
+    for cap in stripped:
+        if cap and cap in caption_tags:
+            feature_col_values.append(json.dumps(caption_tags[cap], ensure_ascii=False))
+        else:
+            feature_col_values.append("[]")
+    df["extracted_features"] = feature_col_values
+
+    out_path = DISCOVERY_DIR / TAGGED_CAPTIONS_CSV
+    df.to_csv(out_path, index=False)
+    n_tagged = sum(1 for v in feature_col_values if v != "[]")
+    print(f"  Saved tagged captions to {out_path}")
+    print(f"  {n_tagged:,} rows with extracted features, "
+          f"{len(df) - n_tagged:,} rows with empty features")
+    return df
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1623,6 +1903,34 @@ if __name__ == "__main__":
     sample_df.to_csv(sample_path, index=False)
     print(f"  Saved sample to {sample_path}\n")
 
+    if ESTIMATE_ONLY:
+        n_labels = int(sample_df["label_name"].nunique())
+        n_captions = len(sample_df)
+        est_discovery_calls = n_labels
+        est_input_tokens = est_discovery_calls * 3000
+        est_output_tokens = est_discovery_calls * 2000
+        print("  Cost Estimate (ESTIMATE_ONLY=1):")
+        print(f"    Labels to process:  {n_labels:,}")
+        print(f"    Captions sampled:   {n_captions:,}")
+        print(f"    Est. discovery API calls:  {est_discovery_calls:,}")
+        print(f"    Est. input tokens:  ~{est_input_tokens:,}")
+        print(f"    Est. output tokens: ~{est_output_tokens:,}")
+
+        full_df = pd.read_csv(CSV_PATH)
+        n_all = len(full_df)
+        n_unique_all = full_df[CAPTION_COLUMN].nunique()
+        tag_calls = (n_unique_all + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
+        tag_input = tag_calls * 1500
+        tag_output = tag_calls * 500
+        print(f"\n    Tagging step (all captions):")
+        print(f"      Total rows: {n_all:,}, unique captions: {n_unique_all:,}")
+        print(f"      Est. tagging API calls: {tag_calls:,}")
+        print(f"      Est. input tokens:  ~{tag_input:,}")
+        print(f"      Est. output tokens: ~{tag_output:,}")
+        print("\n  Exiting without running discovery. Set ESTIMATE_ONLY=0 to proceed.")
+        import sys
+        sys.exit(0)
+
     # ── Step 2: Per-label discovery ───────────────────────────────────────────
     print("STEP 2: Running per-label-name LLM feature discovery...\n")
     all_features = discover_all_features(sample_df)
@@ -1638,17 +1946,19 @@ if __name__ == "__main__":
         json.dump(raw_serializable, f, indent=2)
     print(f"  Saved raw features to {raw_path}\n")
 
-    # ── Step 3: Consolidation ─────────────────────────────────────────────────
-    print("STEP 3: Consolidating features via LLM...\n")
+    # ── Step 3: Inject SCIN features + Consolidation ──────────────────────────
+    print("STEP 3: Injecting SCIN features and consolidating via LLM...\n")
+    n_scin_injected = inject_scin_into_raw_features(all_features)
+    print(f"  Injected {n_scin_injected} SCIN feature values into raw features before consolidation")
     consolidated = consolidate_schema(
         all_features,
         n_captions_sampled=len(sample_df),
         n_disease_classes=int(sample_df["label_name"].nunique()),
     )
 
-    # ── Step 4: SCIN alignment ────────────────────────────────────────────────
-    print("\nSTEP 4: Aligning with SCIN columns...\n")
-    consolidated, scin_map, n_scin_comparable = add_scin_alignment(consolidated)
+    # ── Step 4: SCIN post-consolidation verification ──────────────────────────
+    print("\nSTEP 4: Verifying SCIN features post-consolidation...\n")
+    consolidated, scin_map, n_scin_comparable = verify_scin_post_consolidation(consolidated)
 
     # ── Build final schema ────────────────────────────────────────────────────
     n_categories = len(consolidated)
@@ -1697,4 +2007,11 @@ if __name__ == "__main__":
         json.dump(schema, fp, indent=2)
 
     print(f"\n  Schema saved to {SCHEMA_OUT}")
-    print(f"  Next: run phase2_bulk_extraction.py")
+
+    # ── Step 5: Per-caption feature tagging ───────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STEP 5: Per-Caption Feature Tagging (for Phase 2 token reduction)...\n")
+    tagged_df = run_per_caption_tagging(CSV_PATH, CAPTION_COLUMN, consolidated)
+
+    print(f"\n  Next: run phase2_bulk_extraction.py")
+    print(f"  Phase 2 will auto-detect {DISCOVERY_DIR / TAGGED_CAPTIONS_CSV} for reduced input tokens")
