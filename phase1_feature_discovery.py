@@ -55,6 +55,9 @@ Env (optional):
   OPENAI_BATCH_POLL_SEC    — seconds between batch status polls (default 20)
   OPENAI_BATCH_MAX_REQUESTS — max lines per batch JSONL (default 50000, API cap 50k; larger jobs split into multiple batches)
   OPENAI_BATCH_MAX_FILE_BYTES — max UTF-8 bytes per batch JSONL (default ~195 MiB; API cap 200 MB per file)
+  OPENAI_BATCH_MAX_ENQUEUED_TOKENS — org-level enqueued token cap (default 1800000; gpt-4o-mini orgs often 2M).
+                             Batches are split so each chunk's estimated tokens stay under this limit;
+                             chunks run sequentially, each completing before the next is submitted.
   OPENAI_LOG_USAGE         — 1/true: print prompt/cached/output token stats when available
 
 Prompt caching (OpenAI): static system message first, variable user message last; caching applies from
@@ -77,6 +80,7 @@ from tqdm import tqdm
 
 from openai_batch_utils import (
     chunk_jobs_for_openai_batch,
+    estimate_job_enqueued_tokens,
     openai_batch_max_file_bytes,
     openai_batches_create_safe,
     write_openai_batch_jsonl,
@@ -196,6 +200,11 @@ OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
 OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
     "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
 )
+# Org-level enqueued token limit (input + max_tokens across all in-progress batches).
+# gpt-4o-mini default is 2M; we use 1.8M to leave headroom for concurrent usage.
+OPENAI_BATCH_MAX_ENQUEUED_TOKENS = _safe_int_env(
+    "OPENAI_BATCH_MAX_ENQUEUED_TOKENS", 1_800_000, vmin=100_000
+)
 OPENAI_CONSOLIDATION_MAX_TOKENS = _safe_int_env(
     "OPENAI_CONSOLIDATION_MAX_TOKENS", 16_384, vmin=4_096, vmax=65_536
 )
@@ -298,7 +307,8 @@ elif LLM_PROVIDER == "openai":
         )
         print(
             f"  Batch file limits: ≤{OPENAI_BATCH_MAX_REQUESTS:,} requests/file, "
-            f"≤{openai_batch_max_file_bytes() / (1024 * 1024):.0f} MiB UTF-8/file"
+            f"≤{openai_batch_max_file_bytes() / (1024 * 1024):.0f} MiB UTF-8/file, "
+            f"≤{OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,} enqueued tokens/chunk"
         )
     else:
         print(
@@ -713,9 +723,26 @@ def _run_openai_discovery_batch_chunk(
             "  NOTE: Batch status=expired — reading partial output_file (per Batch API expiration rules)."
         )
     elif batch_job.status != "completed":
+        errors = getattr(batch_job, "errors", None)
+        err_detail = ""
+        if errors:
+            err_data = getattr(errors, "data", None) or errors
+            if isinstance(err_data, list):
+                err_detail = "; ".join(
+                    str(getattr(e, "message", e)) for e in err_data[:5]
+                )
+            else:
+                err_detail = str(err_data)[:500]
+        hint = ""
+        if "enqueued token limit" in err_detail.lower() or "token limit" in err_detail.lower():
+            hint = (
+                f" Lower OPENAI_BATCH_MAX_ENQUEUED_TOKENS (currently {OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,}) "
+                "to split into smaller chunks."
+            )
         raise RuntimeError(
             f"OpenAI batch ended with status={batch_job.status!r}. "
             f"Inspect batch in dashboard; error_file_id may list per-request failures."
+            f"{' Errors: ' + err_detail if err_detail else ''}{hint}"
         )
     if not batch_job.output_file_id:
         raise RuntimeError(
@@ -733,15 +760,20 @@ def _run_openai_discovery_batch_chunk(
 def _run_openai_discovery_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
     """
     jobs: [{"custom_id": str, "body": dict}, ...]
-    Splits at OPENAI_BATCH_MAX_REQUESTS (API max 50k lines per file).
+    Splits by request count, file size, AND enqueued-token limit so each chunk
+    stays under the org's enqueued token quota for gpt-4o-mini.
+    Chunks run sequentially (each waits for completion before the next submits).
     """
     if not jobs:
         return {}, {"prompt": 0, "completion": 0, "cached": 0}
 
     max_r = OPENAI_BATCH_MAX_REQUESTS
     file_cap = openai_batch_max_file_bytes()
+    token_cap = OPENAI_BATCH_MAX_ENQUEUED_TOKENS
+    total_est_tokens = sum(estimate_job_enqueued_tokens(j) for j in jobs)
     chunks = chunk_jobs_for_openai_batch(
-        jobs, max_requests=max_r, max_file_bytes=file_cap
+        jobs, max_requests=max_r, max_file_bytes=file_cap,
+        max_enqueued_tokens=token_cap,
     )
     n_chunks = len(chunks)
     combined: dict[str, str] = {}
@@ -749,8 +781,10 @@ def _run_openai_discovery_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[
 
     if n_chunks > 1:
         tqdm.write(
-            f"  Splitting {len(jobs):,} requests into {n_chunks} batch file(s) "
-            f"(≤{max_r:,} lines each, ≤{file_cap / (1024 * 1024):.0f} MiB UTF-8 per file per Batch API)."
+            f"  Splitting {len(jobs):,} requests (~{total_est_tokens:,} est. tokens) into "
+            f"{n_chunks} batch chunk(s) "
+            f"(≤{max_r:,} lines, ≤{file_cap / (1024 * 1024):.0f} MiB, "
+            f"≤{token_cap:,} enqueued tokens per chunk)."
         )
 
     for ci, chunk in enumerate(chunks):
