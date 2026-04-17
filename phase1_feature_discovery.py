@@ -1578,9 +1578,9 @@ You receive a JSON object mapping subcategory keys to lists of raw feature value
 
 GUIDING PRINCIPLE
 Consolidate toward a small canonical vocabulary per subcategory. Merge everything that is the same clinical concept (synonyms, lexical variants, plural/singular, sub-region of a named region, compound descriptive phrases). Keep separate ONLY what is clinically distinct (e.g. papule ≠ plaque, nail/fingernail ≠ finger, toenail ≠ toe, toe ≠ foot, pruritus → itching but itching ≠ burning).
-NOTE: The output features (all subcategories) MUST be exhaustive and cover all possible values in the raw input.
+NOTE: The output features (all subcategories) MUST be exhaustive list and cover all possible values in the raw input. So do not drop unique values in the raw input.
 
-TARGET BUDGETS (approximate final count per subcategory — the TOTAL across all subcategories MUST be 250-300):
+TARGET BUDGETS (approximate final count per subcategory — the TOTAL across all subcategories MUST be ~300):
 - body_location:            ≤ 55
 - clinical_signs:           ≤ 50
 - demographics_age:         EXACTLY the 10 bins listed below (rule 3)
