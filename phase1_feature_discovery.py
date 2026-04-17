@@ -1577,7 +1577,8 @@ CONSOLIDATION_SYSTEM_PROMPT = """You deduplicate and standardize feature values 
 You receive a JSON object mapping subcategory keys to lists of raw feature values collected from ~73k dermatology image captions and the SCIN questionnaire. The raw lists are very noisy (plurals, lexical variants, rare micro-anatomy, specific ages, compound phrases). Your job: produce a COMPACT, CLEAN canonical vocabulary per subcategory that a downstream one-hot classifier can use.
 
 GUIDING PRINCIPLE
-Aggressively consolidate toward a small canonical vocabulary per subcategory. Merge everything that is the same clinical concept (synonyms, lexical variants, plural/singular, sub-region of a named region, compound descriptive phrases). Keep separate ONLY what is clinically distinct (e.g. papule ≠ plaque, nail/fingernail ≠ finger, toenail ≠ toe, toe ≠ foot, pruritus → itching but itching ≠ burning).
+Consolidate toward a small canonical vocabulary per subcategory. Merge everything that is the same clinical concept (synonyms, lexical variants, plural/singular, sub-region of a named region, compound descriptive phrases). Keep separate ONLY what is clinically distinct (e.g. papule ≠ plaque, nail/fingernail ≠ finger, toenail ≠ toe, toe ≠ foot, pruritus → itching but itching ≠ burning).
+NOTE: The output features (all subcategories) MUST be exhaustive and cover all possible values in the raw input.
 
 TARGET BUDGETS (approximate final count per subcategory — the TOTAL across all subcategories MUST be 250-300):
 - body_location:            ≤ 55
