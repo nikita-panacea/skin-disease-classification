@@ -58,6 +58,7 @@ Env (optional):
   OPENAI_BATCH_MAX_ENQUEUED_TOKENS — org-level enqueued token cap (default 1800000; gpt-4o-mini orgs often 2M).
                              Batches are split so each chunk's estimated tokens stay under this limit;
                              chunks run sequentially, each completing before the next is submitted.
+  OPENAI_BATCH_MAX_RETRIES — batch retry rounds for failed items (default 2; set 0 to skip batch retry)
   OPENAI_LOG_USAGE         — 1/true: print prompt/cached/output token stats when available
 
 Prompt caching (OpenAI): static system message first, variable user message last; caching applies from
@@ -652,15 +653,42 @@ def _openai_download_batch_file_text(file_id: str | None) -> str:
     return file_resp.text if hasattr(file_resp, "text") else file_resp.read().decode("utf-8")
 
 
+def _openai_parse_batch_error_file(error_file_id: str | None) -> tuple[set[str], dict[str, int]]:
+    """
+    Download and parse the batch error file. Returns:
+      - set of failed custom_ids
+      - dict of error_code -> count (for diagnostic logging)
+    """
+    raw = _openai_download_batch_file_text(error_file_id)
+    failed_ids: set[str] = set()
+    error_counts: dict[str, int] = {}
+    if not raw or not raw.strip():
+        return failed_ids, error_counts
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cid = obj.get("custom_id")
+        if cid:
+            failed_ids.add(cid)
+        err = obj.get("error") or {}
+        code = err.get("code", "unknown") if isinstance(err, dict) else "unknown"
+        error_counts[code] = error_counts.get(code, 0) + 1
+    return failed_ids, error_counts
+
+
 def _openai_log_batch_error_file_summary(error_file_id: str | None) -> None:
     """Batch API writes failed/expired per-request lines to error_file_id (separate from output)."""
-    raw = _openai_download_batch_file_text(error_file_id)
-    if not raw.strip():
+    failed_ids, error_counts = _openai_parse_batch_error_file(error_file_id)
+    if not failed_ids:
         return
-    n = sum(1 for line in raw.splitlines() if line.strip())
+    err_breakdown = ", ".join(f"{code}={cnt}" for code, cnt in sorted(error_counts.items()))
     tqdm.write(
-        f"  Batch error_file: {n} line(s). Those custom_ids have no successful output line; "
-        "pipeline uses sync fallback where needed."
+        f"  Batch error_file: {len(failed_ids)} failed request(s) [{err_breakdown}]."
     )
 
 
@@ -681,10 +709,11 @@ def _estimate_openai_discovery_cost_usd(acc: dict[str, int], *, batch_api: bool)
 
 def _run_openai_discovery_batch_chunk(
     jobs: list[dict], chunk_idx: int
-) -> tuple[dict[str, str], dict[str, int], str]:
+) -> tuple[dict[str, str], dict[str, int], str, set[str]]:
     """
-    One Batch API job (≤ OPENAI_BATCH_MAX_REQUESTS lines). Returns (mapping, usage_acc, batch_id).
-    Matches https://developers.openai.com/api/docs/guides/batch (jsonl → upload → create → poll → files.content).
+    One Batch API job (≤ OPENAI_BATCH_MAX_REQUESTS lines).
+    Returns (mapping, usage_acc, batch_id, failed_custom_ids).
+    Partial results are always collected when an output_file exists.
     """
     input_path = DISCOVERY_DIR / f"openai_batch_discovery_input_{chunk_idx}.jsonl"
     nbytes = write_openai_batch_jsonl(input_path, jobs)
@@ -717,12 +746,19 @@ def _run_openai_discovery_batch_chunk(
             f"    status={batch_job.status}  completed={rc.completed}/{rc.total}  failed={rc.failed}"
         )
 
-    # Allow partial results when window expired (completed requests still in output_file).
-    if batch_job.status == "expired" and batch_job.output_file_id:
-        tqdm.write(
-            "  NOTE: Batch status=expired — reading partial output_file (per Batch API expiration rules)."
+    has_output = batch_job.output_file_id is not None
+    rc = batch_job.request_counts
+
+    if batch_job.status in ("expired", "completed") and has_output:
+        if batch_job.status == "expired":
+            tqdm.write(
+                "  NOTE: Batch status=expired — reading partial output_file."
+            )
+    elif batch_job.status == "completed" and not has_output:
+        raise RuntimeError(
+            f"No output_file_id for batch status='completed' — nothing to parse."
         )
-    elif batch_job.status != "completed":
+    elif not has_output:
         errors = getattr(batch_job, "errors", None)
         err_detail = ""
         if errors:
@@ -740,13 +776,9 @@ def _run_openai_discovery_batch_chunk(
                 "to split into smaller chunks."
             )
         raise RuntimeError(
-            f"OpenAI batch ended with status={batch_job.status!r}. "
-            f"Inspect batch in dashboard; error_file_id may list per-request failures."
+            f"OpenAI batch ended with status={batch_job.status!r} and no output file. "
+            f"Inspect batch in dashboard."
             f"{' Errors: ' + err_detail if err_detail else ''}{hint}"
-        )
-    if not batch_job.output_file_id:
-        raise RuntimeError(
-            f"No output_file_id for batch status={batch_job.status!r} — nothing to parse."
         )
 
     raw_text = _openai_download_batch_file_text(batch_job.output_file_id)
@@ -754,7 +786,21 @@ def _run_openai_discovery_batch_chunk(
     _openai_log_batch_error_file_summary(err_id)
 
     mapping, acc = _openai_parse_batch_output_jsonl(raw_text)
-    return mapping, acc, batch_job.id
+
+    submitted_ids = {j["custom_id"] for j in jobs}
+    failed_ids = submitted_ids - set(mapping.keys())
+    if failed_ids:
+        _, error_counts = _openai_parse_batch_error_file(err_id)
+        err_breakdown = ", ".join(f"{c}={n}" for c, n in sorted(error_counts.items()))
+        tqdm.write(
+            f"  Chunk {chunk_idx}: {len(mapping)}/{len(jobs)} succeeded, "
+            f"{len(failed_ids)} failed [{err_breakdown or 'see error_file'}]."
+        )
+
+    return mapping, acc, batch_job.id, failed_ids
+
+
+OPENAI_BATCH_MAX_RETRIES = _safe_int_env("OPENAI_BATCH_MAX_RETRIES", 2, vmin=0, vmax=5)
 
 
 def _run_openai_discovery_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
@@ -763,6 +809,8 @@ def _run_openai_discovery_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[
     Splits by request count, file size, AND enqueued-token limit so each chunk
     stays under the org's enqueued token quota for gpt-4o-mini.
     Chunks run sequentially (each waits for completion before the next submits).
+    Failed items are automatically retried in new batch rounds (up to
+    OPENAI_BATCH_MAX_RETRIES rounds) before the caller falls back to sync.
     """
     if not jobs:
         return {}, {"prompt": 0, "completion": 0, "cached": 0}
@@ -770,31 +818,62 @@ def _run_openai_discovery_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[
     max_r = OPENAI_BATCH_MAX_REQUESTS
     file_cap = openai_batch_max_file_bytes()
     token_cap = OPENAI_BATCH_MAX_ENQUEUED_TOKENS
-    total_est_tokens = sum(estimate_job_enqueued_tokens(j) for j in jobs)
-    chunks = chunk_jobs_for_openai_batch(
-        jobs, max_requests=max_r, max_file_bytes=file_cap,
-        max_enqueued_tokens=token_cap,
-    )
-    n_chunks = len(chunks)
+
+    jobs_by_id = {j["custom_id"]: j for j in jobs}
     combined: dict[str, str] = {}
     acc_total = {"prompt": 0, "completion": 0, "cached": 0}
+    pending_jobs = list(jobs)
+    chunk_counter = 0
 
-    if n_chunks > 1:
-        tqdm.write(
-            f"  Splitting {len(jobs):,} requests (~{total_est_tokens:,} est. tokens) into "
-            f"{n_chunks} batch chunk(s) "
-            f"(≤{max_r:,} lines, ≤{file_cap / (1024 * 1024):.0f} MiB, "
-            f"≤{token_cap:,} enqueued tokens per chunk)."
+    for round_num in range(1 + OPENAI_BATCH_MAX_RETRIES):
+        if not pending_jobs:
+            break
+
+        total_est_tokens = sum(estimate_job_enqueued_tokens(j) for j in pending_jobs)
+        chunks = chunk_jobs_for_openai_batch(
+            pending_jobs, max_requests=max_r, max_file_bytes=file_cap,
+            max_enqueued_tokens=token_cap,
         )
+        n_chunks = len(chunks)
 
-    for ci, chunk in enumerate(chunks):
-        m, a, _bid = _run_openai_discovery_batch_chunk(chunk, ci)
-        combined.update(m)
-        for k in acc_total:
-            acc_total[k] += a[k]
+        round_label = f"round {round_num}" if round_num > 0 else "initial"
+        if n_chunks > 1 or round_num > 0:
+            tqdm.write(
+                f"  Batch {round_label}: {len(pending_jobs):,} requests "
+                f"(~{total_est_tokens:,} est. tokens) → "
+                f"{n_chunks} chunk(s) "
+                f"(≤{max_r:,} lines, ≤{file_cap / (1024 * 1024):.0f} MiB, "
+                f"≤{token_cap:,} enqueued tokens/chunk)."
+            )
+
+        all_failed_ids: set[str] = set()
+        for ci, chunk in enumerate(chunks):
+            m, a, _bid, failed = _run_openai_discovery_batch_chunk(chunk, chunk_counter)
+            chunk_counter += 1
+            combined.update(m)
+            for k in acc_total:
+                acc_total[k] += a[k]
+            all_failed_ids.update(failed)
+
+        if not all_failed_ids:
+            break
+
+        pending_jobs = [jobs_by_id[cid] for cid in all_failed_ids if cid in jobs_by_id]
+        if round_num < OPENAI_BATCH_MAX_RETRIES and pending_jobs:
+            wait = 30 * (round_num + 1)
+            tqdm.write(
+                f"  {len(pending_jobs)} job(s) failed — retrying in {wait}s "
+                f"(batch retry {round_num + 1}/{OPENAI_BATCH_MAX_RETRIES})…"
+            )
+            time.sleep(wait)
+        elif pending_jobs:
+            tqdm.write(
+                f"  {len(pending_jobs)} job(s) still failed after "
+                f"{OPENAI_BATCH_MAX_RETRIES} batch retries — sync fallback will handle them."
+            )
 
     tqdm.write(
-        f"  Batch token totals (all chunks): prompt={acc_total['prompt']:,}, "
+        f"  Batch token totals (all rounds): prompt={acc_total['prompt']:,}, "
         f"cached_prompt={acc_total['cached']:,}, completion={acc_total['completion']:,}"
     )
     est = _estimate_openai_discovery_cost_usd(acc_total, batch_api=True)
@@ -1502,16 +1581,17 @@ They contain synonyms, near-duplicates, and variant spellings that must be conso
 Your task:
 1. MERGE obvious synonyms within each subcategory (e.g. "itch" + "pruritus" → "itching"; "erythematous" + "red" → "red")
    This includes merging SCIN-sourced values with Derm-1M equivalents when they refer to the same concept.
-2. Use one form of terminology/scale to group similar values for a subcategory, eg. for demographics_age, use "child", "adolescent", "adult", "elderly", etc. or age groups like "0-10", "11-20", "21-30", etc., but not both or mix and match.
+2. KEEP all distinct/unique values for a subcategory, do not merge them into a single value (e.g. keep body parts arm, finger, nails separate, and do not merge them into "hand")
+3. Use one form of terminology/scale to group similar values for a subcategory, eg. for demographics_age, use "child", "adolescent", "adult", "elderly", etc. or age groups like "0-10", "11-20", "21-30", etc., but not both or mix and match.
    Similarly eg. for skin tone either use "fair", "medium", "olive", "dark", "deeply_pigmented", etc. or Fitzpatrick skin type like "fst1", "fst2", "fst3", "fst4", "fst5", "fst6", but not both or mix and match.
 3. STANDARDIZE all values to snake_case
-4. REMOVE junk/vague entries (e.g. "other", "unknown", "various")
+4. REMOVE junk/vague entries within a subcategory (e.g. "other", "unknown", "various") if present, but keep them if they are clinically distinct concepts.
 5. DO NOT merge clinically distinct concepts (e.g. keep "papule" and "plaque" separate)
 6. DO NOT move values between subcategories
 7. DO NOT add new subcategories or values not present in the input
 
-Return ONLY valid JSON — no markdown fences, no prose — same format as input:
-{"demographics_age":["child","adolescent","adult","elderly"],"morphology_color":["red","brown","hyperpigmented"],...}
+Return ONLY valid JSON — no markdown fences, no prose — same format as input, as in the example below:
+{"demographics_age":["0-5","5-10","10-20","20-30", ...],"morphology_color":["red","brown","hyperpigmented"],...}
 """
 
 
@@ -1631,8 +1711,22 @@ SCIN_TO_SUBCATEGORY: dict[str, tuple[str, str]] = {
     "symptom_mouth_sores":             ("symptoms_systemic", "mouth_sores"),
     "symptom_shortness_of_breath":     ("symptoms_systemic", "shortness_of_breath"),
     "symptom_no_relevant_symptoms":    ("symptoms_systemic", "no_relevant_symptoms"),
-    "duration":                        ("duration", "duration"),
-    "related_category":                ("other", "related_category"),
+    "duration_1_day":                  ("duration", "days"),
+    "duration_less_than_1_week":       ("duration", "days"),
+    "duration_1-4_weeks":              ("duration", "weeks"),
+    "duration_1-3_months":             ("duration", "months"),
+    "duration_3-12_months":            ("duration", "months"),
+    "duration_over_1_year":            ("duration", "1_year"),
+    "duration_over_5_years":           ("duration", "years"),
+    "duration_since_childhood":        ("duration", "since_childhood"),
+    "related_category_acne":           ("other", "acne_related"),
+    "related_category_growth_or_mole": ("other", "growth_or_mole_related"),
+    "related_category_hair_loss":      ("other", "hair_loss_related"),
+    "related_category_hair_issue":     ("other", "hair_issue_related"),
+    "related_category_nail_issue":     ("other", "nail_issue_related"),
+    "related_category_pigment_birthmark":  ("other", "pigment_birthmark_related"),
+    "related_category_rash":           ("other", "rash_related"),
+    "related_category_normal":         ("other", "normal"),
 }
 
 
@@ -1689,237 +1783,6 @@ def verify_scin_post_consolidation(
     else:
         print(f"  All SCIN features survived consolidation (no re-adds needed)")
     return consolidated, dict(scin_map), n_scin
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 5: Per-Caption Feature Tagging (reduces Phase 2 input tokens)
-# ──────────────────────────────────────────────────────────────────────────────
-
-TAGGING_BATCH_SIZE = _safe_int_env("TAGGING_BATCH_SIZE", 30, vmin=1)
-TAGGING_CKPT_FILE = "tagging_checkpoint.json"
-TAGGED_CAPTIONS_CSV = "caption_features_tagged.csv"
-OPENAI_TAGGING_PROMPT_CACHE_KEY = os.getenv(
-    "OPENAI_TAGGING_PROMPT_CACHE_KEY", "phase1_tagging_v1"
-).strip()
-
-
-def build_tagging_system_prompt(consolidated: dict[str, list[str]]) -> str:
-    """
-    Short system prompt for per-caption feature tagging.
-    Lists all valid feature names so the LLM can match captions to the schema.
-    """
-    feature_lines = []
-    for subcat in sorted(consolidated.keys()):
-        names = [f"{subcat}_{v}" for v in sorted(consolidated[subcat])]
-        feature_lines.append(f"  {subcat}: {', '.join(names)}")
-    schema_str = "\n".join(feature_lines)
-
-    return f"""You are a clinical NLP specialist for dermatology. Given skin disease captions,
-list ONLY the features from the schema that are explicitly mentioned or clearly described in each caption.
-
-FEATURE SCHEMA (use exact feature names):
-{schema_str}
-
-OUTPUT: A JSON array of arrays — one inner array per input caption.
-Each inner array contains the feature names (strings) that are PRESENT in that caption.
-Omit features that are absent or not mentioned.
-
-Example for 2 captions:
-[["morphology_color_red", "body_location_face"], ["symptoms_dermatological_itching"]]
-
-RULES:
-- Use EXACT feature names from the schema above
-- Include ONLY features explicitly mentioned or clearly described
-- Do NOT infer features not stated in the caption
-- No preamble, no markdown fences — ONLY the JSON array
-"""
-
-
-def build_tagging_user_prompt(captions: list[str]) -> str:
-    """User message for tagging — numbered captions."""
-    return "\n\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
-
-
-def _openai_tagging_chat_body(system_prompt: str, user_prompt: str) -> dict:
-    """Chat body for tagging: static schema system first, variable captions last."""
-    body: dict = {
-        "model": DISCOVERY_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 4096,
-        "stream": False,
-    }
-    if OPENAI_JSON_RESPONSE:
-        body["response_format"] = {"type": "json_object"}
-    _openai_apply_prompt_caching(body, OPENAI_TAGGING_PROMPT_CACHE_KEY)
-    return body
-
-
-def parse_tagging_response(text: str, n_captions: int) -> list[list[str]]:
-    """Parse tagging LLM response into list of feature-name lists."""
-    parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-    if isinstance(parsed, dict) and len(parsed) == 1:
-        val = next(iter(parsed.values()))
-        if isinstance(val, list):
-            parsed = val
-    if not isinstance(parsed, list):
-        return [[] for _ in range(n_captions)]
-    result: list[list[str]] = []
-    for item in parsed:
-        if isinstance(item, list):
-            result.append([str(v).strip() for v in item if isinstance(v, str) and v.strip()])
-        else:
-            result.append([])
-    while len(result) < n_captions:
-        result.append([])
-    return result[:n_captions]
-
-
-def tag_captions_batch_sync(
-    captions: list[str],
-    system_prompt: str,
-    retries: int = 3,
-) -> list[list[str]]:
-    """Tag a batch of captions via sync LLM call."""
-    user_prompt = build_tagging_user_prompt(captions)
-    for attempt in range(retries):
-        try:
-            text = call_llm(
-                user_prompt,
-                system_prompt,
-                retries=1,
-                openai_prompt_cache_key=OPENAI_TAGGING_PROMPT_CACHE_KEY,
-            )
-            result = parse_tagging_response(text, len(captions))
-            if any(len(r) > 0 for r in result):
-                return result
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-        except Exception as e:
-            print(f"    Tagging error (attempt {attempt + 1}): {str(e)[:120]}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-    return [[] for _ in captions]
-
-
-def _save_tagging_checkpoint(
-    caption_tags: dict[str, list[str]], ckpt_path: Path
-) -> None:
-    with open(ckpt_path, "w", encoding="utf-8") as f:
-        json.dump(caption_tags, f, ensure_ascii=False)
-
-
-def _load_tagging_checkpoint(ckpt_path: Path) -> dict[str, list[str]]:
-    with open(ckpt_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def run_per_caption_tagging(
-    csv_path: str,
-    caption_col: str,
-    consolidated: dict[str, list[str]],
-) -> pd.DataFrame:
-    """
-    Process ALL captions through lightweight LLM tagging.
-    Returns DataFrame with original columns + 'extracted_features' column.
-    Supports checkpoint resume and Batch API.
-    """
-    print("Loading full CSV for tagging...")
-    df = pd.read_csv(csv_path)
-    df[caption_col] = df[caption_col].fillna("").astype(str)
-    df_valid = df[df[caption_col].str.strip().ne("")]
-
-    stripped = df[caption_col].str.strip()
-    unique_caps = list(stripped[stripped != ""].unique())
-    n_unique = len(unique_caps)
-    print(f"  {len(df):,} total rows, {n_unique:,} unique non-empty captions to tag")
-
-    system_prompt = build_tagging_system_prompt(consolidated)
-
-    ckpt_path = DISCOVERY_DIR / TAGGING_CKPT_FILE
-    caption_tags: dict[str, list[str]] = {}
-    if ckpt_path.exists():
-        try:
-            caption_tags = _load_tagging_checkpoint(ckpt_path)
-            print(f"  Loaded {len(caption_tags):,} tagged captions from checkpoint")
-        except Exception as e:
-            print(f"  WARNING: checkpoint load failed ({e}), re-tagging all")
-            caption_tags = {}
-
-    remaining = [c for c in unique_caps if c not in caption_tags]
-
-    if remaining:
-        print(f"  Tagging {len(remaining):,} remaining unique captions...")
-
-        if LLM_PROVIDER == "openai" and OPENAI_USE_BATCH:
-            jobs: list[dict] = []
-            job_batches: dict[str, list[str]] = {}
-            for bi, batch_start in enumerate(range(0, len(remaining), TAGGING_BATCH_SIZE)):
-                batch = remaining[batch_start : batch_start + TAGGING_BATCH_SIZE]
-                cid = f"tag_{bi}"
-                user_prompt = build_tagging_user_prompt(batch)
-                jobs.append({
-                    "custom_id": cid,
-                    "body": _openai_tagging_chat_body(system_prompt, user_prompt),
-                })
-                job_batches[cid] = batch
-
-            mapping, _acc = _run_openai_discovery_batch(jobs)
-
-            for cid, batch in job_batches.items():
-                text = mapping.get(cid) or ""
-                tags = parse_tagging_response(text, len(batch))
-                if not any(len(t) > 0 for t in tags):
-                    tags = tag_captions_batch_sync(batch, system_prompt)
-                for cap, tag_list in zip(batch, tags):
-                    caption_tags[cap] = tag_list
-        else:
-            n_batches = (len(remaining) + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
-            batch_count = 0
-            for batch_start in tqdm(
-                range(0, len(remaining), TAGGING_BATCH_SIZE),
-                desc="Tagging captions",
-                total=n_batches,
-            ):
-                batch = remaining[batch_start : batch_start + TAGGING_BATCH_SIZE]
-                tags = tag_captions_batch_sync(batch, system_prompt)
-                for cap, tag_list in zip(batch, tags):
-                    caption_tags[cap] = tag_list
-
-                batch_count += 1
-                if batch_count % 50 == 0:
-                    _save_tagging_checkpoint(caption_tags, ckpt_path)
-
-                if LLM_PROVIDER == "openai":
-                    time.sleep(0.5)
-                elif LLM_PROVIDER == "qwen":
-                    time.sleep(0.1)
-                else:
-                    time.sleep(1)
-
-        _save_tagging_checkpoint(caption_tags, ckpt_path)
-        print(f"  Tagging complete: {len(caption_tags):,} unique captions tagged")
-    else:
-        print(f"  All {n_unique:,} unique captions already tagged (checkpoint)")
-
-    feature_col_values = []
-    for cap in stripped:
-        if cap and cap in caption_tags:
-            feature_col_values.append(json.dumps(caption_tags[cap], ensure_ascii=False))
-        else:
-            feature_col_values.append("[]")
-    df["extracted_features"] = feature_col_values
-
-    out_path = DISCOVERY_DIR / TAGGED_CAPTIONS_CSV
-    df.to_csv(out_path, index=False)
-    n_tagged = sum(1 for v in feature_col_values if v != "[]")
-    print(f"  Saved tagged captions to {out_path}")
-    print(f"  {n_tagged:,} rows with extracted features, "
-          f"{len(df) - n_tagged:,} rows with empty features")
-    return df
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2004,19 +1867,8 @@ if __name__ == "__main__":
         consol_input_tokens = 2000
         consol_output_tokens = OPENAI_CONSOLIDATION_MAX_TOKENS
 
-        # Tagging: all unique captions from full CSV
-        full_df = pd.read_csv(CSV_PATH)
-        n_all = len(full_df)
-        n_unique_all = full_df[CAPTION_COLUMN].nunique()
-        tag_api_calls = (n_unique_all + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
-        tag_sys_tokens = 800
-        tag_input_per_call = tag_sys_tokens + (TAGGING_BATCH_SIZE * avg_caption_tokens) + 30
-        tag_output_per_call = TAGGING_BATCH_SIZE * 15
-        tag_input_tokens = tag_api_calls * tag_input_per_call
-        tag_output_tokens = tag_api_calls * tag_output_per_call
-
-        total_input = disc_input_tokens + consol_input_tokens + tag_input_tokens
-        total_output = disc_output_tokens + consol_output_tokens + tag_output_tokens
+        total_input = disc_input_tokens + consol_input_tokens
+        total_output = disc_output_tokens + consol_output_tokens
 
         model_name = DISCOVERY_MODEL if LLM_PROVIDER == "openai" else "gpt-4o-mini"
         est = _estimate_cost(model_name, total_input, total_output, cached_fraction=0.8)
@@ -2040,17 +1892,8 @@ if __name__ == "__main__":
         print(f"    Est. input tokens:     ~{consol_input_tokens:,}")
         print(f"    Est. output tokens:    ~{consol_output_tokens:,}")
         print()
-        print(f"    ── Tagging Step (all captions) ──")
-        print(f"    Total rows:            {n_all:,}")
-        print(f"    Unique captions:       {n_unique_all:,}")
-        print(f"    Batch size:            {TAGGING_BATCH_SIZE}")
-        print(f"    Est. API calls:        {tag_api_calls:,}")
-        print(f"    Est. input tokens:     ~{tag_input_tokens:,} "
-              f"(~{tag_sys_tokens:,} system prompt cached per call)")
-        print(f"    Est. output tokens:    ~{tag_output_tokens:,}")
-        print()
         print(f"    ── Total ──")
-        print(f"    Total API calls:       {discovery_api_calls + 1 + tag_api_calls:,}")
+        print(f"    Total API calls:       {discovery_api_calls + 1:,}")
         print(f"    Total input tokens:    ~{total_input:,}")
         print(f"      Cached (~80%):       ~{est['cached_input_tokens']:,} "
               f"@ ${_MODEL_COSTS.get(model_name, _MODEL_COSTS['gpt-4o-mini'])['cached_input']}/1M")
@@ -2071,19 +1914,32 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ── Step 2: Per-label discovery ───────────────────────────────────────────
-    print("STEP 2: Running per-label-name LLM feature discovery...\n")
-    all_features = discover_all_features(sample_df)
-    total_raw = sum(len(v) for v in all_features.values())
-    print(
-        f"\n  Total raw values discovered: {total_raw} "
-        f"across {len(all_features)} subcategories\n"
-    )
-
     raw_path = DISCOVERY_DIR / "raw_features_all.json"
-    raw_serializable = {k: sorted(v) for k, v in all_features.items()}
-    with open(raw_path, "w", encoding="utf-8") as f:
-        json.dump(raw_serializable, f, indent=2)
-    print(f"  Saved raw features to {raw_path}\n")
+    if raw_path.exists():
+        print(f"STEP 2: Loading raw discovery features from {raw_path} (skipping LLM)...\n")
+        with open(raw_path, "r", encoding="utf-8") as f:
+            raw_loaded = json.load(f)
+        all_features: dict[str, set[str]] = {
+            k: set(v) for k, v in raw_loaded.items() if isinstance(v, list)
+        }
+        total_raw = sum(len(v) for v in all_features.values())
+        print(
+            f"  Loaded {total_raw} raw values across {len(all_features)} subcategories "
+            f"(delete {raw_path.name} to rerun discovery)\n"
+        )
+    else:
+        print("STEP 2: Running per-label-name LLM feature discovery...\n")
+        all_features = discover_all_features(sample_df)
+        total_raw = sum(len(v) for v in all_features.values())
+        print(
+            f"\n  Total raw values discovered: {total_raw} "
+            f"across {len(all_features)} subcategories\n"
+        )
+
+        raw_serializable = {k: sorted(v) for k, v in all_features.items()}
+        with open(raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw_serializable, f, indent=2)
+        print(f"  Saved raw features to {raw_path}\n")
 
     # ── Step 3: Inject SCIN features + Consolidation ──────────────────────────
     print("STEP 3: Injecting SCIN features and consolidating via LLM...\n")
@@ -2146,11 +2002,4 @@ if __name__ == "__main__":
         json.dump(schema, fp, indent=2)
 
     print(f"\n  Schema saved to {SCHEMA_OUT}")
-
-    # ── Step 5: Per-caption feature tagging ───────────────────────────────────
-    print("\n" + "=" * 60)
-    print("STEP 5: Per-Caption Feature Tagging (for Phase 2 token reduction)...\n")
-    tagged_df = run_per_caption_tagging(CSV_PATH, CAPTION_COLUMN, consolidated)
-
     print(f"\n  Next: run phase2_bulk_extraction.py")
-    print(f"  Phase 2 will auto-detect {DISCOVERY_DIR / TAGGED_CAPTIONS_CSV} for reduced input tokens")

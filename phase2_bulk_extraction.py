@@ -31,6 +31,9 @@ Env (optional):
   OPENAI_BATCH_POLL_SEC — batch status poll interval (default 20)
   OPENAI_BATCH_MAX_REQUESTS — max lines per batch file (default 50000, API cap)
   OPENAI_BATCH_MAX_FILE_BYTES — max UTF-8 bytes per batch JSONL (default ~195 MiB; API cap 200 MB)
+  OPENAI_BATCH_MAX_ENQUEUED_TOKENS — org-level enqueued token cap (default 1800000; gpt-4o-mini orgs often 2M).
+                             Batches are split so each chunk's estimated tokens stay under this limit.
+  OPENAI_BATCH_MAX_RETRIES — batch retry rounds for failed items (default 2; 0 to skip batch retry)
   OPENAI_LOG_USAGE — 1/true: print token usage when available
 
 Cost optimizations applied:
@@ -54,6 +57,7 @@ from collections import defaultdict
 
 from openai_batch_utils import (
     chunk_jobs_for_openai_batch,
+    estimate_job_enqueued_tokens,
     openai_batch_max_file_bytes,
     openai_batches_create_safe,
     write_openai_batch_jsonl,
@@ -115,6 +119,10 @@ OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
 OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
     "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
 )
+OPENAI_BATCH_MAX_ENQUEUED_TOKENS = _safe_int_env(
+    "OPENAI_BATCH_MAX_ENQUEUED_TOKENS", 1_800_000, vmin=100_000
+)
+OPENAI_BATCH_MAX_RETRIES = _safe_int_env("OPENAI_BATCH_MAX_RETRIES", 2, vmin=0, vmax=5)
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 
 # Qwen local server config
@@ -161,7 +169,8 @@ elif LLM_PROVIDER == "openai":
         )
         print(
             f"  Batch file limits: ≤{OPENAI_BATCH_MAX_REQUESTS:,} requests/file, "
-            f"≤{openai_batch_max_file_bytes() / (1024 * 1024):.0f} MiB UTF-8/file"
+            f"≤{openai_batch_max_file_bytes() / (1024 * 1024):.0f} MiB UTF-8/file, "
+            f"≤{OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,} enqueued tokens/chunk"
         )
     else:
         print("  OpenAI extraction: synchronous Chat Completions (OPENAI_USE_BATCH=1 for Batch API)")
@@ -321,13 +330,41 @@ def _openai_download_batch_file_text(file_id: str | None) -> str:
     return file_resp.text if hasattr(file_resp, "text") else file_resp.read().decode("utf-8")
 
 
-def _openai_log_batch_error_file_summary(error_file_id: str | None) -> None:
+def _openai_parse_batch_error_file(error_file_id: str | None) -> tuple[set[str], dict[str, int]]:
+    """
+    Download and parse the batch error file. Returns:
+      - set of failed custom_ids
+      - dict of error_code -> count (for diagnostic logging)
+    """
     raw = _openai_download_batch_file_text(error_file_id)
-    if not raw.strip():
+    failed_ids: set[str] = set()
+    error_counts: dict[str, int] = {}
+    if not raw or not raw.strip():
+        return failed_ids, error_counts
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cid = obj.get("custom_id")
+        if cid:
+            failed_ids.add(cid)
+        err = obj.get("error") or {}
+        code = err.get("code", "unknown") if isinstance(err, dict) else "unknown"
+        error_counts[code] = error_counts.get(code, 0) + 1
+    return failed_ids, error_counts
+
+
+def _openai_log_batch_error_file_summary(error_file_id: str | None) -> None:
+    failed_ids, error_counts = _openai_parse_batch_error_file(error_file_id)
+    if not failed_ids:
         return
-    n = sum(1 for line in raw.splitlines() if line.strip())
+    err_breakdown = ", ".join(f"{code}={cnt}" for code, cnt in sorted(error_counts.items()))
     tqdm.write(
-        f"  Batch error_file: {n} line(s). Missing output lines fall back to sync extraction."
+        f"  Batch error_file: {len(failed_ids)} failed request(s) [{err_breakdown}]."
     )
 
 
@@ -340,7 +377,11 @@ def _estimate_openai_phase2_batch_cost_usd(acc: dict[str, int]) -> float:
 
 def _run_openai_extraction_batch_chunk(
     jobs: list[dict], chunk_idx: int
-) -> tuple[dict[str, str], dict[str, int], str]:
+) -> tuple[dict[str, str], dict[str, int], str, set[str]]:
+    """
+    One Batch API chunk. Returns (mapping, usage_acc, batch_id, failed_custom_ids).
+    Partial results are always collected when an output_file exists.
+    """
     input_path = CHECKPOINT_DIR / f"openai_batch_extraction_input_{chunk_idx}.jsonl"
     input_path.parent.mkdir(parents=True, exist_ok=True)
     nbytes = write_openai_batch_jsonl(input_path, jobs)
@@ -373,51 +414,127 @@ def _run_openai_extraction_batch_chunk(
             f"    status={batch_job.status}  completed={rc.completed}/{rc.total}  failed={rc.failed}"
         )
 
-    if batch_job.status == "expired" and batch_job.output_file_id:
-        tqdm.write(
-            "  NOTE: Batch status=expired — reading partial output_file (per Batch API rules)."
-        )
-    elif batch_job.status != "completed":
+    has_output = batch_job.output_file_id is not None
+
+    if batch_job.status in ("expired", "completed") and has_output:
+        if batch_job.status == "expired":
+            tqdm.write(
+                "  NOTE: Batch status=expired — reading partial output_file."
+            )
+    elif batch_job.status == "completed" and not has_output:
         raise RuntimeError(
-            f"OpenAI batch ended with status={batch_job.status!r}. "
-            "Check dashboard and error_file_id for per-request failures."
+            f"No output_file_id for batch status='completed' — nothing to parse."
         )
-    if not batch_job.output_file_id:
-        raise RuntimeError(f"No output_file_id for batch status={batch_job.status!r}.")
+    elif not has_output:
+        errors = getattr(batch_job, "errors", None)
+        err_detail = ""
+        if errors:
+            err_data = getattr(errors, "data", None) or errors
+            if isinstance(err_data, list):
+                err_detail = "; ".join(
+                    str(getattr(e, "message", e)) for e in err_data[:5]
+                )
+            else:
+                err_detail = str(err_data)[:500]
+        hint = ""
+        if "enqueued token limit" in err_detail.lower() or "token limit" in err_detail.lower():
+            hint = (
+                f" Lower OPENAI_BATCH_MAX_ENQUEUED_TOKENS "
+                f"(currently {OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,}) to split into smaller chunks."
+            )
+        raise RuntimeError(
+            f"OpenAI batch ended with status={batch_job.status!r} and no output file. "
+            f"Inspect batch in dashboard."
+            f"{' Errors: ' + err_detail if err_detail else ''}{hint}"
+        )
 
     raw_text = _openai_download_batch_file_text(batch_job.output_file_id)
-    _openai_log_batch_error_file_summary(getattr(batch_job, "error_file_id", None))
+    err_id = getattr(batch_job, "error_file_id", None)
+    _openai_log_batch_error_file_summary(err_id)
+
     mapping, acc = _openai_parse_batch_output_jsonl(raw_text)
-    return mapping, acc, batch_job.id
+
+    submitted_ids = {j["custom_id"] for j in jobs}
+    failed_ids = submitted_ids - set(mapping.keys())
+    if failed_ids:
+        _, error_counts = _openai_parse_batch_error_file(err_id)
+        err_breakdown = ", ".join(f"{c}={n}" for c, n in sorted(error_counts.items()))
+        tqdm.write(
+            f"  Chunk {chunk_idx}: {len(mapping)}/{len(jobs)} succeeded, "
+            f"{len(failed_ids)} failed [{err_breakdown or 'see error_file'}]."
+        )
+
+    return mapping, acc, batch_job.id, failed_ids
 
 
 def _run_openai_extraction_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
+    """
+    Splits by request count, file size, AND enqueued-token limit.
+    Chunks run sequentially. Failed items are retried in new batch rounds
+    (up to OPENAI_BATCH_MAX_RETRIES) before the caller falls back to sync.
+    """
     if not jobs:
         return {}, {"prompt": 0, "completion": 0, "cached": 0}
 
     max_r = OPENAI_BATCH_MAX_REQUESTS
     file_cap = openai_batch_max_file_bytes()
-    chunks = chunk_jobs_for_openai_batch(
-        jobs, max_requests=max_r, max_file_bytes=file_cap
-    )
-    n_chunks = len(chunks)
+    token_cap = OPENAI_BATCH_MAX_ENQUEUED_TOKENS
+
+    jobs_by_id = {j["custom_id"]: j for j in jobs}
     combined: dict[str, str] = {}
     acc_total = {"prompt": 0, "completion": 0, "cached": 0}
+    pending_jobs = list(jobs)
+    chunk_counter = 0
 
-    if n_chunks > 1:
-        tqdm.write(
-            f"  Splitting {len(jobs):,} requests into {n_chunks} batch file(s) "
-            f"(≤{max_r:,} lines each, ≤{file_cap / (1024 * 1024):.0f} MiB UTF-8 per file)."
+    for round_num in range(1 + OPENAI_BATCH_MAX_RETRIES):
+        if not pending_jobs:
+            break
+
+        total_est_tokens = sum(estimate_job_enqueued_tokens(j) for j in pending_jobs)
+        chunks = chunk_jobs_for_openai_batch(
+            pending_jobs, max_requests=max_r, max_file_bytes=file_cap,
+            max_enqueued_tokens=token_cap,
         )
+        n_chunks = len(chunks)
 
-    for ci, chunk in enumerate(chunks):
-        m, a, _bid = _run_openai_extraction_batch_chunk(chunk, ci)
-        combined.update(m)
-        for k in acc_total:
-            acc_total[k] += a[k]
+        round_label = f"round {round_num}" if round_num > 0 else "initial"
+        if n_chunks > 1 or round_num > 0:
+            tqdm.write(
+                f"  Batch {round_label}: {len(pending_jobs):,} requests "
+                f"(~{total_est_tokens:,} est. tokens) → "
+                f"{n_chunks} chunk(s) "
+                f"(≤{max_r:,} lines, ≤{file_cap / (1024 * 1024):.0f} MiB, "
+                f"≤{token_cap:,} enqueued tokens/chunk)."
+            )
+
+        all_failed_ids: set[str] = set()
+        for ci, chunk in enumerate(chunks):
+            m, a, _bid, failed = _run_openai_extraction_batch_chunk(chunk, chunk_counter)
+            chunk_counter += 1
+            combined.update(m)
+            for k in acc_total:
+                acc_total[k] += a[k]
+            all_failed_ids.update(failed)
+
+        if not all_failed_ids:
+            break
+
+        pending_jobs = [jobs_by_id[cid] for cid in all_failed_ids if cid in jobs_by_id]
+        if round_num < OPENAI_BATCH_MAX_RETRIES and pending_jobs:
+            wait = 30 * (round_num + 1)
+            tqdm.write(
+                f"  {len(pending_jobs)} job(s) failed — retrying in {wait}s "
+                f"(batch retry {round_num + 1}/{OPENAI_BATCH_MAX_RETRIES})…"
+            )
+            time.sleep(wait)
+        elif pending_jobs:
+            tqdm.write(
+                f"  {len(pending_jobs)} job(s) still failed after "
+                f"{OPENAI_BATCH_MAX_RETRIES} batch retries — sync fallback will handle them."
+            )
 
     tqdm.write(
-        f"  Batch token totals (all chunks): prompt={acc_total['prompt']:,}, "
+        f"  Batch token totals (all rounds): prompt={acc_total['prompt']:,}, "
         f"cached_prompt={acc_total['cached']:,}, completion={acc_total['completion']:,}"
     )
     est = _estimate_openai_phase2_batch_cost_usd(acc_total)
