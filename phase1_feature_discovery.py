@@ -1578,20 +1578,41 @@ You receive a JSON object mapping subcategory keys to lists of feature values.
 These were collected from two sources: Derm-1M captions (majority) and SCIN questionnaire fields.
 They contain synonyms, near-duplicates, and variant spellings that must be consolidated.
 
-Your task:
-1. MERGE obvious synonyms within each subcategory (e.g. "itch" + "pruritus" → "itching"; "erythematous" + "red" → "red")
-   This includes merging SCIN-sourced values with Derm-1M equivalents when they refer to the same concept.
-2. KEEP all distinct/unique values for a subcategory, do not merge them into a single value (e.g. keep body parts arm, finger, nails separate, and do not merge them into "hand")
-3. Use one form of terminology/scale to group similar values for a subcategory, eg. for demographics_age, use "child", "adolescent", "adult", "elderly", etc. or age groups like "0-10", "11-20", "21-30", etc., but not both or mix and match.
-   Similarly eg. for skin tone either use "fair", "medium", "olive", "dark", "deeply_pigmented", etc. or Fitzpatrick skin type like "fst1", "fst2", "fst3", "fst4", "fst5", "fst6", but not both or mix and match.
-3. STANDARDIZE all values to snake_case
-4. REMOVE junk/vague entries within a subcategory (e.g. "other", "unknown", "various") if present, but keep them if they are clinically distinct concepts.
-5. DO NOT merge clinically distinct concepts (e.g. keep "papule" and "plaque" separate)
-6. DO NOT move values between subcategories
-7. DO NOT add new subcategories or values not present in the input
+GUIDING PRINCIPLE: Preserve every clinically distinguishing value. When in doubt, KEEP the value as a separate entry. Only collapse values that are true synonyms (same concept, different wording/spelling) or numeric points that must be binned. Never collapse a fine-grained anatomical site, morphology, symptom, color, or sign into a coarser umbrella term.
 
-Return ONLY valid JSON — no markdown fences, no prose — same format as input, as in the example below:
-{"demographics_age":["0-5","5-10","10-20","20-30", ...],"morphology_color":["red","brown","hyperpigmented"],...}
+RULES:
+
+1. MERGE only true synonyms / spelling variants within a subcategory.
+   - "itch" + "pruritus" + "pruritic" → "itching"
+   - "erythematous" + "erythema" → "red" (or keep "erythema" if it is the more specific clinical term used)
+   - "hyper_pigmented" + "hyperpigmentation" → "hyperpigmented"
+   - This includes merging SCIN-sourced values with Derm-1M equivalents when they refer to the exact same concept.
+
+2. KEEP every distinct/unique value separate. This is the default behaviour — do not collapse to broader categories.
+   - body_location: KEEP finger_nails, toe_nails, nail_bed, lips, upper_lip, lower_lip, ear, earlobe, nose, nostril, scalp, forehead, cheek, chin, eyelid, neck, nape, axilla, groin, elbow, knee, wrist, ankle, palm, sole, finger, toe, web_space, etc. as SEPARATE values. Do NOT merge them into "face", "hand", "foot", or "extremities".
+   - morphology_texture / morphology_color / secondary_changes / symptoms_*: KEEP every distinct descriptor (e.g. "papule", "plaque", "nodule", "vesicle", "pustule", "crust", "scale", "fissure", "erosion", "ulcer" are all separate concepts — never merge).
+
+3. BIN continuous numeric values into range labels (this is the only case where you reduce cardinality aggressively):
+   - demographics_age: Replace every specific age (e.g. "1_year_old", "10_year_old", "25", "42_yo", "infant_3_months") with age-bin labels:
+       "0-5", "5-10", "10-20", "20-30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-plus"
+     Use ONLY these bins. Drop exact-age values entirely in favor of the bin they fall into. If the raw values also include descriptive bands like "adult", "elderly", "newborn" that cannot be mapped to a numeric bin, you may keep at most one qualitative tag ("newborn") alongside the numeric bins, but prefer numeric bins whenever age is numeric.
+   - duration: Bin into labels like "hours", "days", "weeks", "months", "years", "chronic" (drop specific numeric durations like "3_days", "2_weeks", "5_years" → map to the appropriate bin).
+   - lesion_count: Use coarse bins "single", "few_2_to_5", "multiple_6_to_20", "many_20_plus", "numerous" rather than exact counts.
+
+4. Within a subcategory, pick ONE terminology/scale and map variants onto it — do not mix scales:
+   - demographics_skin_type: Either use descriptive tones ("fair", "medium", "olive", "brown", "dark", "deeply_pigmented") OR Fitzpatrick ("fst1", "fst2", "fst3", "fst4", "fst5", "fst6"), not both. Prefer Fitzpatrick if any fst values are present.
+   - severity: Use a single ordinal scale ("mild", "moderate", "severe", "very_severe") rather than mixing ordinal terms with percentages or descriptive phrases.
+
+5. STANDARDIZE all values to snake_case, lowercase, ASCII. Replace hyphens/spaces with underscores. For range bins keep the hyphen (e.g. "0-5", "20-30").
+
+6. REMOVE vacuous entries within a subcategory (e.g. "other", "unknown", "various", "not_specified", "n_a", "none_mentioned"). Keep them ONLY if they are a clinically meaningful distinct concept for that subcategory (rare).
+
+7. DO NOT merge clinically distinct concepts (e.g. "papule" vs "plaque", "macule" vs "patch", "vesicle" vs "bulla", "ulcer" vs "erosion", "scale" vs "crust" — all remain separate).
+
+8. DO NOT move values between subcategories. DO NOT add subcategories or values not present in the input (except when creating age/duration/count BINS from existing numeric values in rule 3).
+
+OUTPUT: ONLY valid JSON — no markdown fences, no prose — same top-level shape as input:
+{"demographics_age":["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"],"body_location":["scalp","forehead","cheek","nose","lips","ear","neck","chest","back","abdomen","groin","axilla","elbow","forearm","wrist","palm","finger","finger_nail","thigh","knee","shin","ankle","foot","sole","toe","toe_nail"],"morphology_color":["red","pink","brown","hyperpigmented","hypopigmented","depigmented","yellow","violaceous"], ...}
 """
 
 
