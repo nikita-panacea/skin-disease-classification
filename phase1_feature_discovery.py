@@ -1578,11 +1578,12 @@ You receive a JSON object mapping subcategory keys to lists of feature values.
 These were collected from two sources: Derm-1M captions (majority) and SCIN questionnaire fields.
 They contain synonyms, near-duplicates, and variant spellings that must be consolidated.
 
-GUIDING PRINCIPLE: Preserve every clinically distinguishing value. When in doubt, KEEP the value as a separate entry. Only collapse values that are true synonyms (same concept, different wording/spelling) or numeric points that must be binned. Never collapse a fine-grained anatomical site, morphology, symptom, color, or sign into a coarser umbrella term.
+GUIDING PRINCIPLE: Preserve every clinically distinguishing value. When in doubt, KEEP the value as a separate entry. Collapse values that are true synonyms (same concept, different wording/spelling, similar meaning/area represented) or numeric points that must be binned. 
+Do not collapse different anatomical sites, morphologies, symptoms, colors, or signs into a coarser umbrella term. Merge them into a single value if they are synonyms or the same concept represented in different ways.
 
 RULES:
 
-1. MERGE only true synonyms / spelling variants within a subcategory.
+1. MERGE true synonyms / spelling variants within a subcategory.
    - "itch" + "pruritus" + "pruritic" → "itching"
    - "erythematous" + "erythema" → "red" (or keep "erythema" if it is the more specific clinical term used)
    - "hyper_pigmented" + "hyperpigmentation" → "hyperpigmented"
@@ -1590,7 +1591,7 @@ RULES:
 
 2. KEEP every distinct/unique value separate. This is the default behaviour — do not collapse to broader categories.
    - COVERAGE CONTRACT: Every raw value in the input MUST be represented in your output, either as itself (normalized) or — only if rule 1 applies — mapped onto its canonical synonym which is present in the output. It is a BUG to silently drop a raw value.
-   - body_location: KEEP nail, fingernail, toenail, nail_bed, nail_plate, finger_nails, toe_nails, lips, upper_lip, lower_lip, ear, earlobe, nose, nostril, scalp, forehead, temple, cheek, chin, eyelid, eyebrow, neck, nape, axilla, groin, elbow, knee, wrist, ankle, palm, sole, finger, toe, web_space, mucosa, genital, etc. as SEPARATE values — AND ALSO keep coarser values like "face", "hand", "foot" if they appeared in the raw input (they represent captions that mention only the general region). Do NOT merge "nail" into "finger_nail", do NOT merge "cheek" into "face", do NOT merge "finger" into "hand".
+   - body_location: KEEP fingernail, toenail, lips, ear, nose, scalp, forehead, cheek, chin, eyelid, neck, axilla, groin, elbow, knee, wrist, ankle, palm, sole, finger, toe, web_space, mucosa, genital, etc. as SEPARATE values — AND ALSO keep coarser values like "face", "hand", "foot" if they appeared in the raw input (they represent captions that mention only the general region). Do NOT merge "finger_nail"/"nail" into "hand", do NOT merge "cheek" into "face", etc.
    - morphology_texture / morphology_color / secondary_changes / symptoms_*: KEEP every distinct descriptor (e.g. "papule", "plaque", "nodule", "vesicle", "pustule", "crust", "scale", "fissure", "erosion", "ulcer" are all separate concepts — never merge).
 
 3. BIN continuous numeric values into range labels (this is the only case where you reduce cardinality aggressively):
