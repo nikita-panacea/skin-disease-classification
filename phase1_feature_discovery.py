@@ -1577,17 +1577,17 @@ CONSOLIDATION_SYSTEM_PROMPT = """You deduplicate and standardize feature values 
 You receive a JSON object mapping subcategory keys to lists of raw feature values collected from ~73k dermatology image captions and the SCIN questionnaire. The raw lists are very noisy (plurals, lexical variants, rare micro-anatomy, specific ages, compound phrases). Your job: produce a COMPACT, CLEAN canonical vocabulary per subcategory that a downstream one-hot classifier can use.
 
 GUIDING PRINCIPLE
-Aggressively consolidate toward a small canonical vocabulary per subcategory. Merge everything that is the same clinical concept (synonyms, lexical variants, plural/singular, sub-region of a named region, compound descriptive phrases). Keep separate ONLY what is clinically distinct (e.g. papule ≠ plaque, nail ≠ finger, pruritus → itching but itching ≠ burning).
+Aggressively consolidate toward a small canonical vocabulary per subcategory. Merge everything that is the same clinical concept (synonyms, lexical variants, plural/singular, sub-region of a named region, compound descriptive phrases). Keep separate ONLY what is clinically distinct (e.g. papule ≠ plaque, nail/fingernail ≠ finger, toenail ≠ toe, toe ≠ foot, pruritus → itching but itching ≠ burning).
 
 TARGET BUDGETS (approximate final count per subcategory — the TOTAL across all subcategories MUST be 250-300):
-- body_location:            < 40
-- clinical_signs:           ≤ 15
+- body_location:            ≤ 55
+- clinical_signs:           ≤ 50
 - demographics_age:         EXACTLY the 10 bins listed below (rule 3)
 - demographics_ethnicity:   ≤ 10
 - demographics_sex:         EXACTLY ["male","female","other"]
 - demographics_skin_type:   EXACTLY ["fst1","fst2","fst3","fst4","fst5","fst6"] (prefer Fitzpatrick) OR ≤ 6 descriptive tones — not both
 - duration:                 EXACTLY ["hours","days","weeks","months","years","chronic"]
-- history:                  ≤ 15
+- history:                  ≤ 20
 - image_metadata:           ≤ 6
 - lesion_count:             EXACTLY ["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"]
 - morphology_color:         ≤ 12
@@ -1595,7 +1595,7 @@ TARGET BUDGETS (approximate final count per subcategory — the TOTAL across all
 - morphology_shape:         ≤ 12
 - morphology_texture:       ≤ 20
 - other:                    ≤ 20
-- secondary_changes:        ≤ 12
+- secondary_changes:        ≤ 20
 - severity:                 EXACTLY ["mild","moderate","severe","very_severe"]
 - symptoms_dermatological:  ≤ 20
 - symptoms_systemic:        ≤ 20
@@ -1615,7 +1615,7 @@ RULES
    - SCIN values merged with Derm-1M equivalents when they mean the same thing.
 
 2. KEEP separate only clinically distinct concepts:
-   - body_location: nail / fingernail / toenail / nail_bed ARE distinct from finger/toe/hand/foot. Lips, ear, nose, scalp, cheek, forehead, chin, eyelid are distinct from "face". Palm/sole distinct from hand/foot. Mucosa, genital, buttock, axilla, groin are their own sites.
+   - body_location: fingernail / toenail / nail ARE distinct from finger/toe/hand/foot. Lips, ear, nose, scalp, cheek, forehead, chin, eyelid are distinct from "face". Palm/sole distinct from hand/foot. Mucosa, genital, buttock, axilla, groin are their own sites. But merge values like "foot" and "foot_top_side" into "foot".
    - morphology: papule ≠ plaque ≠ nodule ≠ macule ≠ patch ≠ vesicle ≠ bulla ≠ pustule ≠ cyst ≠ tumor.
    - secondary_changes: crust ≠ scale ≠ erosion ≠ ulcer ≠ fissure ≠ atrophy ≠ lichenification.
 
