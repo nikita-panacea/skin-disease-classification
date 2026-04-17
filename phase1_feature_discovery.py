@@ -1615,7 +1615,8 @@ RULES
    - SCIN values merged with Derm-1M equivalents when they mean the same thing.
 
 2. KEEP separate only clinically distinct concepts:
-   - body_location: fingernail / toenail / nail ARE distinct from finger/toe/hand/foot. Lips, ear, nose, scalp, cheek, forehead, chin, eyelid are distinct from "face". Palm/sole distinct from hand/foot. Mucosa, genital, buttock, axilla, groin are their own sites. But merge values like "foot" and "foot_top_side" into "foot".
+   - body_location: fingernail / toenail / nail ARE distinct from finger/toe/hand/foot. Lips, ear, nose, scalp, cheek, forehead, chin, eyelid are distinct from "face". Palm/sole distinct from hand/foot. Mucosa, genital, buttock, axilla, groin are their own sites. 
+                    Merge values like "foot" and "foot_top_side" into "foot".
    - morphology: papule ≠ plaque ≠ nodule ≠ macule ≠ patch ≠ vesicle ≠ bulla ≠ pustule ≠ cyst ≠ tumor.
    - secondary_changes: crust ≠ scale ≠ erosion ≠ ulcer ≠ fissure ≠ atrophy ≠ lichenification.
 
