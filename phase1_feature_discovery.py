@@ -1589,7 +1589,8 @@ RULES:
    - This includes merging SCIN-sourced values with Derm-1M equivalents when they refer to the exact same concept.
 
 2. KEEP every distinct/unique value separate. This is the default behaviour — do not collapse to broader categories.
-   - body_location: KEEP finger_nails, toe_nails, nail_bed, lips, upper_lip, lower_lip, ear, earlobe, nose, nostril, scalp, forehead, cheek, chin, eyelid, neck, nape, axilla, groin, elbow, knee, wrist, ankle, palm, sole, finger, toe, web_space, etc. as SEPARATE values. Do NOT merge them into "face", "hand", "foot", or "extremities".
+   - COVERAGE CONTRACT: Every raw value in the input MUST be represented in your output, either as itself (normalized) or — only if rule 1 applies — mapped onto its canonical synonym which is present in the output. It is a BUG to silently drop a raw value.
+   - body_location: KEEP nail, fingernail, toenail, nail_bed, nail_plate, finger_nails, toe_nails, lips, upper_lip, lower_lip, ear, earlobe, nose, nostril, scalp, forehead, temple, cheek, chin, eyelid, eyebrow, neck, nape, axilla, groin, elbow, knee, wrist, ankle, palm, sole, finger, toe, web_space, mucosa, genital, etc. as SEPARATE values — AND ALSO keep coarser values like "face", "hand", "foot" if they appeared in the raw input (they represent captions that mention only the general region). Do NOT merge "nail" into "finger_nail", do NOT merge "cheek" into "face", do NOT merge "finger" into "hand".
    - morphology_texture / morphology_color / secondary_changes / symptoms_*: KEEP every distinct descriptor (e.g. "papule", "plaque", "nodule", "vesicle", "pustule", "crust", "scale", "fissure", "erosion", "ulcer" are all separate concepts — never merge).
 
 3. BIN continuous numeric values into range labels (this is the only case where you reduce cardinality aggressively):
@@ -1616,13 +1617,144 @@ OUTPUT: ONLY valid JSON — no markdown fences, no prose — same top-level shap
 """
 
 
+# Subcategories whose values are intentionally collapsed into coarse bins by the LLM.
+# Numeric raw values for these subcategories are NOT re-added by the coverage audit.
+_BINNED_SUBCATEGORIES: set[str] = {
+    "demographics_age",
+    "duration",
+    "lesion_count",
+}
+
+# Minimal, high-confidence synonym map. The coverage audit will skip re-adding a raw
+# value if its canonical target is present in the LLM's consolidated output.
+# Keep this list small and obviously-correct; everything else is preserved verbatim.
+_RAW_SYNONYM_CANONICAL: dict[str, str] = {
+    # symptoms — itch family
+    "itch": "itching",
+    "itchy": "itching",
+    "itches": "itching",
+    "pruritus": "itching",
+    "pruritic": "itching",
+    # color — red / erythema family
+    "erythema": "red",
+    "erythematous": "red",
+    # pigmentation spellings
+    "hyper_pigmented": "hyperpigmented",
+    "hyper_pigmentation": "hyperpigmented",
+    "hyperpigmentation": "hyperpigmented",
+    "hypo_pigmented": "hypopigmented",
+    "hypo_pigmentation": "hypopigmented",
+    "hypopigmentation": "hypopigmented",
+    "de_pigmented": "depigmented",
+    "depigmentation": "depigmented",
+    # plurals of common morphology terms
+    "papules": "papule",
+    "plaques": "plaque",
+    "nodules": "nodule",
+    "vesicles": "vesicle",
+    "pustules": "pustule",
+    "macules": "macule",
+    "patches": "patch",
+    "bullae": "bulla",
+    "ulcers": "ulcer",
+    "erosions": "erosion",
+    "fissures": "fissure",
+    "scales": "scale",
+    "crusts": "crust",
+    "cysts": "cyst",
+    "tumors": "tumor",
+    "tumours": "tumor",
+    # generic noise tokens — safe to drop entirely
+    "unknown": "",
+    "other": "",
+    "various": "",
+    "not_specified": "",
+    "n_a": "",
+    "none": "",
+    "none_mentioned": "",
+    "na": "",
+}
+
+
+def _normalize_value(v: str) -> str:
+    """Lower, strip, collapse whitespace → underscores. Hyphens preserved for numeric bins like 0-5."""
+    s = str(v).strip().lower()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def _canonicalize_raw(v: str) -> str:
+    """Apply _normalize_value, then resolve via known-synonym map. Empty string = drop."""
+    n = _normalize_value(v)
+    if not n:
+        return ""
+    return _RAW_SYNONYM_CANONICAL.get(n, n)
+
+
+def _looks_numeric_age_or_duration(v: str) -> bool:
+    """True if the value contains digits AND no hyphen range (hyphens indicate it's already a bin)."""
+    if "-" in v:
+        return False
+    return any(ch.isdigit() for ch in v)
+
+
+def _ensure_raw_coverage(
+    raw: dict[str, list[str]],
+    consolidated: dict[str, list[str]],
+) -> tuple[dict[str, list[str]], int]:
+    """
+    Deterministic post-LLM safety net: guarantee every distinct raw value is preserved
+    in the consolidated schema, unless (a) it maps to a known canonical synonym that is
+    already present, or (b) it's a specific numeric value in a binned subcategory.
+
+    Returns (augmented_schema, n_values_re_added).
+    """
+    out: dict[str, list[str]] = {k: list(v) for k, v in consolidated.items()}
+    n_added = 0
+
+    for subcat, raw_vals in raw.items():
+        existing = set(out.get(subcat, []))
+        existing_norm = {_normalize_value(c) for c in existing}
+        is_binned = subcat in _BINNED_SUBCATEGORIES
+
+        added_here: list[str] = []
+        for rv in raw_vals:
+            canonical = _canonicalize_raw(rv)
+            if not canonical:
+                continue
+
+            if canonical in existing or canonical in existing_norm:
+                continue
+
+            if is_binned and _looks_numeric_age_or_duration(canonical):
+                continue
+
+            existing.add(canonical)
+            existing_norm.add(canonical)
+            added_here.append(canonical)
+
+        if added_here:
+            out[subcat] = sorted(existing)
+            n_added += len(added_here)
+            preview = ", ".join(added_here[:8])
+            ellipsis = f", ... +{len(added_here) - 8} more" if len(added_here) > 8 else ""
+            print(
+                f"    Coverage audit [{subcat}]: re-added {len(added_here)} dropped raw value(s): "
+                f"{preview}{ellipsis}"
+            )
+
+    return out, n_added
+
+
 def consolidate_schema(
     all_features: dict[str, set[str]],
     n_captions_sampled: int = 0,
     n_disease_classes: int = 0,
 ) -> dict[str, list[str]]:
     """
-    Deduplicate feature values within each subcategory via LLM.
+    Deduplicate feature values within each subcategory via LLM, then run a deterministic
+    coverage audit to restore any distinct raw value the LLM silently dropped.
     Input:  {subcategory: set_of_values}  (raw discovery output)
     Output: {subcategory: sorted_list_of_canonical_values}
     """
@@ -1667,9 +1799,19 @@ def consolidate_schema(
                     result[k] = clean
             new_total = sum(len(v) for v in result.values())
             print(
-                f"  Consolidated: {total_vals} → {new_total} values "
+                f"  Consolidated (LLM): {total_vals} → {new_total} values "
                 f"in {len(result)} subcategories"
             )
+            result, n_added = _ensure_raw_coverage(raw, result)
+            final_total = sum(len(v) for v in result.values())
+            if n_added:
+                print(
+                    f"  Coverage audit: re-added {n_added} raw value(s) dropped by LLM "
+                    f"→ final: {final_total} values across {len(result)} subcategories"
+                )
+            else:
+                print(f"  Coverage audit: OK — all raw values already covered "
+                      f"({final_total} final values)")
             return result
         except json.JSONDecodeError:
             print(f"  Consolidation JSON parse error (attempt {attempt+1}), retrying...")
