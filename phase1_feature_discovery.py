@@ -1574,106 +1574,100 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, set[str]]:
 
 CONSOLIDATION_SYSTEM_PROMPT = """You deduplicate and standardize feature values for a dermatology classifier schema.
 
-You receive a JSON object mapping subcategory keys to lists of feature values.
-These were collected from two sources: Derm-1M captions (majority) and SCIN questionnaire fields.
-They contain synonyms, near-duplicates, and variant spellings that must be consolidated.
+You receive a JSON object mapping subcategory keys to lists of raw feature values collected from ~73k dermatology image captions and the SCIN questionnaire. The raw lists are very noisy (plurals, lexical variants, rare micro-anatomy, specific ages, compound phrases). Your job: produce a COMPACT, CLEAN canonical vocabulary per subcategory that a downstream one-hot classifier can use.
 
-GUIDING PRINCIPLE: Preserve every clinically distinguishing value. When in doubt, KEEP the value as a separate entry. Collapse values that are true synonyms (same concept, different wording/spelling, similar meaning/area represented) or numeric points that must be binned. 
-Do not collapse different anatomical sites, morphologies, symptoms, colors, or signs into a coarser umbrella term. Merge them into a single value if they are synonyms or the same concept represented in different ways.
+GUIDING PRINCIPLE
+Aggressively consolidate toward a small canonical vocabulary per subcategory. Merge everything that is the same clinical concept (synonyms, lexical variants, plural/singular, sub-region of a named region, compound descriptive phrases). Keep separate ONLY what is clinically distinct (e.g. papule ≠ plaque, nail ≠ finger, pruritus → itching but itching ≠ burning).
 
-RULES:
+TARGET BUDGETS (approximate final count per subcategory — the TOTAL across all subcategories MUST be 250-300):
+- body_location:            < 40
+- clinical_signs:           ≤ 15
+- demographics_age:         EXACTLY the 10 bins listed below (rule 3)
+- demographics_ethnicity:   ≤ 10
+- demographics_sex:         EXACTLY ["male","female","other"]
+- demographics_skin_type:   EXACTLY ["fst1","fst2","fst3","fst4","fst5","fst6"] (prefer Fitzpatrick) OR ≤ 6 descriptive tones — not both
+- duration:                 EXACTLY ["hours","days","weeks","months","years","chronic"]
+- history:                  ≤ 15
+- image_metadata:           ≤ 6
+- lesion_count:             EXACTLY ["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"]
+- morphology_color:         ≤ 12
+- morphology_distribution:  ≤ 12
+- morphology_shape:         ≤ 12
+- morphology_texture:       ≤ 20
+- other:                    ≤ 20
+- secondary_changes:        ≤ 12
+- severity:                 EXACTLY ["mild","moderate","severe","very_severe"]
+- symptoms_dermatological:  ≤ 20
+- symptoms_systemic:        ≤ 20
+- treatments:               ≤ 20
+- triggers:                 ≤ 20
 
-1. MERGE true synonyms / spelling variants within a subcategory.
-   - "itch" + "pruritus" + "pruritic" → "itching"
-   - "erythematous" + "erythema" → "red" (or keep "erythema" if it is the more specific clinical term used)
-   - "hyper_pigmented" + "hyperpigmentation" → "hyperpigmented"
-   - This includes merging SCIN-sourced values with Derm-1M equivalents when they refer to the exact same concept.
+If a subcategory's raw list is tiny (e.g. 3 values), keep what's there. If it's huge (e.g. body_location has 1000+), consolidate aggressively down to the budget.
 
-2. KEEP every distinct/unique value separate. This is the default behaviour — do not collapse to broader categories.
-   - COVERAGE CONTRACT: Every raw value in the input MUST be represented in your output, either as itself (normalized) or — only if rule 1 applies — mapped onto its canonical synonym which is present in the output. It is a BUG to silently drop a raw value.
-   - body_location: KEEP fingernail, toenail, lips, ear, nose, scalp, forehead, cheek, chin, eyelid, neck, axilla, groin, elbow, knee, wrist, ankle, palm, sole, finger, toe, web_space, mucosa, genital, etc. as SEPARATE values — AND ALSO keep coarser values like "face", "hand", "foot" if they appeared in the raw input (they represent captions that mention only the general region). Do NOT merge "finger_nail"/"nail" into "hand", do NOT merge "cheek" into "face", etc.
-   - morphology_texture / morphology_color / secondary_changes / symptoms_*: KEEP every distinct descriptor (e.g. "papule", "plaque", "nodule", "vesicle", "pustule", "crust", "scale", "fissure", "erosion", "ulcer" are all separate concepts — never merge).
+RULES
 
-3. BIN continuous numeric values into range labels (this is the only case where you reduce cardinality aggressively):
-   - demographics_age: Replace every specific age (e.g. "1_year_old", "10_year_old", "25", "42_yo", "infant_3_months") with age-bin labels:
-       "0-5", "5-10", "10-20", "20-30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-plus"
-     Use ONLY these bins. Drop exact-age values entirely in favor of the bin they fall into. If the raw values also include descriptive bands like "adult", "elderly", "newborn" that cannot be mapped to a numeric bin, you may keep at most one qualitative tag ("newborn") alongside the numeric bins, but prefer numeric bins whenever age is numeric.
-   - duration: Bin into labels like "hours", "days", "weeks", "months", "years", "chronic" (drop specific numeric durations like "3_days", "2_weeks", "5_years" → map to the appropriate bin).
-   - lesion_count: Use coarse bins "single", "few_2_to_5", "multiple_6_to_20", "many_20_plus", "numerous" rather than exact counts.
+1. MERGE aggressively within each subcategory. Collapse:
+   - Plural → singular: "papules"→"papule", "ankles"→"ankle", "fingernails"→"fingernail".
+   - Lexical/spelling variants: "hyperpigmentation"+"hyper_pigmented"→"hyperpigmented"; "erythema"+"erythematous"→"red"; "pruritus"+"pruritic"+"itch"+"itchy"→"itching".
+   - Compound descriptive phrases → their head term: "anterior aspect of thigh"→"thigh", "both ankles"→"ankle", "antecubital fossa"→"elbow", "zygomatic cheek"→"cheek", "abdominal skin"→"abdomen", "web spaces between fingers and toes"→"web_space".
+   - Sub-regions of a named region → the canonical region: "alar base"/"ala of nose"/"alar region"→"nose"; "nasal dorsum"/"bridge of nose"→"nose"; "anterior chest wall"→"chest"; "lateral thigh"→"thigh".
+   - Redundant qualifiers: drop "area", "region", "skin", "surface", "aspect", "side", "both", "bilateral", "left", "right" when the base term is already canonical.
+   - SCIN values merged with Derm-1M equivalents when they mean the same thing.
 
-4. Within a subcategory, pick ONE terminology/scale and map variants onto it — do not mix scales:
-   - demographics_skin_type: Either use descriptive tones ("fair", "medium", "olive", "brown", "dark", "deeply_pigmented") OR Fitzpatrick ("fst1", "fst2", "fst3", "fst4", "fst5", "fst6"), not both. Prefer Fitzpatrick if any fst values are present.
-   - severity: Use a single ordinal scale ("mild", "moderate", "severe", "very_severe") rather than mixing ordinal terms with percentages or descriptive phrases.
+2. KEEP separate only clinically distinct concepts:
+   - body_location: nail / fingernail / toenail / nail_bed ARE distinct from finger/toe/hand/foot. Lips, ear, nose, scalp, cheek, forehead, chin, eyelid are distinct from "face". Palm/sole distinct from hand/foot. Mucosa, genital, buttock, axilla, groin are their own sites.
+   - morphology: papule ≠ plaque ≠ nodule ≠ macule ≠ patch ≠ vesicle ≠ bulla ≠ pustule ≠ cyst ≠ tumor.
+   - secondary_changes: crust ≠ scale ≠ erosion ≠ ulcer ≠ fissure ≠ atrophy ≠ lichenification.
 
-5. STANDARDIZE all values to snake_case, lowercase, ASCII. Replace hyphens/spaces with underscores. For range bins keep the hyphen (e.g. "0-5", "20-30").
+3. ENUM SUBCATEGORIES — use EXACTLY these values (nothing else allowed):
+   - demographics_age → ["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"]. Map every specific age ("1-year-old", "2.5-year-old", "23-year-old", "42_yo", "infant_3_months", "newborn", "toddler", "child", "adult", "elderly") onto the appropriate bin. DO NOT output any raw age like "23-year-old" — only bin labels.
+   - duration → ["hours","days","weeks","months","years","chronic"]. Map "3_days"→"days", "2_weeks"→"weeks", "longstanding"/"persistent_for_10_years"→"chronic".
+   - lesion_count → ["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"].
+   - severity → ["mild","moderate","severe","very_severe"].
+   - demographics_sex → ["male","female","other"].
+   - demographics_skin_type → prefer Fitzpatrick ["fst1","fst2","fst3","fst4","fst5","fst6"] if ANY fst values appear in the raw input; otherwise up to 6 descriptive tones (e.g. "fair","medium","olive","brown","dark","deeply_pigmented").
 
-6. REMOVE vacuous entries within a subcategory (e.g. "other", "unknown", "various", "not_specified", "n_a", "none_mentioned"). Keep them ONLY if they are a clinically meaningful distinct concept for that subcategory (rare).
+4. REMOVE noise entries: "other", "unknown", "various", "not_specified", "n_a", "none", "none_mentioned", "no_history", "no_treatment", "not_mentioned", and any value that is a disease name itself (belongs to the label, not the feature schema).
 
-7. DO NOT merge clinically distinct concepts (e.g. "papule" vs "plaque", "macule" vs "patch", "vesicle" vs "bulla", "ulcer" vs "erosion", "scale" vs "crust" — all remain separate).
+5. SUGGESTED canonical body_location vocabulary (use these; add site-specific ones from raw input only if clinically distinct):
+   scalp, hairline, forehead, temple, face, eyebrow, eyelid, periorbital, nose, nostril, cheek, ear, earlobe, lip, oral_mucosa, tongue, chin, jaw, neck, nape, shoulder, axilla, chest, breast, back, abdomen, flank, groin, genital, perineum, buttock, arm, elbow, forearm, wrist, hand, palm, dorsum_hand, knuckle, finger, fingernail, web_space, thigh, knee, shin, calf, ankle, foot, sole, heel, dorsum_foot, toe, toenail, nail, trunk, extremity, generalized, flexural, acral, mucosa
 
-8. DO NOT move values between subcategories. DO NOT add subcategories or values not present in the input (except when creating age/duration/count BINS from existing numeric values in rule 3).
+6. STANDARDIZE all values to lowercase snake_case ASCII. Hyphens only for numeric range bins ("0-5", "80-plus").
 
-OUTPUT: ONLY valid JSON — no markdown fences, no prose — same top-level shape as input:
-{"demographics_age":["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"],"body_location":["scalp","forehead","cheek","nose","lips","ear","neck","chest","back","abdomen","groin","axilla","elbow","forearm","wrist","palm","finger","finger_nail","thigh","knee","shin","ankle","foot","sole","toe","toe_nail"],"morphology_color":["red","pink","brown","hyperpigmented","hypopigmented","depigmented","yellow","violaceous"], ...}
+7. DO NOT move values between subcategories; DO NOT add new subcategory keys.
+
+OUTPUT — ONLY valid JSON, no markdown fences, no prose, same top-level shape as input:
+{"demographics_age":["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"],"demographics_sex":["male","female","other"],"severity":["mild","moderate","severe","very_severe"],"body_location":["scalp","forehead","face","cheek","nose","lip","ear","chin","neck","chest","back","abdomen","groin","axilla","arm","elbow","forearm","wrist","hand","palm","finger","fingernail","nail","web_space","thigh","knee","shin","ankle","foot","sole","toe","toenail","trunk","extremity","generalized"], ...}
 """
 
 
-# Subcategories whose values are intentionally collapsed into coarse bins by the LLM.
-# Numeric raw values for these subcategories are NOT re-added by the coverage audit.
-_BINNED_SUBCATEGORIES: set[str] = {
-    "demographics_age",
-    "duration",
-    "lesion_count",
+# Hard-enumerated subcategories: LLM output for these MUST be drawn from the canonical
+# list below. Anything else is dropped by _enforce_enum_subcategories.
+_ENUM_CANONICAL: dict[str, list[str]] = {
+    "demographics_age": [
+        "0-5", "5-10", "10-20", "20-30", "30-40",
+        "40-50", "50-60", "60-70", "70-80", "80-plus",
+    ],
+    "duration": ["hours", "days", "weeks", "months", "years", "chronic"],
+    "lesion_count": [
+        "single", "few_2_to_5", "multiple_6_to_20", "many_20_plus", "numerous",
+    ],
+    "severity": ["mild", "moderate", "severe", "very_severe"],
+    "demographics_sex": ["male", "female", "other"],
+    # demographics_skin_type is partially-enumerated: EITHER Fitzpatrick OR descriptive tones.
+    # Handled specially in _enforce_enum_subcategories.
 }
 
-# Minimal, high-confidence synonym map. The coverage audit will skip re-adding a raw
-# value if its canonical target is present in the LLM's consolidated output.
-# Keep this list small and obviously-correct; everything else is preserved verbatim.
-_RAW_SYNONYM_CANONICAL: dict[str, str] = {
-    # symptoms — itch family
-    "itch": "itching",
-    "itchy": "itching",
-    "itches": "itching",
-    "pruritus": "itching",
-    "pruritic": "itching",
-    # color — red / erythema family
-    "erythema": "red",
-    "erythematous": "red",
-    # pigmentation spellings
-    "hyper_pigmented": "hyperpigmented",
-    "hyper_pigmentation": "hyperpigmented",
-    "hyperpigmentation": "hyperpigmented",
-    "hypo_pigmented": "hypopigmented",
-    "hypo_pigmentation": "hypopigmented",
-    "hypopigmentation": "hypopigmented",
-    "de_pigmented": "depigmented",
-    "depigmentation": "depigmented",
-    # plurals of common morphology terms
-    "papules": "papule",
-    "plaques": "plaque",
-    "nodules": "nodule",
-    "vesicles": "vesicle",
-    "pustules": "pustule",
-    "macules": "macule",
-    "patches": "patch",
-    "bullae": "bulla",
-    "ulcers": "ulcer",
-    "erosions": "erosion",
-    "fissures": "fissure",
-    "scales": "scale",
-    "crusts": "crust",
-    "cysts": "cyst",
-    "tumors": "tumor",
-    "tumours": "tumor",
-    # generic noise tokens — safe to drop entirely
-    "unknown": "",
-    "other": "",
-    "various": "",
-    "not_specified": "",
-    "n_a": "",
-    "none": "",
-    "none_mentioned": "",
-    "na": "",
+_FITZPATRICK_TONES: list[str] = ["fst1", "fst2", "fst3", "fst4", "fst5", "fst6"]
+_DESCRIPTIVE_TONES: list[str] = [
+    "fair", "light", "medium", "olive", "brown", "dark", "deeply_pigmented",
+]
+
+# Minimal noise tokens that should never survive — applied across every subcategory.
+_NOISE_VALUES: set[str] = {
+    "", "unknown", "other", "various", "miscellaneous",
+    "not_specified", "not_mentioned", "none", "none_mentioned", "no_history",
+    "no_treatment", "n_a", "na", "null", "nan",
 }
 
 
@@ -1685,67 +1679,60 @@ def _normalize_value(v: str) -> str:
     return s
 
 
-def _canonicalize_raw(v: str) -> str:
-    """Apply _normalize_value, then resolve via known-synonym map. Empty string = drop."""
-    n = _normalize_value(v)
-    if not n:
-        return ""
-    return _RAW_SYNONYM_CANONICAL.get(n, n)
-
-
-def _looks_numeric_age_or_duration(v: str) -> bool:
-    """True if the value contains digits AND no hyphen range (hyphens indicate it's already a bin)."""
-    if "-" in v:
-        return False
-    return any(ch.isdigit() for ch in v)
-
-
-def _ensure_raw_coverage(
-    raw: dict[str, list[str]],
+def _enforce_enum_subcategories(
     consolidated: dict[str, list[str]],
 ) -> tuple[dict[str, list[str]], int]:
     """
-    Deterministic post-LLM safety net: guarantee every distinct raw value is preserved
-    in the consolidated schema, unless (a) it maps to a known canonical synonym that is
-    already present, or (b) it's a specific numeric value in a binned subcategory.
+    Deterministic post-LLM cleanup. For each hard-enumerated subcategory, drop any
+    value not in the canonical list. Also strip global noise values from every
+    subcategory. Does NOT re-add values — only removes.
 
-    Returns (augmented_schema, n_values_re_added).
+    Returns (cleaned_schema, n_values_dropped).
     """
-    out: dict[str, list[str]] = {k: list(v) for k, v in consolidated.items()}
-    n_added = 0
+    out: dict[str, list[str]] = {}
+    n_dropped = 0
 
-    for subcat, raw_vals in raw.items():
-        existing = set(out.get(subcat, []))
-        existing_norm = {_normalize_value(c) for c in existing}
-        is_binned = subcat in _BINNED_SUBCATEGORIES
+    for subcat, vals in consolidated.items():
+        kept: list[str] = []
+        dropped_here: list[str] = []
 
-        added_here: list[str] = []
-        for rv in raw_vals:
-            canonical = _canonicalize_raw(rv)
-            if not canonical:
-                continue
+        if subcat in _ENUM_CANONICAL:
+            allowed = set(_ENUM_CANONICAL[subcat])
+            for v in vals:
+                nv = _normalize_value(v)
+                if nv in allowed:
+                    kept.append(nv)
+                else:
+                    dropped_here.append(v)
+        elif subcat == "demographics_skin_type":
+            fitz = set(_FITZPATRICK_TONES)
+            desc = set(_DESCRIPTIVE_TONES)
+            has_fitz = any(_normalize_value(v) in fitz for v in vals)
+            allowed = fitz if has_fitz else desc
+            for v in vals:
+                nv = _normalize_value(v)
+                if nv in allowed:
+                    kept.append(nv)
+                else:
+                    dropped_here.append(v)
+        else:
+            for v in vals:
+                nv = _normalize_value(v)
+                if nv and nv not in _NOISE_VALUES:
+                    kept.append(nv)
+                else:
+                    dropped_here.append(v)
 
-            if canonical in existing or canonical in existing_norm:
-                continue
+        unique_kept = sorted(set(kept))
+        if unique_kept:
+            out[subcat] = unique_kept
+        n_dropped += len(dropped_here)
+        if dropped_here:
+            preview = ", ".join(str(d) for d in dropped_here[:6])
+            ellipsis = f" ... +{len(dropped_here) - 6} more" if len(dropped_here) > 6 else ""
+            print(f"    Enum cleanup [{subcat}]: dropped {len(dropped_here)} non-canonical value(s): {preview}{ellipsis}")
 
-            if is_binned and _looks_numeric_age_or_duration(canonical):
-                continue
-
-            existing.add(canonical)
-            existing_norm.add(canonical)
-            added_here.append(canonical)
-
-        if added_here:
-            out[subcat] = sorted(existing)
-            n_added += len(added_here)
-            preview = ", ".join(added_here[:8])
-            ellipsis = f", ... +{len(added_here) - 8} more" if len(added_here) > 8 else ""
-            print(
-                f"    Coverage audit [{subcat}]: re-added {len(added_here)} dropped raw value(s): "
-                f"{preview}{ellipsis}"
-            )
-
-    return out, n_added
+    return out, n_dropped
 
 
 def consolidate_schema(
@@ -1755,7 +1742,9 @@ def consolidate_schema(
 ) -> dict[str, list[str]]:
     """
     Deduplicate feature values within each subcategory via LLM, then run a deterministic
-    coverage audit to restore any distinct raw value the LLM silently dropped.
+    enum-enforcement pass that drops non-canonical values from hard-enumerated subcategories
+    (demographics_age/sex/skin_type, duration, lesion_count, severity) and strips global
+    noise tokens (unknown/other/n_a/...) from every subcategory.
     Input:  {subcategory: set_of_values}  (raw discovery output)
     Output: {subcategory: sorted_list_of_canonical_values}
     """
@@ -1803,15 +1792,15 @@ def consolidate_schema(
                 f"  Consolidated (LLM): {total_vals} → {new_total} values "
                 f"in {len(result)} subcategories"
             )
-            result, n_added = _ensure_raw_coverage(raw, result)
+            result, n_dropped = _enforce_enum_subcategories(result)
             final_total = sum(len(v) for v in result.values())
-            if n_added:
+            if n_dropped:
                 print(
-                    f"  Coverage audit: re-added {n_added} raw value(s) dropped by LLM "
+                    f"  Enum cleanup: dropped {n_dropped} non-canonical value(s) "
                     f"→ final: {final_total} values across {len(result)} subcategories"
                 )
             else:
-                print(f"  Coverage audit: OK — all raw values already covered "
+                print(f"  Enum cleanup: OK — no non-canonical values found "
                       f"({final_total} final values)")
             return result
         except json.JSONDecodeError:
