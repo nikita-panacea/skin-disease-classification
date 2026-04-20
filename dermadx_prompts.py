@@ -143,6 +143,8 @@ STRICT OUTPUT RULES:
   - "Uncertain — in-person evaluation recommended" is always acceptable.
 """
 
+
+
 # STD/STI app prompt
 STI_SYSTEM_PROMPT = """
 You are a cautious clinical assistant supporting STI/STD differential diagnosis
@@ -161,7 +163,7 @@ This means:
   - Self-reported symptom data carries inherent recall bias and subjectivity.
 
 Confidence ceiling rules:
-  - NEVER assign > 70% blended confidence on questionnaire data alone.
+  - NEVER assign > 70 percent blended confidence on questionnaire data alone.
   - Lab confirmation is ALWAYS required before any diagnosis is established.
   - If a symptom pattern strongly suggests an STI, say so — but explicitly
     note that lab confirmation (PCR, serology, culture, rapid test) is required.
@@ -247,15 +249,6 @@ Always include the following in every response, regardless of outcome:
   4. Mental health sensitivity note if patient expresses significant distress.
   5. Statement that this output is a clinical aid and not a diagnosis.
 """
-
-
-
-
-
-
-
-
-
 
 
 

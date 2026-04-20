@@ -255,7 +255,10 @@ def _openai_extraction_chat_body(system_prompt: str, user_prompt: str) -> dict:
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
-        "max_tokens": 4096,
+        # 8192 gives headroom for ~25 captions × ~21 categories each without truncation.
+        # gpt-4o-mini caps at 16384 output tokens; raise further if you see completion=8192
+        # with truncated JSON in logs.
+        "max_tokens": 15000,
         "stream": False,
     }
     if OPENAI_JSON_RESPONSE:
@@ -573,7 +576,7 @@ def call_llm(
                     model=MODEL_NAME,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=4096,
+                    max_tokens=15000,
                     stream=False,
                 )
                 if OPENAI_JSON_RESPONSE:
@@ -597,7 +600,7 @@ def call_llm(
                 response = qwen_client.chat.completions.create(
                     model=MODEL_NAME,
                     messages=messages,
-                    max_tokens=4096,
+                    max_tokens=8192,
                     temperature=0.7,
                     top_p=0.8,
                     presence_penalty=1.5,
@@ -959,6 +962,55 @@ def _expand_category_output_to_encoding(
     return result, fixes
 
 
+def _salvage_truncated_json_array(txt: str) -> list[dict] | None:
+    """
+    When the LLM response was cut off mid-string (max_tokens hit), `json.loads`
+    fails. Walk the text incrementally with `raw_decode` and return every top-
+    level object that WAS fully emitted before truncation. Returns None if no
+    objects can be salvaged.
+    """
+    if not txt:
+        return None
+
+    start = txt.find("[")
+    if start < 0:
+        # Might be a bare dict stream; try to collect top-level objects.
+        start = txt.find("{")
+    if start < 0:
+        return None
+
+    dec = json.JSONDecoder()
+    i = start
+    # Skip "[" if present and whitespace
+    if txt[i] == "[":
+        i += 1
+    objects: list[dict] = []
+    n = len(txt)
+    while i < n:
+        # Skip whitespace / separators between array items
+        while i < n and txt[i] in " \t\r\n,":
+            i += 1
+        if i >= n or txt[i] == "]":
+            break
+        try:
+            obj, end = dec.raw_decode(txt, i)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict):
+            objects.append(obj)
+        i = end
+
+    return objects if objects else None
+
+
+def _openai_response_finish_info(text: str) -> str:
+    """Small hint message when parsing fails — guesses the likely cause."""
+    if not text:
+        return "empty response"
+    tail = text[-80:].replace("\n", " ")
+    return f"last 80 chars: {tail!r}"
+
+
 def parse_extraction_response_text(
     text: str,
     captions: list[str],
@@ -975,10 +1027,17 @@ def parse_extraction_response_text(
           ...
         ]
 
-    Returns (results, stats). On parse failure, returns a fallback row (all 2s)
-    per input caption so the pipeline keeps making progress.
+    Robustness:
+      • Accepts `{"results":[...]}` / `{"data":[...]}` wrappers.
+      • Accepts a single bare caption object.
+      • Salvages valid prefix objects when the JSON was truncated mid-string
+        (common when the completion hits max_tokens). Only the captions at the
+        tail get the "unknown" fallback row; preceding captions are recovered.
+
+    Returns (results, stats). `stats["success"]` is True only when ALL captions
+    were parsed or salvaged without error.
     """
-    stats: dict = {"success": False, "validation_fixes": 0}
+    stats: dict = {"success": False, "validation_fixes": 0, "salvaged": False}
     fallback_row = {k: 2 for k in all_feature_names}
 
     if feature_categories is None:
@@ -988,27 +1047,10 @@ def parse_extraction_response_text(
         all_feature_names, feature_categories
     )
 
-    try:
-        txt = (text or "").strip()
-        txt = re.sub(r"```json\s*|```\s*", "", txt).strip()
-        parsed = json.loads(txt)
-
-        # Tolerate the LLM wrapping the array in a container object.
-        if isinstance(parsed, dict):
-            for key in ("results", "data", "captions", "outputs", "items"):
-                if key in parsed and isinstance(parsed[key], list):
-                    parsed = parsed[key]
-                    break
-            else:
-                # Single-caption object → wrap as a one-element array.
-                parsed = [parsed]
-
-        if not isinstance(parsed, list):
-            raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
-
+    def _finalize(parsed_list: list[dict], *, salvaged: bool) -> tuple[list[dict], dict]:
         results: list[dict] = []
         fixes = 0
-        for item in parsed:
+        for item in parsed_list:
             encoding, f = _expand_category_output_to_encoding(
                 item if isinstance(item, dict) else {},
                 all_feature_names,
@@ -1020,19 +1062,56 @@ def parse_extraction_response_text(
             fixes += f
             results.append(encoding)
 
-        if len(results) < len(captions):
-            results.extend([dict(fallback_row)] * (len(captions) - len(results)))
-            fixes += len(captions) - len(results) + (len(captions) - len(results))
+        short = len(captions) - len(results)
+        if short > 0:
+            results.extend([dict(fallback_row)] * short)
+            fixes += short
         results = results[: len(captions)]
 
         stats["validation_fixes"] = fixes
-        stats["success"] = True
+        stats["salvaged"] = salvaged
+        # Salvaged partial parses still count as "success=False" so the caller
+        # retries or falls back to sync for the missing tail captions, but the
+        # salvaged prefix is preserved in the returned results.
+        stats["success"] = not salvaged and short == 0
         return results, stats
 
+    txt = (text or "").strip()
+    txt = re.sub(r"```json\s*|```\s*", "", txt).strip()
+
+    try:
+        parsed = json.loads(txt)
     except (json.JSONDecodeError, ValueError, TypeError) as e:
-        print(f"    parse_extraction_response_text: {str(e)[:160]}")
-        stats["success"] = False
+        salvaged = _salvage_truncated_json_array(txt)
+        if salvaged:
+            print(
+                f"    parse_extraction_response_text: {str(e)[:120]} — "
+                f"salvaged {len(salvaged)}/{len(captions)} caption(s) from truncated JSON"
+            )
+            return _finalize(salvaged, salvaged=True)
+        print(
+            f"    parse_extraction_response_text: {str(e)[:160]} "
+            f"({_openai_response_finish_info(txt)})"
+        )
         return [dict(fallback_row) for _ in captions], stats
+
+    # Tolerate the LLM wrapping the array in a container object.
+    if isinstance(parsed, dict):
+        for key in ("results", "data", "captions", "outputs", "items"):
+            if key in parsed and isinstance(parsed[key], list):
+                parsed = parsed[key]
+                break
+        else:
+            parsed = [parsed]
+
+    if not isinstance(parsed, list):
+        print(
+            f"    parse_extraction_response_text: expected JSON array, got "
+            f"{type(parsed).__name__}"
+        )
+        return [dict(fallback_row) for _ in captions], stats
+
+    return _finalize(parsed, salvaged=False)
 
 
 def _is_valid_idx(val, n: int) -> bool:
@@ -1072,6 +1151,8 @@ def extract_features_batch(
         "validation_fixes": 0,
     }
 
+    best_partial: list[dict] | None = None
+
     for attempt in range(retries):
         try:
             stats["attempts"] = attempt + 1
@@ -1083,6 +1164,10 @@ def extract_features_batch(
             if pst.get("success"):
                 stats["success"] = True
                 return valid_results, stats
+            # Keep the longest successful prefix across attempts so a consistently
+            # truncating batch still returns real data for the recovered captions.
+            if pst.get("salvaged"):
+                best_partial = valid_results
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
         except json.JSONDecodeError as e:
@@ -1097,6 +1182,41 @@ def extract_features_batch(
                     time.sleep(10 * (attempt + 1))
                 else:
                     time.sleep(2 ** attempt)
+
+    # All retries exhausted. If this is a multi-caption batch, bisect and retry
+    # each half independently — most truncation-induced failures are due to one
+    # or two verbose captions, so splitting quickly isolates them.
+    if len(captions) > 1 and tag_lists is None:
+        mid = len(captions) // 2
+        left_caps, right_caps = captions[:mid], captions[mid:]
+        print(
+            f"    Bisecting failed batch ({len(captions)} → "
+            f"{len(left_caps)} + {len(right_caps)}) after {retries} attempts"
+        )
+        left, st_l = extract_features_batch(
+            left_caps, all_feature_names, system_prompt,
+            retries=retries, feature_categories=feature_categories,
+        )
+        right, st_r = extract_features_batch(
+            right_caps, all_feature_names, system_prompt,
+            retries=retries, feature_categories=feature_categories,
+        )
+        stats["validation_fixes"] += (
+            st_l.get("validation_fixes", 0) + st_r.get("validation_fixes", 0)
+        )
+        stats["success"] = bool(st_l.get("success") and st_r.get("success"))
+        return left + right, stats
+
+    if best_partial is not None:
+        unknown_count = sum(
+            1 for row in best_partial if all(v == 2 for v in row.values())
+        )
+        print(
+            f"    ERROR: All {retries} attempts failed. Using salvaged partial: "
+            f"{len(captions) - unknown_count}/{len(captions)} recovered, "
+            f"{unknown_count} fell back to unknown."
+        )
+        return best_partial, stats
 
     print(f"    ERROR: All {retries} attempts failed. Returning unknown values.")
     fallback = [{k: 2 for k in all_feature_names} for _ in captions]
@@ -1151,18 +1271,42 @@ def _run_dedup_openai_batch(
         global_stats["total_validation_fixes"] += pst.get("validation_fixes", 0)
 
         if not ok:
-            tqdm.write(f"    Sync fallback for batch {cid}")
-            batch_tags = (
-                [caption_to_tags.get(c, []) for c in batch]
-                if caption_to_tags is not None else None
-            )
-            batch_results, st2 = extract_features_batch(
-                batch, all_feature_names, system_prompt, tag_lists=batch_tags,
-                feature_categories=feature_categories,
-            )
-            ok = st2.get("success", False)
-            global_stats["total_retries"] += 1
-            global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
+            # If salvage recovered a prefix, keep it and only re-run the unsalvaged
+            # tail captions synchronously. This usually cuts sync-retry cost by
+            # 10-20x for truncation-related failures.
+            tail_start = 0
+            if pst.get("salvaged"):
+                for idx, row in enumerate(batch_results):
+                    if all(v == 2 for v in row.values()):
+                        tail_start = idx
+                        break
+                else:
+                    tail_start = len(batch_results)
+
+            tail_batch = batch[tail_start:] if tail_start < len(batch) else []
+
+            if tail_batch:
+                tqdm.write(
+                    f"    Sync fallback for batch {cid} "
+                    f"(salvaged {tail_start}/{len(batch)}, "
+                    f"retrying tail of {len(tail_batch)})"
+                )
+                batch_tags = (
+                    [caption_to_tags.get(c, []) for c in tail_batch]
+                    if caption_to_tags is not None else None
+                )
+                tail_results, st2 = extract_features_batch(
+                    tail_batch, all_feature_names, system_prompt,
+                    tag_lists=batch_tags,
+                    feature_categories=feature_categories,
+                )
+                batch_results = batch_results[:tail_start] + tail_results
+                ok = st2.get("success", False)
+                global_stats["total_retries"] += 1
+                global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
+            else:
+                # Full batch already salvaged; treat as success.
+                ok = True
 
         if ok:
             global_stats["successful_batches"] += 1
