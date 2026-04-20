@@ -1720,10 +1720,14 @@ CONSOLIDATION RULES
 
 5. STANDARDIZE all values to lowercase snake_case ASCII. Hyphens only for numeric range bins ("0-5", "80-plus").
 
-OUTPUT FORMAT
-Return ONLY a JSON array of canonical values. No markdown fences, no prose, no keys, no explanation.
-Example for demographics_sex: ["female","male","other"]
-Example for body_location: ["abdomen","ankle","arm","back","cheek","chest","ear","eyelid","face","finger","fingernail","forehead","hand","knee","lip","nail","neck","nose","palm","scalp","sole","thigh","toe","toenail"]
+OUTPUT FORMAT — STRICT
+Return ONLY a single JSON OBJECT with ONE key named "values" whose value is a JSON array of canonical strings. NO other keys, no markdown fences, no prose, no explanation, no comments.
+
+Example for demographics_sex:
+{"values":["female","male","other"]}
+
+Example for body_location:
+{"values":["abdomen","ankle","arm","back","cheek","chest","ear","eyelid","face","finger","fingernail","forehead","hand","knee","lip","nail","neck","nose","palm","scalp","sole","thigh","toe","toenail"]}
 """
 
 
@@ -1874,22 +1878,91 @@ def _build_per_subcategory_user_prompt(
     parts.append(f"Raw values ({len(raw_values)} total):")
     parts.append(body_json)
     parts.append("")
-    parts.append("Return ONLY a JSON array of canonical values. No keys, no prose.")
+    parts.append('Return ONLY a JSON object of the form {"values": ["...", "..."]}.')
     return "\n".join(parts)
+
+
+# Keys we recognize as wrappers around the canonical-values list (in priority order).
+_VALUES_KEY_CANDIDATES: tuple[str, ...] = (
+    "values", "value", "canonical_values", "canonical", "items", "list",
+    "features", "tags", "vocab", "vocabulary", "result", "results", "output",
+)
+
+
+def _extract_values_list(parsed) -> list[str] | None:
+    """
+    Robustly pull a list of strings out of an LLM JSON response, regardless of how
+    the model wrapped it. Handles:
+      - bare JSON array          → ["a", "b"]
+      - {"values": ["a", "b"]}  (and other common wrapper keys above)
+      - any single-key dict whose value is a list
+      - any multi-key dict — first list-value found is used
+      - dict with all string values        → use the values
+      - dict with all bool/null values     → use the keys (one-hot style)
+      - nested {"<subcat>": {"values": [...]}}
+    Returns None only if no list of strings can be recovered.
+    """
+    if parsed is None:
+        return None
+
+    if isinstance(parsed, list):
+        return [str(v) for v in parsed if isinstance(v, (str, int, float)) and str(v).strip()]
+
+    if isinstance(parsed, dict):
+        # 1. Try recognized wrapper keys first (case-insensitive).
+        lower_map = {str(k).lower(): k for k in parsed.keys()}
+        for cand in _VALUES_KEY_CANDIDATES:
+            if cand in lower_map:
+                inner = parsed[lower_map[cand]]
+                got = _extract_values_list(inner)
+                if got:
+                    return got
+
+        # 2. Any value that is itself a list of strings.
+        for v in parsed.values():
+            if isinstance(v, list):
+                got = _extract_values_list(v)
+                if got:
+                    return got
+
+        # 3. Any nested dict that contains a list.
+        for v in parsed.values():
+            if isinstance(v, dict):
+                got = _extract_values_list(v)
+                if got:
+                    return got
+
+        # 4. All values are strings → use the values.
+        str_vals = [str(v) for v in parsed.values()
+                    if isinstance(v, (str, int, float)) and str(v).strip()]
+        if str_vals and len(str_vals) == len(parsed):
+            return str_vals
+
+        # 5. One-hot-style {"feature_a": true, "feature_b": true} → use the keys.
+        bool_or_null = all(v is None or isinstance(v, bool) for v in parsed.values())
+        if bool_or_null and parsed:
+            keys = [str(k) for k in parsed.keys() if str(k).strip()]
+            if keys:
+                return keys
+
+    return None
 
 
 def _consolidate_single_subcategory(
     subcat: str,
     raw_values: list[str],
     budget: int,
+    max_attempts: int = 5,
 ) -> list[str]:
     """
-    Consolidate ONE subcategory via a focused LLM call with subcategory-specific guidance.
-    Returns a sorted deduplicated list of canonical values (possibly empty on failure).
+    Consolidate ONE subcategory via a focused LLM call with subcategory-specific
+    guidance. Returns a sorted deduplicated list of canonical values. Returns an
+    empty list ONLY if every attempt fails (no alphabetical fallback).
     """
     user = _build_per_subcategory_user_prompt(subcat, raw_values, budget)
 
-    for attempt in range(2):
+    last_error: str | None = None
+    for attempt in range(max_attempts):
         try:
             text = call_llm(
                 user,
@@ -1898,47 +1971,38 @@ def _consolidate_single_subcategory(
                 openai_max_tokens=4096,
             )
             parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            if isinstance(parsed, dict) and len(parsed) == 1:
-                val = next(iter(parsed.values()))
-                if isinstance(val, list):
-                    parsed = val
-            if not isinstance(parsed, list):
-                print(f"    [{subcat}] attempt {attempt+1}: parse error, retrying...")
-                time.sleep(2)
+            values = _extract_values_list(parsed)
+            if values is None:
+                last_error = f"could not extract list (got {type(parsed).__name__})"
+                shape = ""
+                if isinstance(parsed, dict):
+                    shape = f" keys={list(parsed.keys())[:6]}"
+                head = (text or "")[:140].replace("\n", " ")
+                print(f"    [{subcat}] attempt {attempt+1}: {last_error}{shape}; head={head!r}")
+                time.sleep(min(2 ** attempt, 8))
                 continue
-            cleaned = sorted(set(
+            cleaned = sorted({
                 _normalize_value(v)
-                for v in parsed
+                for v in values
                 if isinstance(v, (str, int, float)) and str(v).strip()
-            ))
+            })
             cleaned = [c for c in cleaned if c and c not in _NOISE_VALUES]
+            if not cleaned:
+                last_error = "extracted list was empty after normalization"
+                print(f"    [{subcat}] attempt {attempt+1}: {last_error}, retrying...")
+                time.sleep(min(2 ** attempt, 8))
+                continue
             return cleaned
         except Exception as e:
-            print(f"    [{subcat}] attempt {attempt+1}: error: {e}")
-            time.sleep(2)
+            last_error = str(e)[:160]
+            print(f"    [{subcat}] attempt {attempt+1}: error: {last_error}")
+            time.sleep(min(2 ** attempt, 8))
+
+    print(
+        f"    [{subcat}] FAILED after {max_attempts} attempts ({last_error}); "
+        f"subcategory will be EMPTY in final schema"
+    )
     return []
-
-
-def _deterministic_trim_fallback(
-    subcat: str,
-    raw_values: list[str],
-    budget: int,
-) -> list[str]:
-    """
-    Last-resort fallback when the LLM fails entirely on a subcategory.
-    Returns the canonical enum if applicable; otherwise normalizes, strips noise,
-    dedups, and takes the first `budget` values alphabetically.
-    """
-    if subcat in _ENUM_CANONICAL:
-        return sorted(_ENUM_CANONICAL[subcat])
-    if subcat == "demographics_skin_type":
-        return sorted(_FITZPATRICK_TONES)
-    normalized = {
-        _normalize_value(v) for v in raw_values
-        if isinstance(v, (str, int, float)) and str(v).strip()
-    }
-    clean = sorted(v for v in normalized if v and v not in _NOISE_VALUES)
-    return clean[:budget]
 
 
 def _collapse_plurals_in_schema(
@@ -2027,20 +2091,21 @@ def consolidate_schema(
         }
         for fut in as_completed(future_to_subcat):
             subcat = future_to_subcat[fut]
-            budget = _SUBCATEGORY_BUDGETS.get(subcat, 12)
             try:
                 cleaned = fut.result()
             except Exception as e:
                 print(f"    [{subcat}] worker raised: {e}")
                 cleaned = []
-            if not cleaned:
-                cleaned = _deterministic_trim_fallback(subcat, raw[subcat], budget)
-                src = "deterministic fallback"
-            else:
-                src = "LLM"
-            print(f"    [{subcat}] {len(raw[subcat])} → {len(cleaned)} canonical values ({src})")
+            print(f"    [{subcat}] {len(raw[subcat])} → {len(cleaned)} canonical values (LLM)")
             if cleaned:
                 result[subcat] = cleaned
+
+    failed = [s for s in raw.keys() if s not in result or not result[s]]
+    if failed:
+        print(
+            f"  WARNING: {len(failed)} subcategor(ies) produced no values from the LLM "
+            f"after all retries: {failed}"
+        )
 
     # Post-pass 1: collapse plural/singular collisions deterministically.
     result, n_plural = _collapse_plurals_in_schema(result)
