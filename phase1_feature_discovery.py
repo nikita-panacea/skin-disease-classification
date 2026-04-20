@@ -1643,6 +1643,33 @@ OUTPUT — ONLY valid JSON, no markdown fences, no prose, same top-level shape a
 """
 
 
+# Per-subcategory soft budgets used for focused retries and deterministic fallback
+# when the LLM drops a subcategory from its single-shot response.
+_SUBCATEGORY_BUDGETS: dict[str, int] = {
+    "body_location": 55,
+    "clinical_signs": 15,
+    "demographics_age": 10,
+    "demographics_ethnicity": 10,
+    "demographics_sex": 3,
+    "demographics_skin_type": 6,
+    "duration": 6,
+    "history": 12,
+    "image_metadata": 6,
+    "lesion_count": 5,
+    "morphology_color": 12,
+    "morphology_distribution": 10,
+    "morphology_shape": 12,
+    "morphology_texture": 18,
+    "other": 8,
+    "secondary_changes": 12,
+    "severity": 4,
+    "symptoms_dermatological": 18,
+    "symptoms_systemic": 12,
+    "treatments": 18,
+    "triggers": 12,
+}
+
+
 # Hard-enumerated subcategories: LLM output for these MUST be drawn from the canonical
 # list below. Anything else is dropped by _enforce_enum_subcategories.
 _ENUM_CANONICAL: dict[str, list[str]] = {
@@ -1737,6 +1764,92 @@ def _enforce_enum_subcategories(
     return out, n_dropped
 
 
+_SINGLE_SUBCATEGORY_SYSTEM_PROMPT = """You consolidate a noisy list of raw dermatology feature values for ONE subcategory into a compact canonical vocabulary for a one-hot classifier.
+
+Aggressively merge plurals→singular, lexical variants, sub-regions into regions, compound phrases into head terms, and drop redundant qualifiers (area/region/skin/bilateral/both/left/right). Keep separate only clinically distinct concepts.
+
+For hard-enumerated subcategories use EXACTLY these canonical values (drop everything else):
+- demographics_age: ["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"]
+- duration: ["hours","days","weeks","months","years","chronic"]
+- lesion_count: ["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"]
+- severity: ["mild","moderate","severe","very_severe"]
+- demographics_sex: ["male","female","other"]
+- demographics_skin_type: prefer Fitzpatrick ["fst1","fst2","fst3","fst4","fst5","fst6"]; else descriptive tones
+
+For open subcategories stay AT OR BELOW the target budget. All values lowercase snake_case ASCII.
+
+OUTPUT: ONLY a JSON array of canonical values. No markdown fences, no prose, no keys.
+Example: ["male","female","other"]
+"""
+
+
+def _consolidate_single_subcategory(
+    subcat: str,
+    raw_values: list[str],
+    budget: int,
+) -> list[str]:
+    """
+    Focused follow-up consolidation for a single subcategory the main call dropped.
+    Returns a sorted deduplicated list of canonical values (possibly empty on failure).
+    """
+    body_json = json.dumps(raw_values, ensure_ascii=False, separators=(",", ":"))
+    user = (
+        f"Subcategory: {subcat}\n"
+        f"Target budget: AT MOST {budget} canonical values.\n"
+        f"Raw values ({len(raw_values)} total):\n{body_json}\n\n"
+        f"Return ONLY a JSON array of canonical values."
+    )
+    for attempt in range(2):
+        try:
+            text = call_llm(
+                user,
+                _SINGLE_SUBCATEGORY_SYSTEM_PROMPT,
+                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY,
+                openai_max_tokens=4096,
+            )
+            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
+            if isinstance(parsed, dict) and len(parsed) == 1:
+                val = next(iter(parsed.values()))
+                if isinstance(val, list):
+                    parsed = val
+            if not isinstance(parsed, list):
+                print(f"    Focused retry [{subcat}] attempt {attempt+1}: parse error, retrying...")
+                time.sleep(2)
+                continue
+            cleaned = sorted(set(
+                _normalize_value(v)
+                for v in parsed
+                if isinstance(v, (str, int, float)) and str(v).strip()
+            ))
+            cleaned = [c for c in cleaned if c and c not in _NOISE_VALUES]
+            return cleaned
+        except Exception as e:
+            print(f"    Focused retry [{subcat}] attempt {attempt+1}: error: {e}")
+            time.sleep(2)
+    return []
+
+
+def _deterministic_trim_fallback(
+    subcat: str,
+    raw_values: list[str],
+    budget: int,
+) -> list[str]:
+    """
+    Last-resort fallback when the LLM fails entirely on a subcategory.
+    Normalize, strip noise, dedup, and take the first `budget` alphabetically.
+    """
+    if subcat in _ENUM_CANONICAL:
+        return sorted(_ENUM_CANONICAL[subcat])
+    if subcat == "demographics_skin_type":
+        return sorted(_FITZPATRICK_TONES)
+    normalized = {
+        _normalize_value(v) for v in raw_values
+        if isinstance(v, (str, int, float)) and str(v).strip()
+    }
+    clean = sorted(v for v in normalized if v and v not in _NOISE_VALUES)
+    return clean[:budget]
+
+
 def consolidate_schema(
     all_features: dict[str, set[str]],
     n_captions_sampled: int = 0,
@@ -1747,6 +1860,11 @@ def consolidate_schema(
     enum-enforcement pass that drops non-canonical values from hard-enumerated subcategories
     (demographics_age/sex/skin_type, duration, lesion_count, severity) and strips global
     noise tokens (unknown/other/n_a/...) from every subcategory.
+
+    If the main single-shot LLM call silently drops any input subcategory, a focused
+    per-subcategory follow-up call is issued. If that also fails, a deterministic trim
+    fallback is used so no subcategory is ever missing from the final schema.
+
     Input:  {subcategory: set_of_values}  (raw discovery output)
     Output: {subcategory: sorted_list_of_canonical_values}
     """
@@ -1794,6 +1912,27 @@ def consolidate_schema(
                 f"  Consolidated (LLM): {total_vals} → {new_total} values "
                 f"in {len(result)} subcategories"
             )
+
+            missing = [s for s in raw.keys() if s not in result or not result[s]]
+            if missing:
+                print(
+                    f"  Missing/empty subcategories in LLM output: {missing} "
+                    f"— issuing focused per-subcategory retries..."
+                )
+                for subcat in missing:
+                    budget = _SUBCATEGORY_BUDGETS.get(subcat, 12)
+                    cleaned = _consolidate_single_subcategory(subcat, raw[subcat], budget)
+                    if not cleaned:
+                        cleaned = _deterministic_trim_fallback(subcat, raw[subcat], budget)
+                        print(
+                            f"    [{subcat}] focused retry failed — using deterministic fallback "
+                            f"({len(cleaned)} values)"
+                        )
+                    else:
+                        print(f"    [{subcat}] focused retry: {len(cleaned)} canonical values")
+                    if cleaned:
+                        result[subcat] = cleaned
+
             result, n_dropped = _enforce_enum_subcategories(result)
             final_total = sum(len(v) for v in result.values())
             if n_dropped:
