@@ -76,6 +76,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -1572,101 +1573,30 @@ def discover_all_features(sample_df: pd.DataFrame) -> dict[str, set[str]]:
 # STEP 3: Consolidation via LLM
 # ──────────────────────────────────────────────────────────────────────────────
 
-CONSOLIDATION_SYSTEM_PROMPT = """You deduplicate and standardize feature values for a dermatology classifier schema.
-
-You receive a JSON object mapping subcategory keys to lists of raw feature values collected from ~73k dermatology image captions and the SCIN questionnaire. The raw lists are very noisy (plurals, lexical variants, rare micro-anatomy, specific ages, compound phrases). Your job: produce a COMPACT, CLEAN canonical vocabulary per subcategory that a downstream one-hot classifier can use.
-
-GUIDING PRINCIPLE
-Consolidate toward a small canonical vocabulary per subcategory. Merge everything that is the same clinical concept (synonyms, lexical variants, plural/singular, sub-region of a named region, compound descriptive phrases). Keep separate ONLY what is clinically distinct (e.g. papule ≠ plaque, nail/fingernail ≠ finger, toenail ≠ toe, toe ≠ foot, pruritus → itching but itching ≠ burning).
-IMPORTANT NOTE: The output features (all subcategories) MUST be exhaustive list and cover all possible values in the raw input. So do not drop unique values in the raw input. DO NOT skip or omit any of the below subcategories.
-
-TARGET BUDGETS (approximate final count per subcategory — the TOTAL across all subcategories MUST be ~300):
-- body_location:            ≤ 55
-- clinical_signs:           ≤ 50
-- demographics_age:         EXACTLY the 10 bins listed below (rule 3)
-- demographics_ethnicity:   ≤ 10
-- demographics_sex:         EXACTLY ["male","female","other"]
-- demographics_skin_type:   EXACTLY ["fst1","fst2","fst3","fst4","fst5","fst6"] (prefer Fitzpatrick) OR ≤ 6 descriptive tones — not both
-- duration:                 EXACTLY ["hours","days","weeks","months","years","chronic"]
-- history:                  ≤ 20
-- image_metadata:           ≤ 6
-- lesion_count:             EXACTLY ["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"]
-- morphology_color:         ≤ 12
-- morphology_distribution:  ≤ 12
-- morphology_shape:         ≤ 12
-- morphology_texture:       ≤ 20
-- other:                    ≤ 20
-- secondary_changes:        ≤ 20
-- severity:                 EXACTLY ["mild","moderate","severe","very_severe"]
-- symptoms_dermatological:  ≤ 20
-- symptoms_systemic:        ≤ 20
-- treatments:               ≤ 20
-- triggers:                 ≤ 20
-
-If a subcategory's raw list is tiny (e.g. 3 values), keep what's there. If it's huge (e.g. body_location has 1000+), consolidate aggressively down to the budget.
-
-RULES
-
-1. MERGE aggressively within each subcategory. Collapse:
-   - Plural → singular: "papules"→"papule", "ankles"→"ankle", "fingernails"→"fingernail".
-   - Lexical/spelling variants: "hyperpigmentation"+"hyper_pigmented"→"hyperpigmented"; "erythema"+"erythematous"→"red"; "pruritus"+"pruritic"+"itch"+"itchy"→"itching".
-   - Compound descriptive phrases → their head term: "anterior aspect of thigh"→"thigh", "both ankles"→"ankle", "antecubital fossa"→"elbow", "zygomatic cheek"→"cheek", "abdominal skin"→"abdomen", "web spaces between fingers and toes"→"web_space".
-   - Sub-regions of a named region → the canonical region: "alar base"/"ala of nose"/"alar region"→"nose"; "nasal dorsum"/"bridge of nose"→"nose"; "anterior chest wall"→"chest"; "lateral thigh"→"thigh".
-   - Redundant qualifiers: drop "area", "region", "skin", "surface", "aspect", "side", "both", "bilateral", "left", "right" when the base term is already canonical.
-   - SCIN values merged with Derm-1M equivalents when they mean the same thing.
-
-2. KEEP separate only clinically distinct concepts:
-   - body_location: fingernail / toenail / nail ARE distinct from finger/toe/hand/foot. Lips, ear, nose, scalp, cheek, forehead, chin, eyelid are distinct from "face". Palm/sole distinct from hand/foot. Mucosa, genital, buttock, axilla, groin are their own sites. 
-                    Merge values like "foot" and "foot_top_side" into "foot".
-   - morphology: papule ≠ plaque ≠ nodule ≠ macule ≠ patch ≠ vesicle ≠ bulla ≠ pustule ≠ cyst ≠ tumor.
-   - secondary_changes: crust ≠ scale ≠ erosion ≠ ulcer ≠ fissure ≠ atrophy ≠ lichenification.
-
-3. ENUM SUBCATEGORIES — use EXACTLY these values (nothing else allowed):
-   - demographics_age → ["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"]. Map every specific age ("1-year-old", "2.5-year-old", "23-year-old", "42_yo", "infant_3_months", "newborn", "toddler", "child", "adult", "elderly") onto the appropriate bin. DO NOT output any raw age like "23-year-old" — only bin labels.
-   - duration → ["hours","days","weeks","months","years","chronic"]. Map "3_days"→"days", "2_weeks"→"weeks", "longstanding"/"persistent_for_10_years"→"chronic".
-   - lesion_count → ["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"].
-   - severity → ["mild","moderate","severe","very_severe"].
-   - demographics_sex → ["male","female","other"].
-   - demographics_skin_type → prefer Fitzpatrick ["fst1","fst2","fst3","fst4","fst5","fst6"] if ANY fst values appear in the raw input; otherwise up to 6 descriptive tones (e.g. "fair","medium","olive","brown","dark","deeply_pigmented").
-
-4. REMOVE noise entries: "other", "unknown", "various", "not_specified", "n_a", "none", "none_mentioned", "no_history", "no_treatment", "not_mentioned", and any value that is a disease name itself (belongs to the label, not the feature schema).
-
-5. SUGGESTED canonical body_location vocabulary (use these; add site-specific ones from raw input only if clinically distinct):
-   scalp, hairline, forehead, temple, face, eyebrow, eyelid, periorbital, nose, nostril, cheek, ear, earlobe, lip, oral_mucosa, tongue, chin, jaw, neck, nape, shoulder, axilla, chest, breast, back, abdomen, flank, groin, genital, perineum, buttock, arm, elbow, forearm, wrist, hand, palm, dorsum_hand, knuckle, finger, fingernail, web_space, thigh, knee, shin, calf, ankle, foot, sole, heel, dorsum_foot, toe, toenail, nail, trunk, extremity, generalized, flexural, acral, mucosa
-
-6. STANDARDIZE all values to lowercase snake_case ASCII. Hyphens only for numeric range bins ("0-5", "80-plus").
-
-7. DO NOT move values between subcategories; DO NOT add new subcategory keys.
-
-OUTPUT — ONLY valid JSON, no markdown fences, no prose, same top-level shape as input:
-{"demographics_age":["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"],"demographics_sex":["male","female","other"],"severity":["mild","moderate","severe","very_severe"],"body_location":["scalp","forehead","face","cheek","nose","lip","ear","chin","neck","chest","back","abdomen","groin","axilla","arm","elbow","forearm","wrist","hand","palm","finger","fingernail","nail","web_space","thigh","knee","shin","ankle","foot","sole","toe","toenail","trunk","extremity","generalized"], ...}
-"""
-
-
-# Per-subcategory soft budgets used for focused retries and deterministic fallback
-# when the LLM drops a subcategory from its single-shot response.
+# Per-subcategory soft budgets used by the per-subcategory LLM consolidator and
+# the deterministic fallback. Tuning these lets you nudge the total feature count.
 _SUBCATEGORY_BUDGETS: dict[str, int] = {
     "body_location": 55,
-    "clinical_signs": 15,
+    "clinical_signs": 25,
     "demographics_age": 10,
     "demographics_ethnicity": 10,
     "demographics_sex": 3,
     "demographics_skin_type": 6,
     "duration": 6,
-    "history": 12,
+    "history": 20,
     "image_metadata": 6,
     "lesion_count": 5,
-    "morphology_color": 12,
-    "morphology_distribution": 10,
-    "morphology_shape": 12,
-    "morphology_texture": 18,
-    "other": 8,
-    "secondary_changes": 12,
+    "morphology_color": 15,
+    "morphology_distribution": 15,
+    "morphology_shape": 15,
+    "morphology_texture": 20,
+    "other": 25,
+    "secondary_changes": 20,
     "severity": 4,
-    "symptoms_dermatological": 18,
-    "symptoms_systemic": 12,
-    "treatments": 18,
-    "triggers": 12,
+    "symptoms_dermatological": 25,
+    "symptoms_systemic": 25,
+    "treatments": 25,
+    "triggers": 25,
 }
 
 
@@ -1764,23 +1694,188 @@ def _enforce_enum_subcategories(
     return out, n_dropped
 
 
+# Per-subcategory consolidation: a fixed system prompt (cacheable across all calls)
+# plus a per-subcategory user prompt with subcategory-specific guidance and raw values.
 _SINGLE_SUBCATEGORY_SYSTEM_PROMPT = """You consolidate a noisy list of raw dermatology feature values for ONE subcategory into a compact canonical vocabulary for a one-hot classifier.
 
-Aggressively merge plurals→singular, lexical variants, sub-regions into regions, compound phrases into head terms, and drop redundant qualifiers (area/region/skin/bilateral/both/left/right). Keep separate only clinically distinct concepts.
+YOUR JOB
+You receive (in the user message): the subcategory name, an optional canonical vocabulary hint, a budget (max number of canonical values to output), and a JSON array of raw values. Produce a clean canonical list AT OR BELOW the budget.
 
-For hard-enumerated subcategories use EXACTLY these canonical values (drop everything else):
-- demographics_age: ["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"]
-- duration: ["hours","days","weeks","months","years","chronic"]
-- lesion_count: ["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"]
-- severity: ["mild","moderate","severe","very_severe"]
-- demographics_sex: ["male","female","other"]
-- demographics_skin_type: prefer Fitzpatrick ["fst1","fst2","fst3","fst4","fst5","fst6"]; else descriptive tones
+CONSOLIDATION RULES
+1. Aggressively MERGE:
+   - Plural → singular: "papules"→"papule", "ankles"→"ankle", "fingernails"→"fingernail", "ulcers"→"ulcer". NEVER output both the singular and the plural form.
+   - Lexical/spelling variants: "hyperpigmentation"+"hyper_pigmented"→"hyperpigmented"; "erythema"+"erythematous"→"red"; "pruritus"+"pruritic"+"itch"+"itchy"→"itching".
+   - Compound descriptive phrases → head term: "anterior aspect of thigh"→"thigh", "both ankles"→"ankle", "antecubital fossa"→"elbow", "abdominal skin"→"abdomen", "web spaces between fingers and toes"→"web_space".
+   - Sub-regions of a named region → canonical region: "alar base"/"ala of nose"/"alar region"→"nose"; "anterior chest wall"→"chest"; "lateral thigh"→"thigh".
+   - Drop redundant qualifiers: "area", "region", "skin", "surface", "aspect", "side", "both", "bilateral", "left", "right".
+   - Specific drug/item names → their class (e.g. "tacrolimus"→"calcineurin_inhibitor", "doxycycline"→"antibiotic_oral", "perfume"→"irritant_chemical").
 
-For open subcategories stay AT OR BELOW the target budget. All values lowercase snake_case ASCII.
+2. KEEP SEPARATE only clinically distinct concepts:
+   - body_location: nail / fingernail / toenail /  are distinct from finger/toe/hand/foot. Lip / ear / nose / scalp / cheek / forehead / chin / eyelid are distinct from face. Palm / sole distinct from hand / foot.
+   - morphology: papule ≠ plaque ≠ nodule ≠ macule ≠ patch ≠ vesicle ≠ bulla ≠ pustule ≠ cyst ≠ tumor.
 
-OUTPUT: ONLY a JSON array of canonical values. No markdown fences, no prose, no keys.
-Example: ["male","female","other"]
+3. ENUM SUBCATEGORIES — output EXACTLY values from the canonical vocabulary the user provides; drop anything else (including raw exact ages like "23-year-old", raw durations like "3_days", etc.).
+
+4. REMOVE noise: "other", "unknown", "various", "not_specified", "n_a", "none", "none_mentioned", and any value that is a disease name (belongs to the label, not the feature).
+
+5. STANDARDIZE all values to lowercase snake_case ASCII. Hyphens only for numeric range bins ("0-5", "80-plus").
+
+OUTPUT FORMAT
+Return ONLY a JSON array of canonical values. No markdown fences, no prose, no keys, no explanation.
+Example for demographics_sex: ["female","male","other"]
+Example for body_location: ["abdomen","ankle","arm","back","cheek","chest","ear","eyelid","face","finger","fingernail","forehead","hand","knee","lip","nail","neck","nose","palm","scalp","sole","thigh","toe","toenail"]
 """
+
+
+# Per-subcategory canonical vocabulary hints. Sent in the USER message so the SYSTEM
+# prompt stays identical across all calls (maximizes prompt-cache hit rate).
+# These are anchors, not hard limits — the LLM may add other distinct values from raw.
+_SUBCATEGORY_GUIDANCE: dict[str, str] = {
+    "body_location": (
+        "SUGGESTED canonical sites (use as anchors; add only clinically distinct sites from raw input):\n"
+        "scalp, hairline, forehead, temple, face, eyebrow, eyelid, periorbital, "
+        "nose, nostril, cheek, ear, earlobe, lip, upper_lip, lower_lip, "
+        "oral_mucosa, tongue, chin, jaw, neck, nape, shoulder, axilla, "
+        "chest, breast, back, abdomen, flank, groin, genital, perineum, buttock, "
+        "arm, elbow, forearm, wrist, hand, palm, dorsum_hand, knuckle, finger, fingernail, web_space, "
+        "thigh, knee, shin, calf, ankle, foot, sole, heel, dorsum_foot, toe, toenail, nail, "
+        "trunk, extremity, generalized, flexural, acral, mucosa\n"
+        "Keep nail / fingernail / toenail separate from finger / toe / hand / foot. "
+        "Keep cheek / lip / nose / ear / scalp / forehead / chin / eyelid separate from face."
+    ),
+    "treatments": (
+        "SUGGESTED canonical treatment classes (map specific drug names to a class):\n"
+        "topical_steroid, oral_steroid, intralesional_steroid, "
+        "topical_antibiotic, oral_antibiotic, topical_antifungal, oral_antifungal, antiviral, "
+        "antihistamine, immunosuppressant, biologic, "
+        "topical_retinoid, oral_retinoid, calcineurin_inhibitor, "
+        "phototherapy, laser, cryotherapy, surgical_excision, "
+        "emollient, salicylic_acid, benzoyl_peroxide, supportive_care\n"
+        "Examples: 'tacrolimus'→'calcineurin_inhibitor', 'doxycycline'→'oral_antibiotic', "
+        "'isotretinoin'→'oral_retinoid', 'clobetasol'→'topical_steroid'."
+    ),
+    "triggers": (
+        "SUGGESTED canonical trigger categories (map specific items to a class):\n"
+        "heat, sweat, sunlight, cold, friction, pressure, "
+        "contact_allergen, food_allergen, drug_allergen, medication, "
+        "irritant_chemical, infection, stress, hormonal, occupational, "
+        "smoking, alcohol, environmental, mechanical_trauma, dietary\n"
+        "Examples: 'perfume'→'irritant_chemical', 'peanut'→'food_allergen', "
+        "'exercise'→'sweat', 'detergent'→'irritant_chemical'."
+    ),
+    "symptoms_dermatological": (
+        "SUGGESTED canonical skin symptoms:\n"
+        "itching, burning, stinging, pain, tenderness, soreness, tingling, numbness, "
+        "dryness, oiliness, bleeding, oozing, crusting, scaling, swelling, redness, warmth, "
+        "hair_loss, nail_change"
+    ),
+    "symptoms_systemic": (
+        "SUGGESTED canonical systemic symptoms:\n"
+        "fever, chills, fatigue, malaise, headache, nausea, joint_pain, muscle_pain, "
+        "lymphadenopathy, weight_loss, night_sweats, gastrointestinal_symptoms"
+    ),
+    "morphology_color": (
+        "SUGGESTED canonical colors:\n"
+        "red, pink, brown, yellow, white, black, gray, violaceous, blue, "
+        "hyperpigmented, hypopigmented, depigmented, skin_colored\n"
+        "Merge 'erythema'/'erythematous'→'red'."
+    ),
+    "morphology_texture": (
+        "SUGGESTED canonical textures:\n"
+        "smooth, rough, scaly, crusted, eroded, ulcerated, fissured, lichenified, "
+        "atrophic, indurated, edematous, vesicular, pustular, papular, nodular, "
+        "verrucous, keratotic, dry, moist"
+    ),
+    "morphology_shape": (
+        "SUGGESTED canonical shapes:\n"
+        "round, oval, linear, annular, polygonal, irregular, serpiginous, reticular, "
+        "target_like, geographic, well_defined, ill_defined"
+    ),
+    "morphology_distribution": (
+        "SUGGESTED canonical distributions:\n"
+        "localized, generalized, symmetric, asymmetric, unilateral, bilateral, "
+        "dermatomal, photodistributed, flexural, extensor, acral, follicular"
+    ),
+    "secondary_changes": (
+        "SUGGESTED canonical secondary changes:\n"
+        "crust, scale, erosion, ulcer, fissure, atrophy, lichenification, scar, "
+        "hyperkeratosis, excoriation, post_inflammatory_hyperpigmentation, post_inflammatory_hypopigmentation"
+    ),
+    "clinical_signs": (
+        "SUGGESTED canonical clinical signs:\n"
+        "auspitz_sign, koebner_phenomenon, nikolsky_sign, darier_sign, dermographism, "
+        "wickham_striae, target_lesion, herald_patch, christmas_tree_pattern, "
+        "satellite_lesion, milia, comedone, telangiectasia, follicular_plugging, blanching"
+    ),
+    "history": (
+        "SUGGESTED canonical history items:\n"
+        "recurrent, persistent, progressive, intermittent, recent_onset, family_history, "
+        "atopy_history, allergy_history, prior_treatment, immunosuppression, "
+        "comorbidity, sun_exposure_history"
+    ),
+    "demographics_ethnicity": (
+        "SUGGESTED canonical ethnicities:\n"
+        "caucasian, african, hispanic, asian, middle_eastern, south_asian, "
+        "mixed, indigenous, pacific_islander, other_ethnicity"
+    ),
+    "image_metadata": (
+        "SUGGESTED canonical image metadata:\n"
+        "dermoscopic, clinical_photo, close_up, wide_view, magnified, low_resolution"
+    ),
+    "other": (
+        "SUGGESTED canonical 'other' features:\n"
+        "recurrence, complication, response_to_treatment, biopsy_finding, "
+        "dermatoscopy_finding, comorbidity, secondary_infection, scarring_outcome"
+    ),
+    # Hard enums — list the only allowed values; the LLM must drop everything else.
+    "demographics_age": (
+        "ENUM ONLY — output values from this exact list (drop everything else, including "
+        "specific ages like '23-year-old' or descriptive bands like 'adult'/'elderly'):\n"
+        '["0-5","5-10","10-20","20-30","30-40","40-50","50-60","60-70","70-80","80-plus"]'
+    ),
+    "demographics_sex": (
+        'ENUM ONLY — output values from this exact list: ["male","female","other"]'
+    ),
+    "demographics_skin_type": (
+        "ENUM ONLY — prefer Fitzpatrick if any 'fst' values appear in raw input "
+        '(["fst1","fst2","fst3","fst4","fst5","fst6"]); otherwise descriptive tones '
+        '(["fair","light","medium","olive","brown","dark","deeply_pigmented"]). '
+        "Do not mix the two scales."
+    ),
+    "duration": (
+        'ENUM ONLY — output values from this exact list (drop specific durations like "3_days"): '
+        '["hours","days","weeks","months","years","chronic"]'
+    ),
+    "lesion_count": (
+        "ENUM ONLY — output values from this exact list: "
+        '["single","few_2_to_5","multiple_6_to_20","many_20_plus","numerous"]'
+    ),
+    "severity": (
+        'ENUM ONLY — output values from this exact list: ["mild","moderate","severe","very_severe"]'
+    ),
+}
+
+
+def _build_per_subcategory_user_prompt(
+    subcat: str,
+    raw_values: list[str],
+    budget: int,
+) -> str:
+    guidance = _SUBCATEGORY_GUIDANCE.get(subcat, "")
+    body_json = json.dumps(raw_values, ensure_ascii=False, separators=(",", ":"))
+    parts = [
+        f"Subcategory: {subcat}",
+        f"Target budget: AT MOST {budget} canonical values.",
+    ]
+    if guidance:
+        parts.append("")
+        parts.append(guidance)
+    parts.append("")
+    parts.append(f"Raw values ({len(raw_values)} total):")
+    parts.append(body_json)
+    parts.append("")
+    parts.append("Return ONLY a JSON array of canonical values. No keys, no prose.")
+    return "\n".join(parts)
 
 
 def _consolidate_single_subcategory(
@@ -1789,16 +1884,11 @@ def _consolidate_single_subcategory(
     budget: int,
 ) -> list[str]:
     """
-    Focused follow-up consolidation for a single subcategory the main call dropped.
+    Consolidate ONE subcategory via a focused LLM call with subcategory-specific guidance.
     Returns a sorted deduplicated list of canonical values (possibly empty on failure).
     """
-    body_json = json.dumps(raw_values, ensure_ascii=False, separators=(",", ":"))
-    user = (
-        f"Subcategory: {subcat}\n"
-        f"Target budget: AT MOST {budget} canonical values.\n"
-        f"Raw values ({len(raw_values)} total):\n{body_json}\n\n"
-        f"Return ONLY a JSON array of canonical values."
-    )
+    user = _build_per_subcategory_user_prompt(subcat, raw_values, budget)
+
     for attempt in range(2):
         try:
             text = call_llm(
@@ -1813,7 +1903,7 @@ def _consolidate_single_subcategory(
                 if isinstance(val, list):
                     parsed = val
             if not isinstance(parsed, list):
-                print(f"    Focused retry [{subcat}] attempt {attempt+1}: parse error, retrying...")
+                print(f"    [{subcat}] attempt {attempt+1}: parse error, retrying...")
                 time.sleep(2)
                 continue
             cleaned = sorted(set(
@@ -1824,7 +1914,7 @@ def _consolidate_single_subcategory(
             cleaned = [c for c in cleaned if c and c not in _NOISE_VALUES]
             return cleaned
         except Exception as e:
-            print(f"    Focused retry [{subcat}] attempt {attempt+1}: error: {e}")
+            print(f"    [{subcat}] attempt {attempt+1}: error: {e}")
             time.sleep(2)
     return []
 
@@ -1836,7 +1926,8 @@ def _deterministic_trim_fallback(
 ) -> list[str]:
     """
     Last-resort fallback when the LLM fails entirely on a subcategory.
-    Normalize, strip noise, dedup, and take the first `budget` alphabetically.
+    Returns the canonical enum if applicable; otherwise normalizes, strips noise,
+    dedups, and takes the first `budget` values alphabetically.
     """
     if subcat in _ENUM_CANONICAL:
         return sorted(_ENUM_CANONICAL[subcat])
@@ -1850,109 +1941,127 @@ def _deterministic_trim_fallback(
     return clean[:budget]
 
 
+def _collapse_plurals_in_schema(
+    schema: dict[str, list[str]],
+) -> tuple[dict[str, list[str]], int]:
+    """
+    Deterministic plural-vs-singular collision resolver. For each subcategory, if both
+    a plural form and its singular form are present, drop the plural and keep the singular.
+    Handles -s, -es, -ies, -ches/-shes/-xes/-zes patterns. Conservative: only drops a value
+    when its singular candidate is also present in the same subcategory.
+    """
+    out: dict[str, list[str]] = {}
+    n_dropped = 0
+
+    def _singular_candidates(v: str) -> list[str]:
+        cands: list[str] = []
+        if len(v) > 3 and v.endswith("ies"):
+            cands.append(v[:-3] + "y")
+        if len(v) > 4 and (v.endswith("ches") or v.endswith("shes") or v.endswith("xes") or v.endswith("zes")):
+            cands.append(v[:-2])
+        if len(v) > 2 and v.endswith("es") and not v.endswith("ses"):
+            cands.append(v[:-2])
+            cands.append(v[:-1])
+        if len(v) > 1 and v.endswith("s") and not v.endswith("ss") and not v.endswith("us"):
+            cands.append(v[:-1])
+        return cands
+
+    for subcat, vals in schema.items():
+        present = set(vals)
+        kept: list[str] = []
+        dropped_here: list[str] = []
+        for v in vals:
+            singulars = _singular_candidates(v)
+            if any(s in present and s != v for s in singulars):
+                dropped_here.append(v)
+                continue
+            kept.append(v)
+        if dropped_here:
+            n_dropped += len(dropped_here)
+            preview = ", ".join(dropped_here[:6])
+            ellipsis = f" ... +{len(dropped_here) - 6} more" if len(dropped_here) > 6 else ""
+            print(f"    Plural collapse [{subcat}]: dropped {len(dropped_here)} plural form(s): {preview}{ellipsis}")
+        out[subcat] = sorted(set(kept))
+    return out, n_dropped
+
+
 def consolidate_schema(
     all_features: dict[str, set[str]],
     n_captions_sampled: int = 0,
     n_disease_classes: int = 0,
 ) -> dict[str, list[str]]:
     """
-    Deduplicate feature values within each subcategory via LLM, then run a deterministic
-    enum-enforcement pass that drops non-canonical values from hard-enumerated subcategories
-    (demographics_age/sex/skin_type, duration, lesion_count, severity) and strips global
-    noise tokens (unknown/other/n_a/...) from every subcategory.
+    Per-subcategory parallel consolidation via the LLM.
 
-    If the main single-shot LLM call silently drops any input subcategory, a focused
-    per-subcategory follow-up call is issued. If that also fails, a deterministic trim
-    fallback is used so no subcategory is ever missing from the final schema.
+    For each subcategory, dispatch a focused LLM call with subcategory-specific
+    canonical-vocabulary guidance and a target budget. Calls run in parallel (the system
+    prompt is identical across calls so OpenAI prompt-caching kicks in for free).
+    Failures fall back to a deterministic trim. Final passes:
+      - _collapse_plurals_in_schema  (drop plural if singular also present)
+      - _enforce_enum_subcategories  (enforce hard enums + strip noise)
 
     Input:  {subcategory: set_of_values}  (raw discovery output)
     Output: {subcategory: sorted_list_of_canonical_values}
     """
     raw: dict[str, list[str]] = {k: sorted(v) for k, v in all_features.items()}
     total_vals = sum(len(v) for v in raw.values())
+    n_subcats = len(raw)
     print(
-        f"  Sending {total_vals} raw values in {len(raw)} subcategories for consolidation..."
+        f"  Consolidating {total_vals} raw values across {n_subcats} subcategories "
+        f"(per-subcategory parallel LLM calls; sampled {n_captions_sampled:,} captions / "
+        f"{n_disease_classes} disease classes)..."
     )
 
-    body = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
-    user = (
-        f"Consolidate this dermatology feature schema ({total_vals} total values "
-        f"across {len(raw)} subcategories), extracted from {n_captions_sampled:,} captions "
-        f"across {n_disease_classes} disease classes.\n\n"
-        f"JSON:\n{body}"
-    )
+    result: dict[str, list[str]] = {}
+    max_workers = min(8, n_subcats) or 1
 
-    for attempt in range(3):
-        try:
-            text = call_llm(
-                user,
-                CONSOLIDATION_SYSTEM_PROMPT,
-                openai_prompt_cache_key=OPENAI_CONSOLIDATION_PROMPT_CACHE_KEY,
-                openai_max_tokens=OPENAI_CONSOLIDATION_MAX_TOKENS,
-            )
-            parsed = parse_llm_json(text, debug=LLM_PARSE_DEBUG)
-            if not isinstance(parsed, dict):
-                print(f"  Consolidation parse error (attempt {attempt+1}), retrying...")
-                time.sleep(3)
-                continue
-            result: dict[str, list[str]] = {}
-            for key, vals in parsed.items():
-                k = str(key).strip().lower().replace(" ", "_")
-                if not k or not isinstance(vals, list):
-                    continue
-                clean = sorted(set(
-                    str(v).strip().lower().replace(" ", "_")
-                    for v in vals
-                    if isinstance(v, (str, int, float)) and str(v).strip()
-                ))
-                if clean:
-                    result[k] = clean
-            new_total = sum(len(v) for v in result.values())
-            print(
-                f"  Consolidated (LLM): {total_vals} → {new_total} values "
-                f"in {len(result)} subcategories"
-            )
-
-            missing = [s for s in raw.keys() if s not in result or not result[s]]
-            if missing:
-                print(
-                    f"  Missing/empty subcategories in LLM output: {missing} "
-                    f"— issuing focused per-subcategory retries..."
-                )
-                for subcat in missing:
-                    budget = _SUBCATEGORY_BUDGETS.get(subcat, 12)
-                    cleaned = _consolidate_single_subcategory(subcat, raw[subcat], budget)
-                    if not cleaned:
-                        cleaned = _deterministic_trim_fallback(subcat, raw[subcat], budget)
-                        print(
-                            f"    [{subcat}] focused retry failed — using deterministic fallback "
-                            f"({len(cleaned)} values)"
-                        )
-                    else:
-                        print(f"    [{subcat}] focused retry: {len(cleaned)} canonical values")
-                    if cleaned:
-                        result[subcat] = cleaned
-
-            result, n_dropped = _enforce_enum_subcategories(result)
-            final_total = sum(len(v) for v in result.values())
-            if n_dropped:
-                print(
-                    f"  Enum cleanup: dropped {n_dropped} non-canonical value(s) "
-                    f"→ final: {final_total} values across {len(result)} subcategories"
-                )
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_subcat = {
+            ex.submit(
+                _consolidate_single_subcategory,
+                subcat,
+                raw[subcat],
+                _SUBCATEGORY_BUDGETS.get(subcat, 12),
+            ): subcat
+            for subcat in raw.keys()
+        }
+        for fut in as_completed(future_to_subcat):
+            subcat = future_to_subcat[fut]
+            budget = _SUBCATEGORY_BUDGETS.get(subcat, 12)
+            try:
+                cleaned = fut.result()
+            except Exception as e:
+                print(f"    [{subcat}] worker raised: {e}")
+                cleaned = []
+            if not cleaned:
+                cleaned = _deterministic_trim_fallback(subcat, raw[subcat], budget)
+                src = "deterministic fallback"
             else:
-                print(f"  Enum cleanup: OK — no non-canonical values found "
-                      f"({final_total} final values)")
-            return result
-        except json.JSONDecodeError:
-            print(f"  Consolidation JSON parse error (attempt {attempt+1}), retrying...")
-            time.sleep(3)
-        except Exception as e:
-            print(f"  Consolidation API error (attempt {attempt+1}): {e}")
-            time.sleep(3)
+                src = "LLM"
+            print(f"    [{subcat}] {len(raw[subcat])} → {len(cleaned)} canonical values ({src})")
+            if cleaned:
+                result[subcat] = cleaned
 
-    print("  WARNING: All consolidation attempts failed; using raw deduplicated values.")
-    return {k: sorted(v) for k, v in all_features.items()}
+    # Post-pass 1: collapse plural/singular collisions deterministically.
+    result, n_plural = _collapse_plurals_in_schema(result)
+    if n_plural:
+        print(f"  Plural collapse: dropped {n_plural} plural form(s) where singular was present")
+
+    # Post-pass 2: enforce hard-enumerated subcategories + global noise strip.
+    result, n_dropped = _enforce_enum_subcategories(result)
+    final_total = sum(len(v) for v in result.values())
+    if n_dropped:
+        print(
+            f"  Enum cleanup: dropped {n_dropped} non-canonical value(s) "
+            f"→ final: {final_total} values across {len(result)} subcategories"
+        )
+    else:
+        print(
+            f"  Enum cleanup: OK — no non-canonical values found "
+            f"({final_total} final values across {len(result)} subcategories)"
+        )
+
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
