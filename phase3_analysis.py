@@ -151,18 +151,38 @@ def compare_derm_vs_scin(
 # ANALYSIS 3: Disease Class-wise Feature Importance
 # ──────────────────────────────────────────────────────────────────────────────
 def _cramers_v_from_table(observed: np.ndarray) -> tuple[float, float, float]:
-    """Return (chi2, p_value, cramers_v). Cramér's V in [0,1] for effect size."""
-    chi2, p, dof, expected = chi2_contingency(observed)
-    n = observed.sum()
-    r, k = observed.shape
-    if n <= 0 or min(r, k) < 2:
-        return float(chi2), float(p), 0.0
+    """
+    Return (chi2, p_value, cramers_v). Cramér's V in [0,1] for effect size.
+
+    Drops rows/columns with zero marginal before calling chi2_contingency
+    (scipy refuses to compute expected frequencies when any marginal is 0),
+    and degrades gracefully on degenerate tables.
+    """
+    obs = np.asarray(observed, dtype=float)
+    if obs.ndim != 2 or obs.size == 0:
+        return 0.0, 1.0, 0.0
+
+    row_sums = obs.sum(axis=1)
+    col_sums = obs.sum(axis=0)
+    obs = obs[row_sums > 0][:, col_sums > 0]
+    if obs.size == 0 or min(obs.shape) < 2:
+        return 0.0, 1.0, 0.0
+
+    n = float(obs.sum())
+    if n <= 0:
+        return 0.0, 1.0, 0.0
+
+    try:
+        chi2, p, dof, expected = chi2_contingency(obs)
+    except ValueError:
+        return 0.0, 1.0, 0.0
+
+    r, k = obs.shape
     denom = n * (min(r, k) - 1)
-    if denom <= 0:
-        return float(chi2), float(p), 0.0
-    v = np.sqrt(chi2 / denom)
-    v = min(float(v), 1.0)
-    return float(chi2), float(p), v
+    v = float(np.sqrt(chi2 / denom)) if denom > 0 else 0.0
+    v = min(v, 1.0)
+    p_out = float(p) if np.isfinite(p) else 1.0
+    return float(chi2), p_out, v
 
 
 def compute_feature_importance(
