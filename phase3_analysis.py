@@ -595,20 +595,20 @@ def generate_eda_summary_tables(
 ):
     """Generate summary tables for EDA."""
 
-    # 1. Overall feature statistics
+    # 1. Overall feature statistics (cast numpy scalars → native Python for JSON)
     stats = {
-        "total_records": len(df),
-        "total_features": len(feature_cols),
-        "total_diseases": df[label_col].nunique(),
-        "label_col_used": label_col,
-        "mean_informativeness": coverage_df["informativeness"].mean(),
-        "median_informativeness": coverage_df["informativeness"].median(),
-        "features_with_>50%_informativeness": (coverage_df["informativeness"] > 50).sum(),
-        "features_with_<10%_informativeness": (coverage_df["informativeness"] < 10).sum(),
+        "total_records": int(len(df)),
+        "total_features": int(len(feature_cols)),
+        "total_diseases": int(df[label_col].nunique()),
+        "label_col_used": str(label_col),
+        "mean_informativeness": float(coverage_df["informativeness"].mean()),
+        "median_informativeness": float(coverage_df["informativeness"].median()),
+        "features_with_>50%_informativeness": int((coverage_df["informativeness"] > 50).sum()),
+        "features_with_<10%_informativeness": int((coverage_df["informativeness"] < 10).sum()),
     }
-    
+
     with open(EDA_DIR / "eda_summary_stats.json", "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump(stats, f, indent=2, default=str)
     print(f"  Saved EDA summary stats to {EDA_DIR / 'eda_summary_stats.json'}")
     
     # 2. Top 20 most informative features
