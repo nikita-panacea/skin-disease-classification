@@ -132,7 +132,19 @@ def compare_derm_vs_scin(
             "gap":                 round(derm_info - scin_avail, 2),
         })
 
-    cmp_df = pd.DataFrame(rows).sort_values("gap", ascending=False)
+    columns = [
+        "canonical_feature", "scin_column",
+        "derm1m_pct_informed", "scin_pct_available", "gap",
+    ]
+    if not rows:
+        print(
+            "  WARNING: no overlap between SCIN_TO_CANONICAL values and feature_cols; "
+            "update scin_feature_map.SCIN_TO_CANONICAL to match current feature_schema.json. "
+            "Returning empty comparison frame."
+        )
+        return pd.DataFrame(columns=columns)
+
+    cmp_df = pd.DataFrame(rows, columns=columns).sort_values("gap", ascending=False)
     return cmp_df
 
 # ──────────────────────────────────────────────────────────────────────────────
