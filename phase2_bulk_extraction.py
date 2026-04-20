@@ -3,7 +3,9 @@ PHASE 2: Bulk Feature Extraction (LLM) — Cost-Optimized
 =======================================================
 Strategy:
   - Deduplicate captions first: only process ~72K unique captions instead of ~182K rows.
-  - Use numeric feature indices (0-N) with sparse output format to minimize output tokens.
+  - Use per-category name-based JSON output (only categories the caption mentions).
+    Omitted categories decode to 2 (unknown); listed values → 1; other values in a
+    mentioned category → 0.
   - Category-aware encoding: 0=absent/inferably absent, 1=present, 2=truly unknown.
   - Prompt caching: static system prompt (>1024 tokens) cached across all API calls.
   - Batch API: 50% cost discount on all token rates.
@@ -76,7 +78,7 @@ LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")
 
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "1").lower() in ("1", "true", "yes")
-OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase2_extraction_v1").strip()
+OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase2_extraction_v2_per_category").strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
 
 _EXTENDED_CACHE_MODELS = frozenset({
@@ -224,7 +226,7 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int,
         "batch_api_cost_usd": round(total * 0.5, 4),
     }
 RATE_LIMIT_SLEEP = 0.1 if LLM_PROVIDER == "qwen" else 0.5
-DEDUP_CKPT_FILE  = "dedup_caption_features.json"
+DEDUP_CKPT_FILE  = "dedup_caption_features_v2.json"
 
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
@@ -705,78 +707,108 @@ def build_category_groups(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM EXTRACTION — SYSTEM PROMPT (indices + sparse + category-aware encoding)
+# LLM EXTRACTION — SYSTEM PROMPT (per-category, name-based, strict literal)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Design:
+#   The LLM outputs ONLY the canonical values it EXPLICITLY READS in each caption,
+#   grouped by category: {"morphology_color":["red"], "body_location":["forearm"]}.
+#
+#   Decoding rules (applied in `parse_extraction_response_text`):
+#     • Category PRESENT in output → listed values = 1, other features in the
+#       same category = 0 (inferably absent).
+#     • Category OMITTED from output → every feature in that category = 2
+#       (truly unknown — caption said nothing about it).
+#
+#   Benefits vs. the previous index-based scheme:
+#     • No cross-category index leakage (was producing phantom body_location=1).
+#     • "Only mark what is literally in the caption" becomes a single strict rule.
+#     • Unknown-vs-absent semantics collapse to a single question per category:
+#       "Is the category mentioned at all?"
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _format_vocabulary_for_prompt(
+    all_feature_names: list[str],
+    feature_categories: dict[str, str],
+) -> str:
+    """Render the per-category canonical vocabulary block for the system prompt."""
+    by_cat: dict[str, list[str]] = defaultdict(list)
+    for name in all_feature_names:
+        cat = feature_categories.get(name, "other")
+        val = name[len(cat) + 1:] if name.startswith(cat + "_") else name
+        by_cat[cat].append(val)
+
+    lines = []
+    for cat in sorted(by_cat):
+        vals = sorted(by_cat[cat])
+        lines.append(f"  {cat}: [{', '.join(vals)}]")
+    return "\n".join(lines)
+
 
 def build_llm_system_prompt(
     all_feature_names: list[str],
     feature_categories: dict[str, str],
 ) -> str:
     """
-    Build the extraction system prompt with:
-    - Numeric feature index map (0..N-1)
-    - Category groups for encoding inference
-    - Category-aware 0/1/2 encoding rules
-    - Sparse output format: {"1":[indices], "2":[indices]}
+    Strict, name-based, per-category extraction prompt.
+
+    Output shape per caption (sparse — only categories that the caption mentions):
+        {"morphology_color":["red"], "symptoms_dermatological":["itching"]}
+    Omitted categories decode to value 2 (unknown).
     """
-    n_feat = len(all_feature_names)
+    vocab_block = _format_vocabulary_for_prompt(all_feature_names, feature_categories)
 
-    index_lines = [f"{i}: {name}" for i, name in enumerate(all_feature_names)]
-    index_map_str = "\n".join(index_lines)
+    return f"""You are a clinical dermatology NLP specialist performing STRICT, LITERAL feature extraction from skin-condition image captions.
 
-    cat_groups = build_category_groups(all_feature_names, feature_categories)
-    group_lines = []
-    for gname, indices in sorted(cat_groups.items()):
-        sample_names = [all_feature_names[i] for i in indices[:4]]
-        suffix = ", ..." if len(indices) > 4 else ""
-        group_lines.append(
-            f"  {gname} (indices {indices[0]}-{indices[-1]}, {len(indices)} features): "
-            f"{', '.join(sample_names)}{suffix}"
-        )
-    groups_str = "\n".join(group_lines)
+TASK
+For EACH input caption, output ONE JSON OBJECT whose KEYS are CATEGORY names and whose VALUES are lists of CANONICAL FEATURE VALUES (from the vocabulary below) that are EXPLICITLY described in that caption. Return one object per caption inside a JSON array, in input order.
 
-    return f"""You are a clinical dermatology NLP specialist performing sparse one-hot feature extraction from skin disease captions.
+ABSOLUTE RULES — READ CAREFULLY
 
-FEATURE INDEX MAP ({n_feat} features — reference by index number only):
-{index_map_str}
+1. EXPLICIT MENTION ONLY. Include a feature value ONLY if the caption explicitly mentions it by name or an OBVIOUS clinical synonym. NEVER infer features from the disease name, the overall image concept, or prior medical knowledge. If the caption does not say WHERE on the body the lesion is, do NOT list any body_location feature — regardless of which disease is named.
 
-CATEGORY GROUPS (for encoding inference):
-{groups_str}
+2. OMIT categories the caption says nothing about. If the caption contains NO information about a given category, do NOT include that category key in the output object at all. Omitted categories decode to value 2 (truly unknown). This is the ONLY way to express "unknown".
 
-=== ENCODING VALUES ===
-  1 = PRESENT — feature is explicitly mentioned or clearly described in the caption
-  0 = ABSENT  — feature is either explicitly negated OR inferably absent (DEFAULT for unlisted indices)
-  2 = TRULY UNKNOWN — ONLY when the caption provides ZERO information about the feature's entire category group
+3. A category key must appear in the output ONLY if you put AT LEAST ONE canonical value in its list. Do NOT output empty lists like `"body_location": []` — if no specific value is mentioned, OMIT the key entirely.
 
-=== CATEGORY-AWARE INFERENCE (CRITICAL) ===
-When a caption mentions ANY feature or features within a category group encode them as 1, ALL OTHER features in that SAME group
-must be 0 (inferably absent), NOT 2. Use 2 ONLY when the caption says NOTHING AT ALL about an
-entire category group.
+4. CANONICAL SYNONYM MAPPING. Always map wording in the caption to the canonical vocabulary name:
+   - erythema / erythematous / reddened → morphology_color: "red"
+   - itchy / itching / pruritus / pruritic → symptoms_dermatological: "itching"
+   - elevated / bumpy / papular → morphology_texture: "raised"
+   - scaling / flaky → morphology_texture: "scaly"
+   - burning sensation → symptoms_dermatological: "burning"
+   - tender / sore / painful → symptoms_dermatological: "pain" (or closest canonical)
+   - hyperpigmentation / darkening of skin → morphology_color: "hyperpigmented"
+   - "rash" / "eruption" alone → do NOT assume a color, texture, or body location
+   - "lesion" / "spots" alone → do NOT assume a shape, color, texture, or body location
 
-Examples:
-- "red rash on face" → color_red=1, ALL other morphology_color features=0, location_face=1,
-  ALL other body_location features=0. If no symptoms mentioned at all → all symptom features=2.
-- "itchy raised lesion" → symptom_itching=1, ALL other symptoms_dermatological=0,
-  texture_raised=1, ALL other morphology_texture=0. If no body location mentioned → all body_location=2.
-- "non-itchy" → symptom_itching=0 (explicitly absent), other symptoms_dermatological=0.
+5. Demographics (age, sex, ethnicity, skin_type), duration, triggers, history, treatments, image_metadata, clinical_signs, severity — OMIT these categories UNLESS the caption literally states something mapping to them. "Photo of a 30-year-old man" → demographics_age: ["30-40"], demographics_sex: ["male"]. "Photo" alone → do not add image_metadata.
 
-=== OUTPUT FORMAT (SPARSE — minimizes tokens) ===
-For EACH caption, output a JSON object with exactly two keys:
-  "1": [list of feature INDICES that are PRESENT]
-  "2": [list of feature INDICES that are TRULY UNKNOWN]
-All indices NOT listed default to 0 (absent).
+6. STRICT JSON output. Return ONLY the JSON array — no markdown fences, no comments, no preface.
 
-Return a JSON array with one object per input caption. Example for 2 captions:
-[
-  {{"1": [0, 8, 45, 88], "2": [150, 155, 160]}},
-  {{"1": [3, 12], "2": []}}
-]
+OUTPUT EXAMPLES
 
-RULES:
-- Each index must be an integer in range 0 to {n_feat - 1}
-- An index must NOT appear in both "1" and "2"
-- If ALL features in a category group are unknown, list those indices in "2"
-- No preamble, no markdown fences, no explanations — ONLY the JSON array
+Caption: "Red, raised, itchy patch on the left forearm"
+→ {{"morphology_color":["red"],"morphology_texture":["raised"],"symptoms_dermatological":["itching"],"body_location":["forearm"]}}
+
+Caption: "Scaly plaque"
+→ {{"morphology_texture":["scaly"]}}
+
+Caption: "Solitary lesion"
+→ {{"lesion_count":["single"]}}
+
+Caption: "Photo of suspected melanoma"
+→ {{}}
+
+Caption: "Non-itchy red macule on cheek"
+→ {{"morphology_color":["red"],"morphology_texture":["flat"],"body_location":["cheek"]}}
+(Explicit negation "non-itchy" is discussed, but we only list what is PRESENT; symptoms_dermatological is omitted so downstream marks it as unknown.)
+
+VOCABULARY (valid canonical values per category — output MUST use only these names):
+{vocab_block}
+
+Return ONLY the JSON array.
 """
 
 
@@ -790,50 +822,27 @@ def build_tagged_system_prompt(
     feature_categories: dict[str, str],
 ) -> str:
     """
-    Shorter system prompt when pre-tagged feature lists are available.
-    No feature index map needed — input is already feature names.
-    Only category groups and encoding rules are needed.
+    Optional variant for pre-tagged inputs. Input is a list of raw feature tag
+    strings already extracted from each caption; the LLM maps each tag to a
+    canonical value and groups them per category using the SAME output shape
+    as `build_llm_system_prompt`.
     """
-    n_feat = len(all_feature_names)
-    name_to_idx = {name: i for i, name in enumerate(all_feature_names)}
-    cat_groups = build_category_groups(all_feature_names, feature_categories)
-    group_lines = []
-    for gname, indices in sorted(cat_groups.items()):
-        group_lines.append(
-            f"  {gname} (indices {indices[0]}-{indices[-1]}, {len(indices)} features)"
-        )
-    groups_str = "\n".join(group_lines)
+    vocab_block = _format_vocabulary_for_prompt(all_feature_names, feature_categories)
 
-    idx_lines = [f"{i}: {name}" for i, name in enumerate(all_feature_names)]
-    idx_map_str = "\n".join(idx_lines)
+    return f"""You are a clinical dermatology NLP specialist converting pre-extracted feature tags into canonical per-category one-hot encoding.
 
-    return f"""You are a clinical dermatology NLP specialist performing sparse one-hot encoding from pre-extracted feature tags.
+For EACH input (a list of raw feature tag strings), output ONE JSON OBJECT mapping CATEGORY → list of CANONICAL VALUES taken from the vocabulary below. Return a JSON array with one object per input, in input order.
 
-Each input is a list of feature names already extracted from a skin disease caption.
-Your task: convert these to sparse index-based encoding using category-aware rules.
+RULES
+1. Include a category ONLY if at least one input tag maps to a canonical value in that category.
+2. OMIT categories for which no input tag maps. Omitted categories decode to value 2 (unknown) downstream.
+3. Map each tag to the closest canonical value (e.g. "erythematous" → morphology_color:"red", "pruritus" → symptoms_dermatological:"itching", "papule" → morphology_texture:"papular" or "raised"). Drop tags that do not map cleanly.
+4. NEVER invent features that are not derivable from the input tag list.
+5. Do NOT output empty lists like `"body_location": []` — omit the category key entirely instead.
+6. Return ONLY the JSON array — no markdown, no commentary.
 
-FEATURE INDEX MAP ({n_feat} features):
-{idx_map_str}
-
-CATEGORY GROUPS:
-{groups_str}
-
-=== ENCODING RULES ===
-  1 = PRESENT — feature name appears in the input list
-  0 = ABSENT  — feature is NOT in the list BUT another feature from the SAME category group IS present (inferably absent)
-  2 = TRULY UNKNOWN — NO features from the entire category group appear in the input list
-
-=== OUTPUT FORMAT (SPARSE) ===
-For EACH input, output: {{"1": [indices], "2": [indices]}}
-Unlisted indices default to 0.
-
-Return a JSON array with one object per input. Example:
-[{{"1": [0, 8, 45], "2": [150, 155]}}, {{"1": [3], "2": []}}]
-
-RULES:
-- Each index must be an integer in range 0 to {n_feat - 1}
-- An index must NOT appear in both "1" and "2"
-- No preamble, no markdown fences — ONLY the JSON array
+VOCABULARY (valid canonical values per category):
+{vocab_block}
 """
 
 
@@ -846,105 +855,188 @@ def build_tagged_user_prompt(tag_lists: list[list[str]]) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SPARSE OUTPUT PARSING
+# PER-CATEGORY OUTPUT PARSING
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# LLM output shape per caption (sparse, name-based):
+#     {"morphology_color":["red"], "body_location":["forearm"], ...}
+#
+# Decoding:
+#     category in output  →  listed values = 1, other features in that category = 0
+#     category NOT in output →  every feature in that category = 2  (unknown)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _expand_sparse_to_dict(
-    sparse: dict,
+
+def _build_category_to_features_map(
     all_feature_names: list[str],
-) -> dict[str, int]:
+    feature_categories: dict[str, str],
+) -> dict[str, set[str]]:
+    """Map category -> set of canonical value suffixes (e.g. 'red', 'forearm')."""
+    by_cat: dict[str, set[str]] = defaultdict(set)
+    for name in all_feature_names:
+        cat = feature_categories.get(name, "other")
+        val = name[len(cat) + 1:] if name.startswith(cat + "_") else name
+        by_cat[cat].add(val)
+    return by_cat
+
+
+def _expand_category_output_to_encoding(
+    cat_output: dict,
+    all_feature_names: list[str],
+    feature_categories: dict[str, str],
+    category_to_values: dict[str, set[str]],
+) -> tuple[dict[str, int], int]:
     """
-    Expand a sparse object {"1": [indices], "2": [indices]} into a full
-    {feature_name: 0|1|2} dict.  Unlisted indices default to 0.
+    Convert one caption's {"category": ["value1", ...]} dict into the full
+    {feature_name: 0|1|2} encoding. Returns (encoding, num_fixes).
+
+      • Categories present with at least one recognized value → listed features = 1,
+        other features in the same category = 0.
+      • Categories absent (or present with only unrecognized/empty values)
+        → all features in that category = 2.
     """
-    n = len(all_feature_names)
-    result = {name: 0 for name in all_feature_names}
+    fixes = 0
+    # Default every feature to 2 (unknown). We'll overwrite categories that are
+    # present in the LLM's output.
+    result = {name: 2 for name in all_feature_names}
 
-    present = sparse.get("1") or sparse.get(1) or []
-    unknown = sparse.get("2") or sparse.get(2) or []
+    if not isinstance(cat_output, dict):
+        return result, 1
 
-    if not isinstance(present, list):
-        present = []
-    if not isinstance(unknown, list):
-        unknown = []
+    # Pre-compute feature name per (category, value) for fast writes.
+    cat_val_to_name: dict[tuple[str, str], str] = {}
+    for name in all_feature_names:
+        cat = feature_categories.get(name, "other")
+        val = name[len(cat) + 1:] if name.startswith(cat + "_") else name
+        cat_val_to_name[(cat, val)] = name
 
-    for idx in present:
-        idx = int(idx)
-        if 0 <= idx < n:
-            result[all_feature_names[idx]] = 1
+    for cat_key, vals in cat_output.items():
+        cat = str(cat_key).strip()
+        if cat not in category_to_values:
+            fixes += 1
+            continue
 
-    for idx in unknown:
-        idx = int(idx)
-        if 0 <= idx < n:
-            result[all_feature_names[idx]] = 2
+        if not isinstance(vals, list):
+            if isinstance(vals, str):
+                vals = [vals]
+            else:
+                fixes += 1
+                continue
 
-    return result
+        valid_set = category_to_values[cat]
+        recognized: list[str] = []
+        for v in vals:
+            s = str(v).strip().lower().replace(" ", "_")
+            # Tolerate "morphology_color_red" style → strip category prefix.
+            prefix = cat + "_"
+            if s.startswith(prefix) and s[len(prefix):] in valid_set:
+                s = s[len(prefix):]
+            if s in valid_set:
+                recognized.append(s)
+            else:
+                fixes += 1
+
+        if not recognized:
+            # Category key was present but no recognized value → still treat
+            # category as "considered": set everything in category to 0 (absent)
+            # rather than 2. This matches the user's request: "only mark features
+            # mentioned in the caption as 1 ... but if a category is considered,
+            # others in it are 0 (inferably absent)".
+            for val in valid_set:
+                fname = cat_val_to_name.get((cat, val))
+                if fname is not None:
+                    result[fname] = 0
+            continue
+
+        # Mark present values = 1, all other features in this category = 0.
+        present_set = set(recognized)
+        for val in valid_set:
+            fname = cat_val_to_name.get((cat, val))
+            if fname is None:
+                continue
+            result[fname] = 1 if val in present_set else 0
+
+    return result, fixes
 
 
 def parse_extraction_response_text(
     text: str,
     captions: list[str],
     all_feature_names: list[str],
+    feature_categories: dict[str, str] | None = None,
 ) -> tuple[list[dict], dict]:
     """
-    Parse sparse JSON array from LLM into per-caption feature dicts.
-    Expected format: [{"1":[...], "2":[...]}, ...]
-    Returns (results, stats).
+    Parse the LLM response (per-caption per-category JSON) into one-hot dicts.
+
+    Expected text format:
+        [
+          {"morphology_color":["red"], "symptoms_dermatological":["itching"]},
+          {"morphology_texture":["scaly"]},
+          ...
+        ]
+
+    Returns (results, stats). On parse failure, returns a fallback row (all 2s)
+    per input caption so the pipeline keeps making progress.
     """
     stats: dict = {"success": False, "validation_fixes": 0}
-    n_feat = len(all_feature_names)
     fallback_row = {k: 2 for k in all_feature_names}
 
-    try:
-        text = (text or "").strip()
-        text = re.sub(r"```json\s*|```\s*", "", text).strip()
-        parsed = json.loads(text)
+    if feature_categories is None:
+        feature_categories = {name: name.split("_", 1)[0] for name in all_feature_names}
 
-        if isinstance(parsed, dict) and ("1" in parsed or "2" in parsed or 1 in parsed or 2 in parsed):
-            parsed = [parsed]
+    category_to_values = _build_category_to_features_map(
+        all_feature_names, feature_categories
+    )
+
+    try:
+        txt = (text or "").strip()
+        txt = re.sub(r"```json\s*|```\s*", "", txt).strip()
+        parsed = json.loads(txt)
+
+        # Tolerate the LLM wrapping the array in a container object.
+        if isinstance(parsed, dict):
+            for key in ("results", "data", "captions", "outputs", "items"):
+                if key in parsed and isinstance(parsed[key], list):
+                    parsed = parsed[key]
+                    break
+            else:
+                # Single-caption object → wrap as a one-element array.
+                parsed = [parsed]
+
         if not isinstance(parsed, list):
             raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
 
         results: list[dict] = []
         fixes = 0
-        for i, item in enumerate(parsed):
+        for item in parsed:
+            encoding, f = _expand_category_output_to_encoding(
+                item if isinstance(item, dict) else {},
+                all_feature_names,
+                feature_categories,
+                category_to_values,
+            )
             if not isinstance(item, dict):
-                results.append(dict(fallback_row))
-                fixes += 1
-                continue
-
-            present = item.get("1") or item.get(1) or []
-            unknown = item.get("2") or item.get(2) or []
-            if not isinstance(present, list):
-                present = []
-            if not isinstance(unknown, list):
-                unknown = []
-
-            overlap = set(int(x) for x in present if _is_valid_idx(x, n_feat)) & \
-                       set(int(x) for x in unknown if _is_valid_idx(x, n_feat))
-            if overlap:
-                for idx in overlap:
-                    unknown = [x for x in unknown if int(x) != idx]
-                fixes += 1
-
-            results.append(_expand_sparse_to_dict(item, all_feature_names))
+                f += 1
+            fixes += f
+            results.append(encoding)
 
         if len(results) < len(captions):
             results.extend([dict(fallback_row)] * (len(captions) - len(results)))
-            fixes += len(captions) - len(parsed)
-        results = results[:len(captions)]
+            fixes += len(captions) - len(results) + (len(captions) - len(results))
+        results = results[: len(captions)]
 
         stats["validation_fixes"] = fixes
         stats["success"] = True
         return results, stats
 
     except (json.JSONDecodeError, ValueError, TypeError) as e:
-        print(f"    parse_extraction_response_text: {str(e)[:120]}")
+        print(f"    parse_extraction_response_text: {str(e)[:160]}")
         stats["success"] = False
         return [dict(fallback_row) for _ in captions], stats
 
 
 def _is_valid_idx(val, n: int) -> bool:
+    """Kept for backward compatibility; no longer used in the new parser."""
     try:
         v = int(val)
         return 0 <= v < n
@@ -963,6 +1055,7 @@ def extract_features_batch(
     retries: int = MAX_RETRIES,
     *,
     tag_lists: list[list[str]] | None = None,
+    feature_categories: dict[str, str] | None = None,
 ) -> tuple[list[dict], dict]:
     """
     Batch LLM call for one chunk of captions (or pre-tagged feature lists).
@@ -983,7 +1076,9 @@ def extract_features_batch(
         try:
             stats["attempts"] = attempt + 1
             text = call_llm(user_prompt, system_prompt, retries=1)
-            valid_results, pst = parse_extraction_response_text(text, captions, all_feature_names)
+            valid_results, pst = parse_extraction_response_text(
+                text, captions, all_feature_names, feature_categories
+            )
             stats["validation_fixes"] = pst.get("validation_fixes", 0)
             if pst.get("success"):
                 stats["success"] = True
@@ -1019,6 +1114,7 @@ def _run_dedup_openai_batch(
     global_stats: dict,
     *,
     caption_to_tags: dict[str, list[str]] | None = None,
+    feature_categories: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """
     Process deduplicated captions via OpenAI Batch API.
@@ -1048,7 +1144,9 @@ def _run_dedup_openai_batch(
     results: dict[str, dict] = {}
     for cid, batch in job_batches.items():
         text = mapping.get(cid) or ""
-        batch_results, pst = parse_extraction_response_text(text, batch, all_feature_names)
+        batch_results, pst = parse_extraction_response_text(
+            text, batch, all_feature_names, feature_categories
+        )
         ok = pst.get("success", False)
         global_stats["total_validation_fixes"] += pst.get("validation_fixes", 0)
 
@@ -1059,7 +1157,8 @@ def _run_dedup_openai_batch(
                 if caption_to_tags is not None else None
             )
             batch_results, st2 = extract_features_batch(
-                batch, all_feature_names, system_prompt, tag_lists=batch_tags
+                batch, all_feature_names, system_prompt, tag_lists=batch_tags,
+                feature_categories=feature_categories,
             )
             ok = st2.get("success", False)
             global_stats["total_retries"] += 1
@@ -1084,6 +1183,7 @@ def _run_dedup_sync(
     ckpt_save_fn,
     *,
     caption_to_tags: dict[str, list[str]] | None = None,
+    feature_categories: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """
     Process deduplicated captions via synchronous LLM calls.
@@ -1105,7 +1205,8 @@ def _run_dedup_sync(
             if caption_to_tags is not None else None
         )
         batch_results, stats = extract_features_batch(
-            batch, all_feature_names, system_prompt, tag_lists=batch_tags
+            batch, all_feature_names, system_prompt, tag_lists=batch_tags,
+            feature_categories=feature_categories,
         )
 
         for cap, feats in zip(batch, batch_results):
@@ -1179,7 +1280,7 @@ def run_extraction(csv_path: str, schema_path: str):
 
     print(f"\n  Total features to extract: {len(all_feature_names)}")
     print(f"  Batch size: {LLM_BATCH_SIZE} captions per API call")
-    print(f"  Output format: sparse JSON (indices only)\n")
+    print(f"  Output format: per-category JSON names (strict literal extraction)\n")
 
     # ── Load data ─────────────────────────────────────────────────────────────
     print(f"Loading CSV: {csv_path}")
@@ -1287,7 +1388,7 @@ def run_extraction(csv_path: str, schema_path: str):
         "start_time": time.time(),
         "openai_use_batch": bool(LLM_PROVIDER == "openai" and OPENAI_USE_BATCH),
         "openai_prompt_cache_key": OPENAI_PROMPT_CACHE_KEY if LLM_PROVIDER == "openai" else "",
-        "output_format": "sparse",
+        "output_format": "per_category_names",
         "using_tagged_features": use_tags,
     }
 
@@ -1327,11 +1428,13 @@ def run_extraction(csv_path: str, schema_path: str):
             new_results = _run_dedup_openai_batch(
                 remaining, all_feature_names, system_prompt, global_stats,
                 caption_to_tags=_tags_arg,
+                feature_categories=feature_categories,
             )
         else:
             new_results = _run_dedup_sync(
                 remaining, all_feature_names, system_prompt, global_stats, _ckpt_saver,
                 caption_to_tags=_tags_arg,
+                feature_categories=feature_categories,
             )
 
         caption_features.update(new_results)
