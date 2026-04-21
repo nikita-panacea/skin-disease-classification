@@ -25,7 +25,7 @@ Run after phase1_feature_discovery.py
 
 Env (optional):
   CAPTION_COLUMN — must match phase1 (default: truncated_caption)
-  LLM_BATCH_SIZE — captions per API call (default 25)
+  LLM_BATCH_SIZE — captions per API call (default 15)
   OPENAI_MODEL_NAME — default gpt-4o-mini
   OPENAI_USE_BATCH — 1/true: enqueue all OpenAI extraction jobs on Batch API (~50% lower $, async ≤24h)
   OPENAI_PROMPT_CACHE_KEY — stable key for automatic prompt caching (default phase2_extraction_v1)
@@ -78,9 +78,14 @@ LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")
 
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "1").lower() in ("1", "true", "yes")
+# When enabled (default), send a strict json_schema response_format so the
+# model CANNOT emit wrong shapes, unknown categories, or unknown values.
+# This prevents the short-response / looped-response failure modes where the
+# model would skip captions or repeat outputs and break parsing.
+OPENAI_USE_JSON_SCHEMA = os.getenv("OPENAI_USE_JSON_SCHEMA", "1").lower() in ("1", "true", "yes")
 OPENAI_PROMPT_CACHE_KEY = os.getenv(
     "OPENAI_PROMPT_CACHE_KEY",
-    "phase2_extraction_v3_captions_wrapped",
+    "phase2_extraction_v4_strict_schema",
 ).strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
 
@@ -190,7 +195,7 @@ SCHEMA_PATH      = "feature_schema.json"
 OUTPUT_CSV       = "derm1m_features.csv"
 STATS_FILE       = "extraction_stats.json"
 CHECKPOINT_DIR   = Path("checkpoints")
-LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 25, vmin=1)
+LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 15, vmin=1)
 MAX_RETRIES      = 5
 
 TAGGED_CSV_PATH  = Path("discovery_outputs/caption_features_tagged.csv")
@@ -249,8 +254,18 @@ def _openai_apply_prompt_caching(create_kw: dict, cache_key: str) -> None:
         create_kw["prompt_cache_retention"] = OPENAI_PROMPT_CACHE_RETENTION
 
 
-def _openai_extraction_chat_body(system_prompt: str, user_prompt: str) -> dict:
-    """Chat body for extraction: static system first, variable captions last (prompt caching)."""
+def _openai_extraction_chat_body(
+    system_prompt: str,
+    user_prompt: str,
+    json_schema: dict | None = None,
+) -> dict:
+    """Chat body for extraction: static system first, variable captions last (prompt caching).
+
+    If `json_schema` is provided and OPENAI_USE_JSON_SCHEMA=1, the body uses
+    `response_format={"type":"json_schema", "strict":True, ...}` so OpenAI
+    enforces the output shape server-side. This eliminates short-response and
+    wrong-shape failure modes that cause sync-fallback cascades.
+    """
     body: dict = {
         "model": MODEL_NAME,
         "messages": [
@@ -258,16 +273,80 @@ def _openai_extraction_chat_body(system_prompt: str, user_prompt: str) -> dict:
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
-        # 8192 gives headroom for ~25 captions × ~21 categories each without truncation.
+        # 8192 gives headroom for ~15 captions × ~21 categories each without truncation.
         # gpt-4o-mini caps at 16384 output tokens; raise further if you see completion=8192
         # with truncated JSON in logs.
         "max_tokens": 8192,
         "stream": False,
     }
-    if OPENAI_JSON_RESPONSE:
+    if OPENAI_USE_JSON_SCHEMA and json_schema is not None:
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": json_schema,
+        }
+    elif OPENAI_JSON_RESPONSE:
         body["response_format"] = {"type": "json_object"}
     _openai_apply_prompt_caching(body, OPENAI_PROMPT_CACHE_KEY)
     return body
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Strict JSON-schema for structured outputs
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI strict-mode schema rules (docs: structured-outputs):
+#   - additionalProperties must be false on every object.
+#   - Every property listed in `properties` must be in `required`.
+#   - `enum` is supported; `minItems`/`maxItems` are NOT supported in strict mode.
+# With strict mode, the server guarantees the model output parses as this
+# schema exactly. That alone fixes:
+#   • wrong top-level shape (model MUST emit {"captions":[...]}),
+#   • unknown category keys (each inner object is a fixed dict of enum lists),
+#   • unknown values (each list has an enum constraint).
+# It does NOT fix count-skipping/looping (no min/max items), but combined with
+# the count-enforcement prompt above and the partial-recovery parser, the
+# pipeline now always makes forward progress instead of dropping whole batches.
+
+_EXTRACTION_SCHEMA_NAME = "caption_features_v4"
+
+
+def _build_extraction_json_schema(
+    all_feature_names: list[str],
+    feature_categories: dict[str, str],
+) -> dict:
+    """Build the strict JSON-schema for {"captions":[{<cat>: [<enum>, ...], ...}]}."""
+    cat_to_vals = _build_category_to_features_map(all_feature_names, feature_categories)
+    categories = sorted(cat_to_vals.keys())
+
+    item_properties: dict = {}
+    for cat in categories:
+        values = sorted(cat_to_vals[cat])
+        item_properties[cat] = {
+            "type": "array",
+            "items": {"type": "string", "enum": values},
+        }
+
+    item_schema = {
+        "type": "object",
+        "properties": item_properties,
+        "required": categories,  # strict mode: all listed props required
+        "additionalProperties": False,
+    }
+
+    return {
+        "name": _EXTRACTION_SCHEMA_NAME,
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "captions": {
+                    "type": "array",
+                    "items": item_schema,
+                },
+            },
+            "required": ["captions"],
+            "additionalProperties": False,
+        },
+    }
 
 
 def _maybe_log_openai_usage(resp) -> None:
@@ -593,6 +672,7 @@ def call_llm(
     retries: int = MAX_RETRIES,
     *,
     openai_prompt_cache_key: str | None = None,
+    json_schema: dict | None = None,
 ) -> tuple[str, dict]:
     """
     Generic LLM caller that works for Gemini, OpenAI, and Qwen (local).
@@ -626,7 +706,12 @@ def call_llm(
                     max_tokens=8192,
                     stream=False,
                 )
-                if OPENAI_JSON_RESPONSE:
+                if OPENAI_USE_JSON_SCHEMA and json_schema is not None:
+                    create_kw["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": json_schema,
+                    }
+                elif OPENAI_JSON_RESPONSE:
                     create_kw["response_format"] = {"type": "json_object"}
                 ck = (
                     openai_prompt_cache_key
@@ -844,8 +929,13 @@ REQUIRED OUTPUT SHAPE (always obey this exact top-level structure)
   ]
 }}
 
-- The array length MUST equal the number of input captions (one object per caption, in order).
-- If a caption has no extractable features, emit an EMPTY object {{}} at that position — never skip a position.
+COUNT RULES (VIOLATING THESE IS THE MOST COMMON FAILURE — DO NOT VIOLATE)
+- The user message starts with "INPUT: N caption(s)". Your output's "captions" array MUST have EXACTLY N elements.
+- Output ONE object per caption, in the SAME ORDER as the input.
+- For a caption with NO extractable features, emit an EMPTY object {{}} at that index. DO NOT omit its position.
+- DO NOT emit fewer than N objects.
+- DO NOT emit more than N objects. Once you have emitted the N-th object, close the array `]` and the outer object `}}` and STOP.
+- DO NOT repeat any object. DO NOT emit duplicate entries for the same caption index.
 - Return ONLY the JSON object above. No markdown, no commentary, no trailing text.
 
 ABSOLUTE EXTRACTION RULES — READ CAREFULLY
@@ -893,8 +983,20 @@ Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 
 
 def build_extraction_user_prompt(captions: list[str]) -> str:
-    """Variable user message: numbered captions only (system holds full extraction rules)."""
-    return "\n\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
+    """
+    Variable user message. Starts with a count-enforcement reminder so the
+    model cannot silently skip captions (common failure mode when many
+    captions have no extractable features).
+    """
+    n = len(captions)
+    header = (
+        f"INPUT: {n} caption(s) indexed [0]..[{n - 1}].\n"
+        f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
+        f"order. Emit {{}} for any caption that has no extractable features — "
+        f"NEVER skip a caption, NEVER repeat a caption, NEVER emit extra items."
+    )
+    body = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
+    return f"{header}\n\n{body}"
 
 
 def build_tagged_system_prompt(
@@ -921,8 +1023,12 @@ REQUIRED OUTPUT SHAPE
     ...
   ]
 }}
-- The array length MUST equal the number of input items (use an empty object {{}} when no tag maps).
-- Return ONLY the JSON object — no markdown, no commentary.
+
+COUNT RULES
+- The user message starts with "INPUT: N tag-list(s)". Your "captions" array MUST have EXACTLY N elements, in input order.
+- Emit {{}} at any position where no tag maps — NEVER skip a position.
+- DO NOT emit more than N objects. After the N-th object, close the array `]` and the outer object `}}` and STOP.
+- DO NOT repeat objects. Return ONLY the JSON object — no markdown, no commentary.
 
 RULES
 1. Include a category ONLY if at least one input tag maps to a canonical value in that category.
@@ -940,10 +1046,18 @@ Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 
 def build_tagged_user_prompt(tag_lists: list[list[str]]) -> str:
     """User message when using pre-tagged feature lists instead of captions."""
-    return "\n".join(
+    n = len(tag_lists)
+    header = (
+        f"INPUT: {n} tag-list(s) indexed [0]..[{n - 1}].\n"
+        f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
+        f"order. Emit {{}} for any input with no mappable tags — NEVER skip, "
+        f"NEVER repeat, NEVER emit extra items."
+    )
+    body = "\n".join(
         f"[{i}] {', '.join(tags) if tags else '(empty)'}"
         for i, tags in enumerate(tag_lists)
     )
+    return f"{header}\n\n{body}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -982,10 +1096,13 @@ def _expand_category_output_to_encoding(
     Convert one caption's {"category": ["value1", ...]} dict into the full
     {feature_name: 0|1|2} encoding. Returns (encoding, num_fixes).
 
-      • Categories present with at least one recognized value → listed features = 1,
-        other features in the same category = 0.
-      • Categories absent (or present with only unrecognized/empty values)
-        → all features in that category = 2.
+      • Category present with ≥1 recognized value   → listed=1, others in cat=0.
+      • Category present with empty / unrecognized  → all in cat = 0 (considered
+        absent). Strict-schema mode always takes this branch when a category
+        has no matching feature.
+      • Category absent from the dict               → all in cat = 2 (unknown).
+        Under strict-schema this never happens because every category is
+        required; only the json_object fallback path ever reaches 2 here.
     """
     fixes = 0
     # Default every feature to 2 (unknown). We'll overwrite categories that are
@@ -1204,21 +1321,38 @@ def parse_extraction_response_text(
     txt = (text or "").strip()
     txt = re.sub(r"```json\s*|```\s*", "", txt).strip()
 
+    n = len(captions)
+
     # Path 1: JSON parses — figure out the shape.
     try:
         parsed = json.loads(txt)
     except (json.JSONDecodeError, ValueError, TypeError) as e:
         # Path 2: JSON broken — try salvage (typical for truncation).
         salvaged = _salvage_truncated_captions_array(txt)
-        is_truncation = (finish_reason == "length") or bool(salvaged)
-        stats["truncated"] = is_truncation
         if salvaged:
+            # Loop case: model repeated items past our requested count. Take
+            # the first N as a full success (they were well-formed).
+            if len(salvaged) >= n:
+                print(
+                    f"    parse_extraction_response_text: {str(e)[:120]} — "
+                    f"model looped (emitted {len(salvaged)}/{n} items); keeping "
+                    f"first {n} as a clean recovery."
+                )
+                stats["truncated"] = False
+                stats["salvaged"] = False
+                results = _finalize(salvaged[:n], salvaged=False)[0]
+                stats["success"] = True
+                return results, stats
+            # True truncation — partial prefix recovered.
+            stats["truncated"] = True
             print(
                 f"    parse_extraction_response_text: {str(e)[:120]} — "
-                f"salvaged {len(salvaged)}/{len(captions)} caption(s) from "
-                f"truncated JSON (finish_reason={finish_reason!r})"
+                f"salvaged {len(salvaged)}/{n} caption(s) from truncated JSON "
+                f"(finish_reason={finish_reason!r})"
             )
             return _finalize(salvaged, salvaged=True)
+        # No salvage possible. Tag as truncated only if API says so.
+        stats["truncated"] = finish_reason == "length"
         print(
             f"    parse_extraction_response_text: {str(e)[:160]} "
             f"(finish_reason={finish_reason!r}, {_response_tail_hint(txt)})"
@@ -1236,10 +1370,30 @@ def parse_extraction_response_text(
         )
         return [dict(fallback_row) for _ in captions], stats
 
-    # If we got fewer items than captions AND the completion hit the token
-    # cap, treat it as truncation (even though JSON parsed cleanly).
-    if len(inner) < len(captions) and finish_reason == "length":
-        stats["truncated"] = True
+    # Loop case #2: JSON parsed AND array has more items than we asked for
+    # (model repeated outputs). First N items are still correct; take them.
+    if len(inner) > n:
+        print(
+            f"    parse_extraction_response_text: model looped "
+            f"(emitted {len(inner)}/{n} items); trimming to first {n}."
+        )
+        return _finalize(inner[:n], salvaged=False)
+
+    # Short response case: JSON parsed but array has fewer items than asked.
+    # This happens for two reasons:
+    #   (a) finish_reason='length' → real truncation,
+    #   (b) finish_reason='stop'   → model skipped captions (e.g., only emitted
+    #       outputs for captions it had features for, ignoring the "emit {}"
+    #       rule).
+    # Either way, treat the gap as a tail that needs retry, and keep the good
+    # prefix we already have. This avoids redoing all N captions.
+    if len(inner) < n:
+        stats["truncated"] = True  # use truncation path → tail-only sync retry
+        print(
+            f"    parse_extraction_response_text: short response "
+            f"({len(inner)}/{n} items, finish_reason={finish_reason!r}); "
+            f"keeping prefix, will retry missing tail."
+        )
         return _finalize(inner, salvaged=True)
 
     return _finalize(inner, salvaged=False)
@@ -1266,6 +1420,7 @@ def extract_features_batch(
     *,
     tag_lists: list[list[str]] | None = None,
     feature_categories: dict[str, str] | None = None,
+    json_schema: dict | None = None,
 ) -> tuple[list[dict], dict]:
     """
     Sync LLM call for one batch of captions (or pre-tagged feature lists), with
@@ -1298,7 +1453,9 @@ def extract_features_batch(
     for attempt in range(retries):
         try:
             stats["attempts"] = attempt + 1
-            text, meta = call_llm(user_prompt, system_prompt, retries=1)
+            text, meta = call_llm(
+                user_prompt, system_prompt, retries=1, json_schema=json_schema,
+            )
             finish_reason = meta.get("finish_reason", "")
             valid_results, pst = parse_extraction_response_text(
                 text, captions, all_feature_names, feature_categories,
@@ -1351,10 +1508,12 @@ def extract_features_batch(
         left, st_l = extract_features_batch(
             left_caps, all_feature_names, system_prompt,
             retries=retries, feature_categories=feature_categories,
+            json_schema=json_schema,
         )
         right, st_r = extract_features_batch(
             right_caps, all_feature_names, system_prompt,
             retries=retries, feature_categories=feature_categories,
+            json_schema=json_schema,
         )
         stats["validation_fixes"] += (
             st_l.get("validation_fixes", 0) + st_r.get("validation_fixes", 0)
@@ -1395,6 +1554,7 @@ def _run_dedup_openai_batch(
     feature_categories: dict[str, str] | None = None,
     ckpt_save_fn=None,
     seed_results: dict[str, dict] | None = None,
+    json_schema: dict | None = None,
 ) -> dict[str, dict]:
     """
     Process deduplicated captions via OpenAI Batch API.
@@ -1417,7 +1577,12 @@ def _run_dedup_openai_batch(
             user_prompt = build_extraction_user_prompt(batch)
         cid = f"p2_{batch_idx}"
         jobs.append(
-            {"custom_id": cid, "body": _openai_extraction_chat_body(system_prompt, user_prompt)}
+            {
+                "custom_id": cid,
+                "body": _openai_extraction_chat_body(
+                    system_prompt, user_prompt, json_schema=json_schema,
+                ),
+            }
         )
         job_batches[cid] = batch
 
@@ -1480,6 +1645,7 @@ def _run_dedup_openai_batch(
                         tail_batch, all_feature_names, system_prompt,
                         tag_lists=batch_tags,
                         feature_categories=feature_categories,
+                        json_schema=json_schema,
                     )
                     batch_results = batch_results[:salvaged_prefix] + tail_results
                     ok = st2.get("success", False)
@@ -1501,6 +1667,7 @@ def _run_dedup_openai_batch(
                     batch, all_feature_names, system_prompt,
                     tag_lists=batch_tags,
                     feature_categories=feature_categories,
+                    json_schema=json_schema,
                 )
                 batch_results = retry_results
                 ok = st2.get("success", False)
@@ -1552,6 +1719,7 @@ def _run_dedup_openai_batch(
                     batch, all_feature_names, system_prompt,
                     tag_lists=batch_tags,
                     feature_categories=feature_categories,
+                    json_schema=json_schema,
                 )
                 for c, feats in zip(batch, retry_results):
                     results[c] = feats
@@ -1580,6 +1748,7 @@ def _run_dedup_sync(
     *,
     caption_to_tags: dict[str, list[str]] | None = None,
     feature_categories: dict[str, str] | None = None,
+    json_schema: dict | None = None,
 ) -> dict[str, dict]:
     """
     Process deduplicated captions via synchronous LLM calls.
@@ -1603,6 +1772,7 @@ def _run_dedup_sync(
         batch_results, stats = extract_features_batch(
             batch, all_feature_names, system_prompt, tag_lists=batch_tags,
             feature_categories=feature_categories,
+            json_schema=json_schema,
         )
 
         for cap, feats in zip(batch, batch_results):
@@ -1753,6 +1923,27 @@ def run_extraction(csv_path: str, schema_path: str):
     else:
         system_prompt = build_llm_system_prompt(all_feature_names, feature_categories)
 
+    # Strict JSON schema for OpenAI structured outputs (shape + vocabulary
+    # enforcement). Only applied when LLM_PROVIDER=openai and OPENAI_USE_JSON_SCHEMA=1.
+    extraction_json_schema: dict | None = None
+    if LLM_PROVIDER == "openai" and OPENAI_USE_JSON_SCHEMA:
+        try:
+            extraction_json_schema = _build_extraction_json_schema(
+                all_feature_names, feature_categories
+            )
+            n_cats = len(extraction_json_schema["schema"]["properties"]["captions"]
+                         ["items"]["properties"])
+            print(
+                f"  Strict JSON schema enabled: {n_cats} categories, "
+                f"{len(all_feature_names)} total values — server-side shape enforced."
+            )
+        except Exception as e:
+            print(
+                f"  WARNING: failed to build JSON schema ({e!r}); falling back "
+                f"to json_object response_format."
+            )
+            extraction_json_schema = None
+
     # ── Load checkpoint if exists ─────────────────────────────────────────────
     dedup_ckpt = CHECKPOINT_DIR / DEDUP_CKPT_FILE
     caption_features: dict[str, dict] = {}
@@ -1827,12 +2018,14 @@ def run_extraction(csv_path: str, schema_path: str):
                 feature_categories=feature_categories,
                 ckpt_save_fn=_ckpt_saver,
                 seed_results=dict(caption_features),
+                json_schema=extraction_json_schema,
             )
         else:
             new_results = _run_dedup_sync(
                 remaining, all_feature_names, system_prompt, global_stats, _ckpt_saver,
                 caption_to_tags=_tags_arg,
                 feature_categories=feature_categories,
+                json_schema=extraction_json_schema,
             )
 
         caption_features.update(new_results)
