@@ -85,7 +85,7 @@ OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "1").lower() in ("1", "
 OPENAI_USE_JSON_SCHEMA = os.getenv("OPENAI_USE_JSON_SCHEMA", "1").lower() in ("1", "true", "yes")
 OPENAI_PROMPT_CACHE_KEY = os.getenv(
     "OPENAI_PROMPT_CACHE_KEY",
-    "phase2_extraction_v4_strict_schema",
+    "phase2_extraction_v5_fewshot",
 ).strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
 
@@ -509,13 +509,47 @@ def _run_openai_extraction_batch_chunk(
     )
 
     terminal = {"completed", "failed", "expired", "cancelled"}
+    # Hard cap on how long we wait for a single chunk before cancelling. Batch
+    # API gives a 24-hour completion window; we add a 2-hour grace for the
+    # "expired" → partial-output flow, then bail so a stuck chunk can't hang
+    # the whole run indefinitely.
+    poll_deadline = time.monotonic() + 26 * 3600
+    last_progress_count = -1
+    stall_start: float | None = None
     while batch_job.status not in terminal:
         time.sleep(OPENAI_BATCH_POLL_SEC)
+        if time.monotonic() > poll_deadline:
+            tqdm.write(
+                f"  Batch chunk {chunk_idx} exceeded 26h wall-clock. Cancelling "
+                f"and returning whatever is already in the output file."
+            )
+            try:
+                openai_client.batches.cancel(batch_job.id)
+            except Exception as cancel_err:
+                tqdm.write(f"    (cancel failed: {cancel_err!r})")
+            # Give the API ~1 poll cycle to finalise the cancel; then move on
+            # with whatever partial output exists.
+            time.sleep(OPENAI_BATCH_POLL_SEC)
+            batch_job = openai_client.batches.retrieve(batch_job.id)
+            break
         batch_job = openai_client.batches.retrieve(batch_job.id)
         rc = batch_job.request_counts
         tqdm.write(
             f"    status={batch_job.status}  completed={rc.completed}/{rc.total}  failed={rc.failed}"
         )
+        # Soft stall detector: if progress hasn't advanced for 30 minutes we
+        # flag a warning (but keep polling until the 26h hard cap).
+        total_done = (rc.completed or 0) + (rc.failed or 0)
+        now = time.monotonic()
+        if total_done != last_progress_count:
+            last_progress_count = total_done
+            stall_start = now
+        elif stall_start is not None and now - stall_start > 1800:
+            tqdm.write(
+                f"    (no progress in 30 min at {total_done}/{rc.total}; "
+                f"continuing to poll until 26h cap)"
+            )
+            stall_start = now  # rearm
 
     has_output = batch_job.output_file_id is not None
 
@@ -624,7 +658,26 @@ def _run_openai_extraction_batch(
 
         all_failed_ids: set[str] = set()
         for ci, chunk in enumerate(chunks):
-            m, a, _bid, failed = _run_openai_extraction_batch_chunk(chunk, chunk_counter)
+            try:
+                m, a, _bid, failed = _run_openai_extraction_batch_chunk(
+                    chunk, chunk_counter
+                )
+            except Exception as chunk_err:
+                # A single chunk's Batch-API upload or poll errored out (network
+                # glitch, token-limit rejection, no output file, etc.). Instead
+                # of aborting the whole pipeline, mark every job in this chunk
+                # as failed so it goes into the next retry round or falls
+                # through to the sync fallback. This is the single biggest
+                # robustness win for long runs with ~30+ chunks.
+                chunk_counter += 1
+                failed_in_chunk = {j["custom_id"] for j in chunk}
+                tqdm.write(
+                    f"  Batch chunk failed ({type(chunk_err).__name__}: "
+                    f"{str(chunk_err)[:200]}); {len(failed_in_chunk)} job(s) "
+                    f"will be retried or routed to sync fallback."
+                )
+                all_failed_ids.update(failed_in_chunk)
+                continue
             chunk_counter += 1
             combined.update(m)
             for k in acc_total:
@@ -898,55 +951,49 @@ def _format_vocabulary_for_prompt(
 def build_llm_system_prompt(
     all_feature_names: list[str],
     feature_categories: dict[str, str],
+    *,
+    schema_enforced: bool = False,
 ) -> str:
     """
     Strict, name-based, per-category extraction prompt.
 
-    Output shape (top level is a JSON OBJECT to stay compatible with OpenAI's
-    response_format=json_object, which REJECTS bare arrays):
-
+    Output shape:
         {"captions": [
-            {"morphology_color":["red"], "symptoms_dermatological":["itching"]},
-            {"morphology_texture":["scaly"]},
+            {"<cat>": ["<value>", ...], ...},  # one object per input caption
             ...
         ]}
 
-    Each inner object is the per-category output for one caption. Omitted
-    categories decode to value 2 (unknown) in the downstream one-hot matrix.
+    Decoding contract (applied downstream in _expand_category_output_to_encoding):
+      • Category has at least one recognised value → listed = 1, other values
+        in that category = 0 (inferably absent).
+      • Category is empty [] or has only unrecognised values → all values in
+        that category stay 2 (unknown).
+      • Category key missing from the object (only possible without strict
+        schema) → all values stay 2 (unknown).
+
+    When ``schema_enforced`` is True we assume the caller is sending a strict
+    ``response_format=json_schema`` body that already pins:
+      • the top-level ``{"captions":[...]}`` shape,
+      • the full set of category keys,
+      • the enum of valid values per category.
+    Under that mode the prompt is much shorter — no vocabulary dump, no
+    "omit categories" contradictions — which dramatically cuts prompt tokens
+    and eliminates the "short-response" failure mode where the model tried
+    to comply with both the schema (all keys required) and the prompt
+    (omit unmentioned keys) at once.
     """
-    vocab_block = _format_vocabulary_for_prompt(all_feature_names, feature_categories)
+    if schema_enforced:
+        return """You are a clinical dermatology NLP specialist performing STRICT, LITERAL feature extraction from skin-condition image captions.
 
-    return f"""You are a clinical dermatology NLP specialist performing STRICT, LITERAL feature extraction from skin-condition image captions.
+The API will enforce the output shape via a strict JSON schema. Your only job is to FILL IN the correct values per caption.
 
-TASK
-Produce ONE top-level JSON OBJECT with a single key "captions" whose value is a JSON array containing ONE object per input caption, in input order. Each inner object maps CATEGORY name → list of CANONICAL FEATURE VALUES (from the vocabulary below) that are EXPLICITLY described in that caption.
+FOR EACH INPUT CAPTION, produce ONE object containing EVERY category key. For each category:
+  • Emit []  if the caption does NOT explicitly discuss that category. This is the DEFAULT — use it for almost every category.
+  • Emit [<canonical_value>, ...] ONLY when the caption LITERALLY mentions one or more values for that category.
 
-REQUIRED OUTPUT SHAPE (always obey this exact top-level structure)
-{{
-  "captions": [
-    {{ <category>: [<canonical_value>, ...], ... }},
-    ...
-  ]
-}}
-
-COUNT RULES (VIOLATING THESE IS THE MOST COMMON FAILURE — DO NOT VIOLATE)
-- The user message starts with "INPUT: N caption(s)". Your output's "captions" array MUST have EXACTLY N elements.
-- Output ONE object per caption, in the SAME ORDER as the input.
-- For a caption with NO extractable features, emit an EMPTY object {{}} at that index. DO NOT omit its position.
-- DO NOT emit fewer than N objects.
-- DO NOT emit more than N objects. Once you have emitted the N-th object, close the array `]` and the outer object `}}` and STOP.
-- DO NOT repeat any object. DO NOT emit duplicate entries for the same caption index.
-- Return ONLY the JSON object above. No markdown, no commentary, no trailing text.
-
-ABSOLUTE EXTRACTION RULES — READ CAREFULLY
-
-1. EXPLICIT MENTION ONLY. Include a feature value ONLY if the caption explicitly mentions it by name or an OBVIOUS clinical synonym. NEVER infer features from the disease name, the overall image concept, or prior medical knowledge. If the caption does not say WHERE on the body the lesion is, do NOT list any body_location feature — regardless of which disease is named.
-
-2. OMIT categories the caption says nothing about. If the caption contains NO information about a given category, do NOT include that category key in the inner object at all. Omitted categories decode to value 2 (truly unknown) downstream. This is the ONLY way to express "unknown".
-
-3. A category key must appear in an inner object ONLY if you put AT LEAST ONE canonical value in its list. Do NOT output empty lists like `"body_location": []` — if no specific value is mentioned, OMIT the key entirely.
-
-4. CANONICAL SYNONYM MAPPING. Always map wording in the caption to the canonical vocabulary name:
+EXTRACTION RULES
+1. EXPLICIT MENTION ONLY. Include a value ONLY when the caption states it (or an obvious clinical synonym). NEVER infer features from the disease name, the overall image concept, or prior medical knowledge. If the caption does not say WHERE on the body the lesion is, body_location MUST be [] — regardless of which disease is named.
+2. CANONICAL SYNONYMS — map to the exact canonical values allowed by the schema:
    - erythema / erythematous / reddened → morphology_color: "red"
    - itchy / itching / pruritus / pruritic → symptoms_dermatological: "itching"
    - elevated / bumpy / papular → morphology_texture: "raised"
@@ -954,26 +1001,109 @@ ABSOLUTE EXTRACTION RULES — READ CAREFULLY
    - burning sensation → symptoms_dermatological: "burning"
    - tender / sore / painful → symptoms_dermatological: "pain" (or closest canonical)
    - hyperpigmentation / darkening of skin → morphology_color: "hyperpigmented"
-   - "rash" / "eruption" alone → do NOT assume a color, texture, or body location
-   - "lesion" / "spots" alone → do NOT assume a shape, color, texture, or body location
+3. GENERIC WORDS DO NOT IMPLY CATEGORIES.
+   - "rash" / "eruption" alone → no color, texture, or body_location value.
+   - "lesion" / "spots" alone → no shape, color, texture, or body_location value.
+   - "photo" / "image" alone → no image_metadata value.
+4. DEMOGRAPHICS and HISTORY only when literally stated ("30-year-old man" → demographics_age, demographics_sex; "1-week rash" → duration).
 
-5. Demographics (age, sex, ethnicity, skin_type), duration, triggers, history, treatments, image_metadata, clinical_signs, severity — OMIT these categories UNLESS the caption literally states something mapping to them. "Photo of a 30-year-old man" → demographics_age: ["30-40"], demographics_sex: ["male"]. "Photo" alone → do not add image_metadata.
+COUNT / ORDER
+- The user message starts with "INPUT: N caption(s)". Produce EXACTLY N caption objects, in input order.
+- Emit every category key in every caption object (the schema requires it); use [] for unmentioned categories.
+- Do not repeat, skip, or add extra caption objects. Once the N-th object is written, stop.
 
-OUTPUT EXAMPLES (2 captions in, {{"captions":[...]}} out — always this shape)
+FEW-SHOT EXAMPLES (ONLY the categories that pick up values are shown below — in your actual output every other category MUST also be present with value []).
 
-Input captions:
-[0] Red, raised, itchy patch on the left forearm
-[1] Scaly plaque
+[E1] Multi-feature, clear anchors
+    Input : "Red, raised, itchy patch on the left forearm"
+    Non-empty values → body_location:["forearm"], morphology_color:["red"],
+                       morphology_texture:["raised"], symptoms_dermatological:["itching"]
+    (all other categories: [])
 
-Correct output:
-{{"captions":[{{"morphology_color":["red"],"morphology_texture":["raised"],"symptoms_dermatological":["itching"],"body_location":["forearm"]}},{{"morphology_texture":["scaly"]}}]}}
+[E2] Disease name only — NO extractable features (common trap: do NOT infer from the diagnosis)
+    Input : "Image of suspected melanoma"
+    Non-empty values → (none)
+    (every category: [])
 
-More inner-object examples:
-- "Solitary lesion" → {{"lesion_count":["single"]}}
-- "Photo of suspected melanoma" → {{}}   (no features explicitly stated)
-- "Non-itchy red macule on cheek" → {{"morphology_color":["red"],"morphology_texture":["flat"],"body_location":["cheek"]}}
-  (explicit negation "non-itchy" is discussed, but we only list what is PRESENT;
-  symptoms_dermatological is omitted so downstream marks it as unknown.)
+[E3] Generic words alone — NO anchors (rash / eruption / lesion / photo tell you nothing specific)
+    Input : "Skin eruption in an adult"
+    Non-empty values → (none — "rash"/"eruption"/"adult-without-age" do not map)
+    (every category: [])
+
+[E4] Demographics stated literally, no lesion description
+    Input : "Photo of a 30-year-old woman with a red bump on the cheek"
+    Non-empty values → demographics_age:["30-40"], demographics_sex:["female"],
+                       body_location:["cheek"], morphology_color:["red"],
+                       morphology_texture:["raised"]
+    (Note: "bump" maps to morphology_texture:"raised"; "photo" alone does NOT fill image_metadata.)
+
+[E5] Explicit negation — list only what IS present; do NOT mark the negated value as "present"
+    Input : "Non-itchy red macule on the chest"
+    Non-empty values → body_location:["chest"], morphology_color:["red"],
+                       morphology_texture:["flat"]
+    (symptoms_dermatological stays [] — "non-itchy" means itching is absent, but our
+     contract only marks mentioned-positive values.)
+
+[E6] Synonym mapping in action
+    Input : "Erythematous, scaly plaque with pruritus"
+    Non-empty values → morphology_color:["red"], morphology_texture:["scaly"],
+                       symptoms_dermatological:["itching"]
+    (erythematous → red; pruritus → itching.)
+
+Follow the examples above LITERALLY. When in doubt, prefer [] — unjustified 1s are worse than missing 1s.
+"""
+
+    # Non-schema-enforced fallback (json_object mode). Keep the vocabulary
+    # block and the original rule set; the model needs the full spec here.
+    vocab_block = _format_vocabulary_for_prompt(all_feature_names, feature_categories)
+
+    return f"""You are a clinical dermatology NLP specialist performing STRICT, LITERAL feature extraction from skin-condition image captions.
+
+TASK
+Produce ONE top-level JSON OBJECT with a single key "captions" whose value is a JSON array containing ONE object per input caption, in input order. Each inner object maps CATEGORY name → list of CANONICAL FEATURE VALUES (from the vocabulary below) that are EXPLICITLY described in that caption.
+
+REQUIRED OUTPUT SHAPE
+{{
+  "captions": [
+    {{ <category>: [<canonical_value>, ...], ... }},
+    ...
+  ]
+}}
+
+COUNT RULES
+- The user message starts with "INPUT: N caption(s)". Your "captions" array MUST have EXACTLY N elements.
+- ONE object per caption, in the SAME ORDER as input. Empty object {{}} for captions with no extractable features.
+- NEVER skip, repeat, or add extra entries. After the N-th object, close the JSON and stop.
+- Return ONLY the JSON object above. No markdown, no commentary.
+
+EXTRACTION RULES
+1. EXPLICIT MENTION ONLY. Include a value ONLY when the caption literally mentions it (or an obvious clinical synonym). NEVER infer from the disease name or prior knowledge. If the caption does not say WHERE on the body, OMIT body_location — regardless of which disease is named.
+2. OMIT categories the caption says nothing about. Omitted categories decode to 2 (unknown).
+3. A category key should only appear if you put AT LEAST ONE canonical value in its list. Do NOT emit empty lists.
+4. Canonical synonyms: erythema→red, itchy/pruritus→itching, raised/papular→raised, scaly/flaky→scaly, burning→burning, tender/sore→pain, hyperpigmentation→hyperpigmented.
+5. Generic words ("rash", "eruption", "lesion", "spots", "photo") do NOT imply any category.
+
+FEW-SHOT EXAMPLES (omit any category not shown in the inner object — omitted = unknown)
+
+[E1] "Red, raised, itchy patch on the left forearm"
+  → {{"body_location":["forearm"],"morphology_color":["red"],"morphology_texture":["raised"],"symptoms_dermatological":["itching"]}}
+
+[E2] "Image of suspected melanoma"            (disease name only → NO anchors)
+  → {{}}
+
+[E3] "Skin eruption in an adult"              (generic words, no age → NO anchors)
+  → {{}}
+
+[E4] "Photo of a 30-year-old woman with a red bump on the cheek"
+  → {{"demographics_age":["30-40"],"demographics_sex":["female"],"body_location":["cheek"],"morphology_color":["red"],"morphology_texture":["raised"]}}
+
+[E5] "Non-itchy red macule on the chest"      (explicit negation: don't mark itching present)
+  → {{"body_location":["chest"],"morphology_color":["red"],"morphology_texture":["flat"]}}
+
+[E6] "Erythematous, scaly plaque with pruritus"   (synonym mapping)
+  → {{"morphology_color":["red"],"morphology_texture":["scaly"],"symptoms_dermatological":["itching"]}}
+
+Follow the examples above LITERALLY. When in doubt, OMIT the category — unjustified 1s are worse than missing 1s.
 
 VOCABULARY (valid canonical values per category — output MUST use only these names):
 {vocab_block}
@@ -982,19 +1112,23 @@ Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 """
 
 
-def build_extraction_user_prompt(captions: list[str]) -> str:
-    """
-    Variable user message. Starts with a count-enforcement reminder so the
-    model cannot silently skip captions (common failure mode when many
-    captions have no extractable features).
-    """
+def build_extraction_user_prompt(captions: list[str], *, schema_enforced: bool = False) -> str:
+    """Variable user message with a short count-enforcement header."""
     n = len(captions)
-    header = (
-        f"INPUT: {n} caption(s) indexed [0]..[{n - 1}].\n"
-        f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
-        f"order. Emit {{}} for any caption that has no extractable features — "
-        f"NEVER skip a caption, NEVER repeat a caption, NEVER emit extra items."
-    )
+    if schema_enforced:
+        header = (
+            f"INPUT: {n} caption(s) indexed [0]..[{n - 1}].\n"
+            f"Emit EXACTLY {n} caption objects in the same order. For each "
+            f"object, include every category key (use [] for unmentioned "
+            f"categories). Never skip, repeat, or add extras."
+        )
+    else:
+        header = (
+            f"INPUT: {n} caption(s) indexed [0]..[{n - 1}].\n"
+            f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
+            f"order. Emit {{}} for any caption that has no extractable features — "
+            f"NEVER skip a caption, NEVER repeat a caption, NEVER emit extra items."
+        )
     body = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
     return f"{header}\n\n{body}"
 
@@ -1002,13 +1136,58 @@ def build_extraction_user_prompt(captions: list[str]) -> str:
 def build_tagged_system_prompt(
     all_feature_names: list[str],
     feature_categories: dict[str, str],
+    *,
+    schema_enforced: bool = False,
 ) -> str:
     """
     Optional variant for pre-tagged inputs. Input is a list of raw feature tag
     strings already extracted from each caption; the LLM maps each tag to a
-    canonical value and groups them per category using the SAME wrapped-object
-    shape as `build_llm_system_prompt` so both paths use one parser.
+    canonical value and groups them per category. Shares the same output
+    contract as ``build_llm_system_prompt``.
     """
+    if schema_enforced:
+        return """You are a clinical dermatology NLP specialist converting pre-extracted feature tags into canonical per-category one-hot encoding.
+
+The API enforces the output shape via a strict JSON schema. Your job is to FILL IN values per tag-list.
+
+FOR EACH INPUT TAG-LIST, produce ONE object containing EVERY category key. For each category:
+  • Emit []  if no input tag maps to that category (DEFAULT for most categories).
+  • Emit [<canonical_value>, ...] containing every tag that maps to that category.
+
+RULES
+1. Map each raw tag to the CLOSEST canonical value allowed by the schema's enum (e.g. "erythematous" → morphology_color:"red", "pruritus" → symptoms_dermatological:"itching", "papule" → morphology_texture:"papular" or "raised").
+2. Drop tags that do not map to any canonical value — do NOT invent categories or values.
+3. NEVER infer features not present in the input tag list.
+
+COUNT / ORDER
+- The user message starts with "INPUT: N tag-list(s)". Produce EXACTLY N caption objects in input order.
+- Emit every category key in every object (use [] for categories with no mapped tags).
+- Do not repeat, skip, or add extra caption objects.
+
+FEW-SHOT EXAMPLES (only non-empty categories shown; every other category MUST be present with value []):
+
+[E1] Tags: ["red", "raised", "itchy", "forearm"]
+    Non-empty → body_location:["forearm"], morphology_color:["red"],
+                morphology_texture:["raised"], symptoms_dermatological:["itching"]
+
+[E2] Tags: []                                   (no tags → everything [])
+    Non-empty → (none)
+
+[E3] Tags: ["melanoma"]                        (disease tag alone does NOT anchor anything)
+    Non-empty → (none)
+
+[E4] Tags: ["erythematous", "pruritus", "scaly"]   (synonym mapping)
+    Non-empty → morphology_color:["red"], morphology_texture:["scaly"],
+                symptoms_dermatological:["itching"]
+
+[E5] Tags: ["30-year-old", "female", "red bump", "cheek"]
+    Non-empty → demographics_age:["30-40"], demographics_sex:["female"],
+                body_location:["cheek"], morphology_color:["red"],
+                morphology_texture:["raised"]
+
+Follow these examples literally. Drop any tag that has no clear canonical mapping.
+"""
+
     vocab_block = _format_vocabulary_for_prompt(all_feature_names, feature_categories)
 
     return f"""You are a clinical dermatology NLP specialist converting pre-extracted feature tags into canonical per-category one-hot encoding.
@@ -1037,6 +1216,23 @@ RULES
 4. NEVER invent features that are not derivable from the input tag list.
 5. Do NOT output empty lists like `"body_location": []` — omit the category key entirely instead.
 
+FEW-SHOT EXAMPLES (omit any category not shown — omitted = unknown)
+
+[E1] Tags: ["red", "raised", "itchy", "forearm"]
+  → {{"body_location":["forearm"],"morphology_color":["red"],"morphology_texture":["raised"],"symptoms_dermatological":["itching"]}}
+
+[E2] Tags: []                                    (no tags)
+  → {{}}
+
+[E3] Tags: ["melanoma"]                         (disease-only tag — NO anchors)
+  → {{}}
+
+[E4] Tags: ["erythematous", "pruritus", "scaly"]   (synonym mapping)
+  → {{"morphology_color":["red"],"morphology_texture":["scaly"],"symptoms_dermatological":["itching"]}}
+
+[E5] Tags: ["30-year-old", "female", "red bump", "cheek"]
+  → {{"demographics_age":["30-40"],"demographics_sex":["female"],"body_location":["cheek"],"morphology_color":["red"],"morphology_texture":["raised"]}}
+
 VOCABULARY (valid canonical values per category):
 {vocab_block}
 
@@ -1044,15 +1240,22 @@ Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 """
 
 
-def build_tagged_user_prompt(tag_lists: list[list[str]]) -> str:
+def build_tagged_user_prompt(tag_lists: list[list[str]], *, schema_enforced: bool = False) -> str:
     """User message when using pre-tagged feature lists instead of captions."""
     n = len(tag_lists)
-    header = (
-        f"INPUT: {n} tag-list(s) indexed [0]..[{n - 1}].\n"
-        f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
-        f"order. Emit {{}} for any input with no mappable tags — NEVER skip, "
-        f"NEVER repeat, NEVER emit extra items."
-    )
+    if schema_enforced:
+        header = (
+            f"INPUT: {n} tag-list(s) indexed [0]..[{n - 1}].\n"
+            f"Emit EXACTLY {n} caption objects in the same order. Include every "
+            f"category key in each object (use [] for categories no tag maps to)."
+        )
+    else:
+        header = (
+            f"INPUT: {n} tag-list(s) indexed [0]..[{n - 1}].\n"
+            f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
+            f"order. Emit {{}} for any input with no mappable tags — NEVER skip, "
+            f"NEVER repeat, NEVER emit extra items."
+        )
     body = "\n".join(
         f"[{i}] {', '.join(tags) if tags else '(empty)'}"
         for i, tags in enumerate(tag_lists)
@@ -1091,33 +1294,43 @@ def _expand_category_output_to_encoding(
     all_feature_names: list[str],
     feature_categories: dict[str, str],
     category_to_values: dict[str, set[str]],
+    cat_val_to_name: dict[tuple[str, str], str] | None = None,
 ) -> tuple[dict[str, int], int]:
     """
     Convert one caption's {"category": ["value1", ...]} dict into the full
     {feature_name: 0|1|2} encoding. Returns (encoding, num_fixes).
 
-      • Category present with ≥1 recognized value   → listed=1, others in cat=0.
-      • Category present with empty / unrecognized  → all in cat = 0 (considered
-        absent). Strict-schema mode always takes this branch when a category
-        has no matching feature.
-      • Category absent from the dict               → all in cat = 2 (unknown).
-        Under strict-schema this never happens because every category is
-        required; only the json_object fallback path ever reaches 2 here.
+    Tri-state semantics (matches the user's original spec):
+      • Category present with ≥1 recognized value
+          → listed values = 1 (present), OTHER values in that category = 0
+            (inferably absent — we know it's X, so it's not Y or Z).
+      • Category present with an empty list [] OR only unrecognized values
+          → stays as 2 (unknown). The model couldn't anchor the category to
+            any canonical value, so we make NO inference — neither present
+            nor absent.
+      • Category absent from the dict (only possible in json_object fallback)
+          → stays as 2 (unknown).
+
+    The empty-list=unknown rule is what keeps all three states alive under
+    strict-schema mode (where every category is REQUIRED): most categories
+    come back as ``[]`` for a typical caption, and they correctly decode to 2.
     """
     fixes = 0
-    # Default every feature to 2 (unknown). We'll overwrite categories that are
-    # present in the LLM's output.
+    # Default every feature to 2 (unknown). Overwrite only when the LLM
+    # EXPLICITLY anchors a category with at least one recognized value.
     result = {name: 2 for name in all_feature_names}
 
     if not isinstance(cat_output, dict):
         return result, 1
 
-    # Pre-compute feature name per (category, value) for fast writes.
-    cat_val_to_name: dict[tuple[str, str], str] = {}
-    for name in all_feature_names:
-        cat = feature_categories.get(name, "other")
-        val = name[len(cat) + 1:] if name.startswith(cat + "_") else name
-        cat_val_to_name[(cat, val)] = name
+    # Pre-compute feature name per (category, value) — the hot path of the
+    # pipeline. Cache across invocations when the caller provides the map.
+    if cat_val_to_name is None:
+        cat_val_to_name = {}
+        for name in all_feature_names:
+            cat = feature_categories.get(name, "other")
+            val = name[len(cat) + 1:] if name.startswith(cat + "_") else name
+            cat_val_to_name[(cat, val)] = name
 
     for cat_key, vals in cat_output.items():
         cat = str(cat_key).strip()
@@ -1125,6 +1338,9 @@ def _expand_category_output_to_encoding(
             fixes += 1
             continue
 
+        # Tolerate None (nullable schema) and scalar strings by normalising.
+        if vals is None:
+            continue  # unknown — stays 2
         if not isinstance(vals, list):
             if isinstance(vals, str):
                 vals = [vals]
@@ -1146,15 +1362,9 @@ def _expand_category_output_to_encoding(
                 fixes += 1
 
         if not recognized:
-            # Category key was present but no recognized value → still treat
-            # category as "considered": set everything in category to 0 (absent)
-            # rather than 2. This matches the user's request: "only mark features
-            # mentioned in the caption as 1 ... but if a category is considered,
-            # others in it are 0 (inferably absent)".
-            for val in valid_set:
-                fname = cat_val_to_name.get((cat, val))
-                if fname is not None:
-                    result[fname] = 0
+            # Category present with empty list or only unrecognised values:
+            # keep as 2 (unknown). The LLM didn't anchor the category, so we
+            # make no claims about present/absent.
             continue
 
         # Mark present values = 1, all other features in this category = 0.
@@ -1283,11 +1493,23 @@ def parse_extraction_response_text(
     fallback_row = {k: 2 for k in all_feature_names}
 
     if feature_categories is None:
-        feature_categories = {name: name.split("_", 1)[0] for name in all_feature_names}
+        # Safer fallback than .split("_", 1)[0]: use everything before the last
+        # "_" so compound categories (symptoms_dermatological_itching →
+        # "symptoms_dermatological") survive. If a name has no "_", use itself.
+        feature_categories = {}
+        for name in all_feature_names:
+            idx = name.rfind("_")
+            feature_categories[name] = name[:idx] if idx > 0 else name
 
     category_to_values = _build_category_to_features_map(
         all_feature_names, feature_categories
     )
+    # Build (cat, val) → feature_name ONCE for all captions in this batch.
+    cat_val_to_name: dict[tuple[str, str], str] = {}
+    for name in all_feature_names:
+        cat = feature_categories.get(name, "other")
+        val = name[len(cat) + 1:] if name.startswith(cat + "_") else name
+        cat_val_to_name[(cat, val)] = name
 
     def _finalize(parsed_list: list, *, salvaged: bool) -> tuple[list[dict], dict]:
         results: list[dict] = []
@@ -1301,15 +1523,21 @@ def parse_extraction_response_text(
                 all_feature_names,
                 feature_categories,
                 category_to_values,
+                cat_val_to_name=cat_val_to_name,
             )
             fixes += f
             results.append(encoding)
 
-        short = len(captions) - len(results)
+        num_llm_items = len(results)
+        short = len(captions) - num_llm_items
         if short > 0:
             results.extend([dict(fallback_row)] * short)
             fixes += short
         results = results[: len(captions)]
+        # Record how many rows actually came from the LLM (pre-padding) so
+        # callers can slice precisely without sniffing all-2 rows (which can
+        # be a legitimate "everything unknown" caption in the new semantics).
+        stats["num_llm_items"] = num_llm_items
 
         stats["validation_fixes"] = fixes
         stats["salvaged"] = salvaged
@@ -1333,19 +1561,19 @@ def parse_extraction_response_text(
             # Loop case: model repeated items past our requested count. Take
             # the first N as a full success (they were well-formed).
             if len(salvaged) >= n:
-                print(
+                tqdm.write(
                     f"    parse_extraction_response_text: {str(e)[:120]} — "
                     f"model looped (emitted {len(salvaged)}/{n} items); keeping "
                     f"first {n} as a clean recovery."
                 )
+                results, _ = _finalize(salvaged[:n], salvaged=False)
                 stats["truncated"] = False
                 stats["salvaged"] = False
-                results = _finalize(salvaged[:n], salvaged=False)[0]
                 stats["success"] = True
                 return results, stats
             # True truncation — partial prefix recovered.
             stats["truncated"] = True
-            print(
+            tqdm.write(
                 f"    parse_extraction_response_text: {str(e)[:120]} — "
                 f"salvaged {len(salvaged)}/{n} caption(s) from truncated JSON "
                 f"(finish_reason={finish_reason!r})"
@@ -1353,7 +1581,7 @@ def parse_extraction_response_text(
             return _finalize(salvaged, salvaged=True)
         # No salvage possible. Tag as truncated only if API says so.
         stats["truncated"] = finish_reason == "length"
-        print(
+        tqdm.write(
             f"    parse_extraction_response_text: {str(e)[:160]} "
             f"(finish_reason={finish_reason!r}, {_response_tail_hint(txt)})"
         )
@@ -1363,7 +1591,7 @@ def parse_extraction_response_text(
     if inner is None:
         stats["shape_mismatch"] = True
         top_keys = list(parsed.keys())[:6] if isinstance(parsed, dict) else None
-        print(
+        tqdm.write(
             f"    parse_extraction_response_text: unexpected JSON shape "
             f"(type={type(parsed).__name__}, top_keys={top_keys}). "
             f"Expected {{'captions': [...]}}."
@@ -1373,7 +1601,7 @@ def parse_extraction_response_text(
     # Loop case #2: JSON parsed AND array has more items than we asked for
     # (model repeated outputs). First N items are still correct; take them.
     if len(inner) > n:
-        print(
+        tqdm.write(
             f"    parse_extraction_response_text: model looped "
             f"(emitted {len(inner)}/{n} items); trimming to first {n}."
         )
@@ -1382,14 +1610,12 @@ def parse_extraction_response_text(
     # Short response case: JSON parsed but array has fewer items than asked.
     # This happens for two reasons:
     #   (a) finish_reason='length' → real truncation,
-    #   (b) finish_reason='stop'   → model skipped captions (e.g., only emitted
-    #       outputs for captions it had features for, ignoring the "emit {}"
-    #       rule).
-    # Either way, treat the gap as a tail that needs retry, and keep the good
-    # prefix we already have. This avoids redoing all N captions.
+    #   (b) finish_reason='stop'   → model skipped captions (rare under strict
+    #       schema; common under json_object).
+    # Either way, keep the good prefix and retry only the missing tail.
     if len(inner) < n:
         stats["truncated"] = True  # use truncation path → tail-only sync retry
-        print(
+        tqdm.write(
             f"    parse_extraction_response_text: short response "
             f"({len(inner)}/{n} items, finish_reason={finish_reason!r}); "
             f"keeping prefix, will retry missing tail."
@@ -1399,18 +1625,12 @@ def parse_extraction_response_text(
     return _finalize(inner, salvaged=False)
 
 
-def _is_valid_idx(val, n: int) -> bool:
-    """Kept for backward compatibility; no longer used in the new parser."""
-    try:
-        v = int(val)
-        return 0 <= v < n
-    except (ValueError, TypeError):
-        return False
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # SYNC EXTRACTION (single batch LLM call with retries)
 # ══════════════════════════════════════════════════════════════════════════════
+
+MAX_BISECT_DEPTH = _safe_int_env("MAX_BISECT_DEPTH", 4, vmin=0, vmax=8)
+
 
 def extract_features_batch(
     captions: list[str],
@@ -1421,6 +1641,7 @@ def extract_features_batch(
     tag_lists: list[list[str]] | None = None,
     feature_categories: dict[str, str] | None = None,
     json_schema: dict | None = None,
+    _bisect_depth: int = 0,
 ) -> tuple[list[dict], dict]:
     """
     Sync LLM call for one batch of captions (or pre-tagged feature lists), with
@@ -1433,12 +1654,17 @@ def extract_features_batch(
         not help because the LLM is misbehaving regardless of size. Return the
         best salvaged partial if any, else all-unknown rows.
 
+    Bisect depth is capped at ``MAX_BISECT_DEPTH`` (default 4 → at most 16×
+    the original batch count in API calls) so a pathological truncation loop
+    can't burn through thousands of API calls before failing out.
+
     Returns (list of feature dicts aligned to input captions, stats dict).
     """
+    schema_enforced = json_schema is not None and OPENAI_USE_JSON_SCHEMA
     if tag_lists is not None:
-        user_prompt = build_tagged_user_prompt(tag_lists)
+        user_prompt = build_tagged_user_prompt(tag_lists, schema_enforced=schema_enforced)
     else:
-        user_prompt = build_extraction_user_prompt(captions)
+        user_prompt = build_extraction_user_prompt(captions, schema_enforced=schema_enforced)
 
     stats = {
         "attempts": 0,
@@ -1481,13 +1707,13 @@ def extract_features_batch(
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
         except json.JSONDecodeError as e:
-            print(f"    JSON parse error (attempt {attempt+1}): {str(e)[:80]}")
+            tqdm.write(f"    JSON parse error (attempt {attempt+1}): {str(e)[:80]}")
             last_failure_kind = "parse_error"
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
         except Exception as e:
             err_str = str(e)
-            print(f"    LLM attempt {attempt+1} failed: {err_str[:120]}")
+            tqdm.write(f"    LLM attempt {attempt+1} failed: {err_str[:120]}")
             last_failure_kind = "api_error"
             if attempt < retries - 1:
                 if "429" in err_str or "quota" in err_str.lower():
@@ -1497,23 +1723,30 @@ def extract_features_batch(
 
     # All retries exhausted. Bisect ONLY when the root cause was truncation —
     # splitting a shape-mismatch batch just multiplies wasted calls because
-    # every half will hit the same LLM misbehaviour.
-    if saw_truncation and len(captions) > 1 and tag_lists is None:
+    # every half will hit the same LLM misbehaviour. Cap recursion depth so a
+    # pathological truncation loop can't spiral.
+    if (
+        saw_truncation
+        and len(captions) > 1
+        and tag_lists is None
+        and _bisect_depth < MAX_BISECT_DEPTH
+    ):
         mid = len(captions) // 2
         left_caps, right_caps = captions[:mid], captions[mid:]
-        print(
+        tqdm.write(
             f"    Bisecting TRUNCATED batch ({len(captions)} → "
-            f"{len(left_caps)} + {len(right_caps)}) after {retries} attempts"
+            f"{len(left_caps)} + {len(right_caps)}) after {retries} attempts "
+            f"(depth {_bisect_depth + 1}/{MAX_BISECT_DEPTH})"
         )
         left, st_l = extract_features_batch(
             left_caps, all_feature_names, system_prompt,
             retries=retries, feature_categories=feature_categories,
-            json_schema=json_schema,
+            json_schema=json_schema, _bisect_depth=_bisect_depth + 1,
         )
         right, st_r = extract_features_batch(
             right_caps, all_feature_names, system_prompt,
             retries=retries, feature_categories=feature_categories,
-            json_schema=json_schema,
+            json_schema=json_schema, _bisect_depth=_bisect_depth + 1,
         )
         stats["validation_fixes"] += (
             st_l.get("validation_fixes", 0) + st_r.get("validation_fixes", 0)
@@ -1521,18 +1754,24 @@ def extract_features_batch(
         stats["success"] = bool(st_l.get("success") and st_r.get("success"))
         return left + right, stats
 
+    if saw_truncation and _bisect_depth >= MAX_BISECT_DEPTH:
+        tqdm.write(
+            f"    Bisect depth cap ({MAX_BISECT_DEPTH}) reached for a "
+            f"{len(captions)}-caption batch; giving up instead of subdividing further."
+        )
+
     if best_partial is not None:
         unknown_count = sum(
             1 for row in best_partial if all(v == 2 for v in row.values())
         )
-        print(
+        tqdm.write(
             f"    All {retries} attempts failed ({last_failure_kind}). "
             f"Using salvaged partial: {len(captions) - unknown_count}/{len(captions)} "
             f"recovered, {unknown_count} left as unknown."
         )
         return best_partial, stats
 
-    print(
+    tqdm.write(
         f"    ERROR: All {retries} attempts failed ({last_failure_kind}). "
         f"Returning {len(captions)} unknown rows."
     )
@@ -1567,14 +1806,15 @@ def _run_dedup_openai_batch(
     """
     jobs: list[dict] = []
     job_batches: dict[str, list[str]] = {}
+    schema_enforced = json_schema is not None and OPENAI_USE_JSON_SCHEMA
 
     for batch_idx, batch_start in enumerate(range(0, len(unique_captions), LLM_BATCH_SIZE)):
         batch = unique_captions[batch_start : batch_start + LLM_BATCH_SIZE]
         if caption_to_tags is not None:
             tag_lists = [caption_to_tags.get(c, []) for c in batch]
-            user_prompt = build_tagged_user_prompt(tag_lists)
+            user_prompt = build_tagged_user_prompt(tag_lists, schema_enforced=schema_enforced)
         else:
-            user_prompt = build_extraction_user_prompt(batch)
+            user_prompt = build_extraction_user_prompt(batch, schema_enforced=schema_enforced)
         cid = f"p2_{batch_idx}"
         jobs.append(
             {
@@ -1610,17 +1850,24 @@ def _run_dedup_openai_batch(
         # the unsalvaged tail via sync. Shape-mismatch failures skip sync retry
         # entirely because a retry will hit the same misbehaviour.
         if not ok:
-            salvaged_prefix = 0
-            if pst.get("salvaged"):
-                for idx, row in enumerate(batch_results):
-                    if all(v == 2 for v in row.values()):
-                        salvaged_prefix = idx
-                        break
-                else:
-                    salvaged_prefix = len(batch_results)
+            # Exact salvage prefix from the parser's own count. Sniffing
+            # "all-2 rows" is unreliable now that genuinely-unknown captions
+            # legitimately produce all-2 output under strict-schema semantics.
+            num_llm_items = pst.get("num_llm_items")
+            if num_llm_items is None:
+                # Fallback only if the parser version somehow didn't set it:
+                # take a conservative zero so the whole batch is retried.
+                salvaged_prefix = 0
+            else:
+                salvaged_prefix = min(int(num_llm_items), len(batch))
 
             is_truncation = pst.get("truncated") or finish_reason == "length"
             is_shape = pst.get("shape_mismatch")
+            # In the batch-fallback path we're already retrying something the
+            # Batch API had a full completion window for. Keep the sync retry
+            # tight (2 attempts) so one bad chunk can't explode into thousands
+            # of extra API calls.
+            sync_retries = 2
 
             if is_shape and not pst.get("salvaged"):
                 tqdm.write(
@@ -1643,6 +1890,7 @@ def _run_dedup_openai_batch(
                     )
                     tail_results, st2 = extract_features_batch(
                         tail_batch, all_feature_names, system_prompt,
+                        retries=sync_retries,
                         tag_lists=batch_tags,
                         feature_categories=feature_categories,
                         json_schema=json_schema,
@@ -1657,7 +1905,8 @@ def _run_dedup_openai_batch(
                 # Generic parse error: retry once synchronously, no bisect.
                 tqdm.write(
                     f"    Sync fallback for batch {cid} — parse error "
-                    f"(finish_reason={finish_reason!r}), retrying full batch."
+                    f"(finish_reason={finish_reason!r}), retrying full batch "
+                    f"(sync retries={sync_retries})."
                 )
                 batch_tags = (
                     [caption_to_tags.get(c, []) for c in batch]
@@ -1665,6 +1914,7 @@ def _run_dedup_openai_batch(
                 )
                 retry_results, st2 = extract_features_batch(
                     batch, all_feature_names, system_prompt,
+                    retries=sync_retries,
                     tag_lists=batch_tags,
                     feature_categories=feature_categories,
                     json_schema=json_schema,
@@ -1800,17 +2050,71 @@ def _run_dedup_sync(
 # CHECKPOINT HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` atomically (tmp file + os.replace).
+
+    Prevents partial / truncated files when the process is killed mid-write —
+    a real risk for the dedup checkpoint which is overwritten after every
+    Batch-API chunk during long (multi-hour) runs.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding=encoding, newline="") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def _save_dedup_checkpoint(
     caption_features: dict[str, dict],
     all_feature_names: list[str],
     ckpt_path: Path,
 ) -> None:
-    """Save caption->values checkpoint as compact {caption: [int, ...]} JSON."""
+    """Save caption->values checkpoint as compact {caption: [int, ...]} JSON.
+
+    Written atomically so a killed process can't leave a truncated JSON on
+    disk that would fail to re-load on the next run.
+    """
     compact: dict[str, list[int]] = {}
     for cap, feats in caption_features.items():
         compact[cap] = [feats.get(fn, 2) for fn in all_feature_names]
-    with open(ckpt_path, "w", encoding="utf-8") as f:
-        json.dump(compact, f, ensure_ascii=False)
+    _atomic_write_text(ckpt_path, json.dumps(compact, ensure_ascii=False))
+
+
+# ── Failed-caption tracking (resume retries instead of freezing all-2 rows) ─
+FAILED_CAPS_FILE = "dedup_failed_captions.json"
+
+
+def _save_failed_captions(failed: set[str], path: Path) -> None:
+    """Persist the set of captions that exhausted all retries (sync + batch).
+
+    On resume, ``run_extraction`` deliberately EXCLUDES these from
+    ``caption_features`` so they are re-attempted — otherwise they'd sit in
+    the checkpoint as all-2 rows and never be retried."""
+    try:
+        _atomic_write_text(path, json.dumps(sorted(failed), ensure_ascii=False))
+    except Exception as e:
+        tqdm.write(f"  WARNING: failed to save failed-captions file: {e!r}")
+
+
+def _load_failed_captions(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, list):
+            return {str(x) for x in raw}
+    except Exception as e:
+        tqdm.write(f"  WARNING: failed to load failed-captions file: {e!r}")
+    return set()
 
 
 def _load_dedup_checkpoint(
@@ -1917,14 +2221,8 @@ def run_extraction(csv_path: str, schema_path: str):
     if not use_tags:
         print(f"  Using CAPTION input mode (full captions)")
 
-    # ── Build system prompt ───────────────────────────────────────────────────
-    if use_tags:
-        system_prompt = build_tagged_system_prompt(all_feature_names, feature_categories)
-    else:
-        system_prompt = build_llm_system_prompt(all_feature_names, feature_categories)
-
-    # Strict JSON schema for OpenAI structured outputs (shape + vocabulary
-    # enforcement). Only applied when LLM_PROVIDER=openai and OPENAI_USE_JSON_SCHEMA=1.
+    # ── Build strict JSON schema FIRST so we can shrink the prompt when ────
+    #    structured outputs will enforce shape + vocabulary server-side.
     extraction_json_schema: dict | None = None
     if LLM_PROVIDER == "openai" and OPENAI_USE_JSON_SCHEMA:
         try:
@@ -1937,6 +2235,17 @@ def run_extraction(csv_path: str, schema_path: str):
                 f"  Strict JSON schema enabled: {n_cats} categories, "
                 f"{len(all_feature_names)} total values — server-side shape enforced."
             )
+            # Cache-key rotation: include a short hash of the schema body so
+            # prompt-cache entries are invalidated whenever the schema (and
+            # therefore the effective system-level contract) changes.
+            import hashlib
+            schema_hash = hashlib.sha1(
+                json.dumps(extraction_json_schema, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:10]
+            global OPENAI_PROMPT_CACHE_KEY  # noqa: PLW0603
+            if OPENAI_PROMPT_CACHE_KEY:
+                OPENAI_PROMPT_CACHE_KEY = f"{OPENAI_PROMPT_CACHE_KEY}_{schema_hash}"
+                print(f"  Effective prompt-cache key: {OPENAI_PROMPT_CACHE_KEY!r}")
         except Exception as e:
             print(
                 f"  WARNING: failed to build JSON schema ({e!r}); falling back "
@@ -1944,8 +2253,21 @@ def run_extraction(csv_path: str, schema_path: str):
             )
             extraction_json_schema = None
 
+    schema_enforced = extraction_json_schema is not None
+
+    # ── Build system prompt ───────────────────────────────────────────────────
+    if use_tags:
+        system_prompt = build_tagged_system_prompt(
+            all_feature_names, feature_categories, schema_enforced=schema_enforced
+        )
+    else:
+        system_prompt = build_llm_system_prompt(
+            all_feature_names, feature_categories, schema_enforced=schema_enforced
+        )
+
     # ── Load checkpoint if exists ─────────────────────────────────────────────
     dedup_ckpt = CHECKPOINT_DIR / DEDUP_CKPT_FILE
+    failed_caps_path = CHECKPOINT_DIR / FAILED_CAPS_FILE
     caption_features: dict[str, dict] = {}
     if dedup_ckpt.exists():
         try:
@@ -1954,6 +2276,20 @@ def run_extraction(csv_path: str, schema_path: str):
         except Exception as e:
             print(f"  WARNING: checkpoint load failed ({e}), re-extracting all")
             caption_features = {}
+
+    # Captions that previously exhausted all retries are deliberately kicked
+    # back out of the checkpoint so they get another shot this run. They are
+    # re-added on retry failure via _save_failed_captions below.
+    known_failed = _load_failed_captions(failed_caps_path)
+    if known_failed:
+        requeued = [c for c in known_failed if c in caption_features]
+        for c in requeued:
+            caption_features.pop(c, None)
+        if requeued:
+            print(
+                f"  Requeueing {len(requeued):,} caption(s) that previously failed "
+                f"all retries (from {failed_caps_path.name})."
+            )
 
     remaining = [c for c in unique_caps_list if c not in caption_features]
 
@@ -2030,6 +2366,14 @@ def run_extraction(csv_path: str, schema_path: str):
 
         caption_features.update(new_results)
         _save_dedup_checkpoint(caption_features, all_feature_names, dedup_ckpt)
+        # Record any captions that still failed so they get retried next run.
+        still_failed = {c for c in remaining if c not in new_results}
+        _save_failed_captions(still_failed, failed_caps_path)
+        if still_failed:
+            print(
+                f"  {len(still_failed):,} caption(s) failed all retries this run "
+                f"→ saved to {failed_caps_path.name} for next-run retry."
+            )
         print(f"  Checkpoint saved: {len(caption_features):,} unique caption results\n")
     else:
         print("  All unique captions already in checkpoint — skipping extraction.\n")
@@ -2072,10 +2416,21 @@ def run_extraction(csv_path: str, schema_path: str):
             final_df[col] = final_df[col].fillna(2).astype(int)
             final_df[col] = final_df[col].clip(0, 2)
 
-    final_df.to_csv(OUTPUT_CSV, index=False)
+    # Write the final CSV atomically so a crash mid-serialisation can't leave
+    # a partially-written 10 GB file that later tools would treat as valid.
+    output_csv_path = Path(OUTPUT_CSV)
+    tmp_out = output_csv_path.with_suffix(output_csv_path.suffix + f".tmp.{os.getpid()}")
+    try:
+        final_df.to_csv(tmp_out, index=False)
+        os.replace(tmp_out, output_csv_path)
+    finally:
+        if tmp_out.exists():
+            try:
+                tmp_out.unlink()
+            except OSError:
+                pass
 
-    with open(STATS_FILE, "w") as f:
-        json.dump(global_stats, f, indent=2, default=str)
+    _atomic_write_text(Path(STATS_FILE), json.dumps(global_stats, indent=2, default=str))
 
     print(f"\n{'=' * 70}")
     print(f"  OUTPUT SUMMARY")
