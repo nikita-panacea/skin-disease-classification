@@ -91,7 +91,7 @@ Apply this gate logic. State which case applies:
 
   Case A: Image NORMAL  + Symptoms NORMAL    → No condition. Reassure patient.
   Case B: Image NORMAL  + Symptoms MILD      → No skin Dx. Refer to GP if persistent.
-  Case C: Image NORMAL  + Symptoms CONCERNING→ No visual correlate. Possible systemic
+  Case C: Image NORMAL  + Symptoms CONCERNING → No visual correlate. Possible systemic
                                                or non-dermatological cause. Refer GP.
   Case D: Image BORDERLINE + Symptoms NORMAL → Document finding. Monitor only.
   Case E: Image BORDERLINE + Symptoms MILD   → Proceed with LOW-CONFIDENCE differential.

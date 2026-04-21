@@ -78,7 +78,10 @@ LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")
 
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "1").lower() in ("1", "true", "yes")
-OPENAI_PROMPT_CACHE_KEY = os.getenv("OPENAI_PROMPT_CACHE_KEY", "phase2_extraction_v2_per_category").strip()
+OPENAI_PROMPT_CACHE_KEY = os.getenv(
+    "OPENAI_PROMPT_CACHE_KEY",
+    "phase2_extraction_v3_captions_wrapped",
+).strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
 
 _EXTENDED_CACHE_MODELS = frozenset({
@@ -258,7 +261,7 @@ def _openai_extraction_chat_body(system_prompt: str, user_prompt: str) -> dict:
         # 8192 gives headroom for ~25 captions × ~21 categories each without truncation.
         # gpt-4o-mini caps at 16384 output tokens; raise further if you see completion=8192
         # with truncated JSON in logs.
-        "max_tokens": 15000,
+        "max_tokens": 8192,
         "stream": False,
     }
     if OPENAI_JSON_RESPONSE:
@@ -283,9 +286,19 @@ def _maybe_log_openai_usage(resp) -> None:
     )
 
 
-def _openai_parse_batch_output_jsonl(raw: str) -> tuple[dict[str, str], dict[str, int]]:
+def _openai_parse_batch_output_jsonl(
+    raw: str,
+) -> tuple[dict[str, dict], dict[str, int]]:
+    """
+    Parse the JSONL output file from a Batch API job.
+
+    Returns (mapping, usage_acc) where each mapping entry is a dict:
+        {"content": <str>, "finish_reason": <str>, "completion_tokens": <int>}
+    so downstream parsers can distinguish truncation (finish_reason='length')
+    from shape/JSON errors (finish_reason='stop').
+    """
     acc = {"prompt": 0, "completion": 0, "cached": 0}
-    out: dict[str, str] = {}
+    out: dict[str, dict] = {}
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -315,16 +328,22 @@ def _openai_parse_batch_output_jsonl(raw: str) -> tuple[dict[str, str], dict[str
         if not isinstance(body, dict):
             continue
         usage = body.get("usage") or {}
+        ct = int(usage.get("completion_tokens", 0))
         acc["prompt"] += int(usage.get("prompt_tokens", 0))
-        acc["completion"] += int(usage.get("completion_tokens", 0))
+        acc["completion"] += ct
         details = usage.get("prompt_tokens_details") or {}
         acc["cached"] += int(details.get("cached_tokens", 0))
         choices = body.get("choices") or []
         if choices and cid and isinstance(choices[0], dict):
-            msg = choices[0].get("message") or {}
+            choice0 = choices[0]
+            msg = choice0.get("message") or {}
             if not isinstance(msg, dict):
                 msg = {}
-            out[cid] = msg.get("content") or ""
+            out[cid] = {
+                "content": msg.get("content") or "",
+                "finish_reason": choice0.get("finish_reason") or "",
+                "completion_tokens": ct,
+            }
     return out, acc
 
 
@@ -472,11 +491,23 @@ def _run_openai_extraction_batch_chunk(
     return mapping, acc, batch_job.id, failed_ids
 
 
-def _run_openai_extraction_batch(jobs: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
+def _run_openai_extraction_batch(
+    jobs: list[dict],
+    *,
+    per_chunk_callback=None,
+) -> tuple[dict[str, dict], dict[str, int]]:
     """
     Splits by request count, file size, AND enqueued-token limit.
     Chunks run sequentially. Failed items are retried in new batch rounds
     (up to OPENAI_BATCH_MAX_RETRIES) before the caller falls back to sync.
+
+    If ``per_chunk_callback`` is provided, it is invoked after every chunk
+    completes with the *incremental* mapping for that chunk
+    ({custom_id: {"content","finish_reason","completion_tokens"}}). This lets
+    the caller persist progress so a crash mid-run loses at most one chunk.
+
+    Returns the combined mapping (same per-id dict shape as each chunk) plus
+    total usage accounting across all rounds.
     """
     if not jobs:
         return {}, {"prompt": 0, "completion": 0, "cached": 0}
@@ -486,7 +517,7 @@ def _run_openai_extraction_batch(jobs: list[dict]) -> tuple[dict[str, str], dict
     token_cap = OPENAI_BATCH_MAX_ENQUEUED_TOKENS
 
     jobs_by_id = {j["custom_id"]: j for j in jobs}
-    combined: dict[str, str] = {}
+    combined: dict[str, dict] = {}
     acc_total = {"prompt": 0, "completion": 0, "cached": 0}
     pending_jobs = list(jobs)
     chunk_counter = 0
@@ -521,6 +552,15 @@ def _run_openai_extraction_batch(jobs: list[dict]) -> tuple[dict[str, str], dict
                 acc_total[k] += a[k]
             all_failed_ids.update(failed)
 
+            if per_chunk_callback is not None and m:
+                try:
+                    per_chunk_callback(m)
+                except Exception as cb_err:
+                    tqdm.write(
+                        f"    per_chunk_callback raised: {cb_err!r} "
+                        f"(continuing; data already in mapping)"
+                    )
+
         if not all_failed_ids:
             break
 
@@ -553,18 +593,22 @@ def call_llm(
     retries: int = MAX_RETRIES,
     *,
     openai_prompt_cache_key: str | None = None,
-) -> str:
+) -> tuple[str, dict]:
     """
     Generic LLM caller that works for Gemini, OpenAI, and Qwen (local).
-    For OpenAI, pass static instructions as system_prompt and variable text as prompt
-    so prompt caching can reuse the system prefix across calls.
+    For OpenAI, pass static instructions as system_prompt and variable text as
+    prompt so prompt caching can reuse the system prefix across calls.
+
+    Returns (text, meta) where ``meta`` contains ``finish_reason`` and
+    ``completion_tokens`` when the provider exposes them. This lets callers
+    distinguish truncation (finish_reason='length') from shape/parse errors.
     """
     for attempt in range(retries):
         try:
             if LLM_PROVIDER == "gemini":
                 full_prompt = f"{system_prompt or ''}\n\n{prompt}" if system_prompt else prompt
                 response = model.generate_content(full_prompt)
-                return response.text
+                return response.text, {"finish_reason": "", "completion_tokens": 0}
 
             elif LLM_PROVIDER == "openai":
                 messages = []
@@ -576,7 +620,10 @@ def call_llm(
                     model=MODEL_NAME,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=15000,
+                    # Match the Batch API body exactly so behavior is consistent
+                    # across paths. A looping model still costs real money at
+                    # 15k tokens, so we cap here at 8192.
+                    max_tokens=8192,
                     stream=False,
                 )
                 if OPENAI_JSON_RESPONSE:
@@ -589,7 +636,14 @@ def call_llm(
                 _openai_apply_prompt_caching(create_kw, ck)
                 response = openai_client.chat.completions.create(**create_kw)
                 _maybe_log_openai_usage(response)
-                return response.choices[0].message.content
+                choice0 = response.choices[0]
+                meta = {
+                    "finish_reason": getattr(choice0, "finish_reason", "") or "",
+                    "completion_tokens": int(
+                        getattr(getattr(response, "usage", None), "completion_tokens", 0) or 0
+                    ),
+                }
+                return choice0.message.content, meta
 
             elif LLM_PROVIDER == "qwen":
                 messages = []
@@ -609,7 +663,14 @@ def call_llm(
                         "chat_template_kwargs": {"enable_thinking": False},
                     },
                 )
-                return response.choices[0].message.content
+                choice0 = response.choices[0]
+                meta = {
+                    "finish_reason": getattr(choice0, "finish_reason", "") or "",
+                    "completion_tokens": int(
+                        getattr(getattr(response, "usage", None), "completion_tokens", 0) or 0
+                    ),
+                }
+                return choice0.message.content, meta
 
         except Exception as e:
             err_msg = str(e)
@@ -756,24 +817,44 @@ def build_llm_system_prompt(
     """
     Strict, name-based, per-category extraction prompt.
 
-    Output shape per caption (sparse — only categories that the caption mentions):
-        {"morphology_color":["red"], "symptoms_dermatological":["itching"]}
-    Omitted categories decode to value 2 (unknown).
+    Output shape (top level is a JSON OBJECT to stay compatible with OpenAI's
+    response_format=json_object, which REJECTS bare arrays):
+
+        {"captions": [
+            {"morphology_color":["red"], "symptoms_dermatological":["itching"]},
+            {"morphology_texture":["scaly"]},
+            ...
+        ]}
+
+    Each inner object is the per-category output for one caption. Omitted
+    categories decode to value 2 (unknown) in the downstream one-hot matrix.
     """
     vocab_block = _format_vocabulary_for_prompt(all_feature_names, feature_categories)
 
     return f"""You are a clinical dermatology NLP specialist performing STRICT, LITERAL feature extraction from skin-condition image captions.
 
 TASK
-For EACH input caption, output ONE JSON OBJECT whose KEYS are CATEGORY names and whose VALUES are lists of CANONICAL FEATURE VALUES (from the vocabulary below) that are EXPLICITLY described in that caption. Return one object per caption inside a JSON array, in input order.
+Produce ONE top-level JSON OBJECT with a single key "captions" whose value is a JSON array containing ONE object per input caption, in input order. Each inner object maps CATEGORY name → list of CANONICAL FEATURE VALUES (from the vocabulary below) that are EXPLICITLY described in that caption.
 
-ABSOLUTE RULES — READ CAREFULLY
+REQUIRED OUTPUT SHAPE (always obey this exact top-level structure)
+{{
+  "captions": [
+    {{ <category>: [<canonical_value>, ...], ... }},
+    ...
+  ]
+}}
+
+- The array length MUST equal the number of input captions (one object per caption, in order).
+- If a caption has no extractable features, emit an EMPTY object {{}} at that position — never skip a position.
+- Return ONLY the JSON object above. No markdown, no commentary, no trailing text.
+
+ABSOLUTE EXTRACTION RULES — READ CAREFULLY
 
 1. EXPLICIT MENTION ONLY. Include a feature value ONLY if the caption explicitly mentions it by name or an OBVIOUS clinical synonym. NEVER infer features from the disease name, the overall image concept, or prior medical knowledge. If the caption does not say WHERE on the body the lesion is, do NOT list any body_location feature — regardless of which disease is named.
 
-2. OMIT categories the caption says nothing about. If the caption contains NO information about a given category, do NOT include that category key in the output object at all. Omitted categories decode to value 2 (truly unknown). This is the ONLY way to express "unknown".
+2. OMIT categories the caption says nothing about. If the caption contains NO information about a given category, do NOT include that category key in the inner object at all. Omitted categories decode to value 2 (truly unknown) downstream. This is the ONLY way to express "unknown".
 
-3. A category key must appear in the output ONLY if you put AT LEAST ONE canonical value in its list. Do NOT output empty lists like `"body_location": []` — if no specific value is mentioned, OMIT the key entirely.
+3. A category key must appear in an inner object ONLY if you put AT LEAST ONE canonical value in its list. Do NOT output empty lists like `"body_location": []` — if no specific value is mentioned, OMIT the key entirely.
 
 4. CANONICAL SYNONYM MAPPING. Always map wording in the caption to the canonical vocabulary name:
    - erythema / erythematous / reddened → morphology_color: "red"
@@ -788,30 +869,26 @@ ABSOLUTE RULES — READ CAREFULLY
 
 5. Demographics (age, sex, ethnicity, skin_type), duration, triggers, history, treatments, image_metadata, clinical_signs, severity — OMIT these categories UNLESS the caption literally states something mapping to them. "Photo of a 30-year-old man" → demographics_age: ["30-40"], demographics_sex: ["male"]. "Photo" alone → do not add image_metadata.
 
-6. STRICT JSON output. Return ONLY the JSON array — no markdown fences, no comments, no preface.
+OUTPUT EXAMPLES (2 captions in, {{"captions":[...]}} out — always this shape)
 
-OUTPUT EXAMPLES
+Input captions:
+[0] Red, raised, itchy patch on the left forearm
+[1] Scaly plaque
 
-Caption: "Red, raised, itchy patch on the left forearm"
-→ {{"morphology_color":["red"],"morphology_texture":["raised"],"symptoms_dermatological":["itching"],"body_location":["forearm"]}}
+Correct output:
+{{"captions":[{{"morphology_color":["red"],"morphology_texture":["raised"],"symptoms_dermatological":["itching"],"body_location":["forearm"]}},{{"morphology_texture":["scaly"]}}]}}
 
-Caption: "Scaly plaque"
-→ {{"morphology_texture":["scaly"]}}
-
-Caption: "Solitary lesion"
-→ {{"lesion_count":["single"]}}
-
-Caption: "Photo of suspected melanoma"
-→ {{}}
-
-Caption: "Non-itchy red macule on cheek"
-→ {{"morphology_color":["red"],"morphology_texture":["flat"],"body_location":["cheek"]}}
-(Explicit negation "non-itchy" is discussed, but we only list what is PRESENT; symptoms_dermatological is omitted so downstream marks it as unknown.)
+More inner-object examples:
+- "Solitary lesion" → {{"lesion_count":["single"]}}
+- "Photo of suspected melanoma" → {{}}   (no features explicitly stated)
+- "Non-itchy red macule on cheek" → {{"morphology_color":["red"],"morphology_texture":["flat"],"body_location":["cheek"]}}
+  (explicit negation "non-itchy" is discussed, but we only list what is PRESENT;
+  symptoms_dermatological is omitted so downstream marks it as unknown.)
 
 VOCABULARY (valid canonical values per category — output MUST use only these names):
 {vocab_block}
 
-Return ONLY the JSON array.
+Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 """
 
 
@@ -827,14 +904,25 @@ def build_tagged_system_prompt(
     """
     Optional variant for pre-tagged inputs. Input is a list of raw feature tag
     strings already extracted from each caption; the LLM maps each tag to a
-    canonical value and groups them per category using the SAME output shape
-    as `build_llm_system_prompt`.
+    canonical value and groups them per category using the SAME wrapped-object
+    shape as `build_llm_system_prompt` so both paths use one parser.
     """
     vocab_block = _format_vocabulary_for_prompt(all_feature_names, feature_categories)
 
     return f"""You are a clinical dermatology NLP specialist converting pre-extracted feature tags into canonical per-category one-hot encoding.
 
-For EACH input (a list of raw feature tag strings), output ONE JSON OBJECT mapping CATEGORY → list of CANONICAL VALUES taken from the vocabulary below. Return a JSON array with one object per input, in input order.
+TASK
+Produce ONE top-level JSON OBJECT with a single key "captions" whose value is a JSON array containing ONE object per input (a list of raw feature tag strings), in input order. Each inner object maps CATEGORY → list of CANONICAL VALUES from the vocabulary below.
+
+REQUIRED OUTPUT SHAPE
+{{
+  "captions": [
+    {{ <category>: [<canonical_value>, ...], ... }},
+    ...
+  ]
+}}
+- The array length MUST equal the number of input items (use an empty object {{}} when no tag maps).
+- Return ONLY the JSON object — no markdown, no commentary.
 
 RULES
 1. Include a category ONLY if at least one input tag maps to a canonical value in that category.
@@ -842,10 +930,11 @@ RULES
 3. Map each tag to the closest canonical value (e.g. "erythematous" → morphology_color:"red", "pruritus" → symptoms_dermatological:"itching", "papule" → morphology_texture:"papular" or "raised"). Drop tags that do not map cleanly.
 4. NEVER invent features that are not derivable from the input tag list.
 5. Do NOT output empty lists like `"body_location": []` — omit the category key entirely instead.
-6. Return ONLY the JSON array — no markdown, no commentary.
 
 VOCABULARY (valid canonical values per category):
 {vocab_block}
+
+Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 """
 
 
@@ -962,32 +1051,62 @@ def _expand_category_output_to_encoding(
     return result, fixes
 
 
-def _salvage_truncated_json_array(txt: str) -> list[dict] | None:
+_WRAPPED_ARRAY_KEYS = ("captions", "results", "data", "outputs", "items")
+
+
+def _extract_captions_array(parsed) -> list | None:
     """
-    When the LLM response was cut off mid-string (max_tokens hit), `json.loads`
-    fails. Walk the text incrementally with `raw_decode` and return every top-
-    level object that WAS fully emitted before truncation. Returns None if no
-    objects can be salvaged.
+    Pull the inner per-caption array out of the LLM's top-level object.
+
+    We insist on a wrapped object because we force `response_format=json_object`.
+    This function returns None if the parsed JSON isn't a known wrapped shape,
+    so the caller can fail fast instead of misinterpreting a shape mismatch as
+    a one-caption response.
+    """
+    if isinstance(parsed, list):
+        # If JSON mode is off, the model may emit a bare array — accept it.
+        return parsed
+    if isinstance(parsed, dict):
+        for key in _WRAPPED_ARRAY_KEYS:
+            val = parsed.get(key)
+            if isinstance(val, list):
+                return val
+        # Some models emit {"0": {...}, "1": {...}, ...}. Accept that shape too.
+        numeric_dict = all(
+            isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+            for k, v in parsed.items()
+        ) and len(parsed) > 0
+        if numeric_dict:
+            return [parsed[k] for k in sorted(parsed.keys(), key=int)]
+    return None
+
+
+def _salvage_truncated_captions_array(txt: str) -> list[dict] | None:
+    """
+    When the LLM response was cut off mid-string (finish_reason=length),
+    `json.loads` fails. Locate the opening of the "captions" array (or any
+    bare array start) and walk it incrementally with `raw_decode`, returning
+    every top-level object that WAS fully emitted before the truncation point.
+    Returns None if nothing can be salvaged.
     """
     if not txt:
         return None
 
-    start = txt.find("[")
-    if start < 0:
-        # Might be a bare dict stream; try to collect top-level objects.
-        start = txt.find("{")
-    if start < 0:
+    # Prefer the "captions" array start.
+    idx = -1
+    m = re.search(r'"captions"\s*:\s*\[', txt)
+    if m:
+        idx = m.end() - 1  # position of "["
+    if idx < 0:
+        idx = txt.find("[")
+    if idx < 0:
         return None
 
     dec = json.JSONDecoder()
-    i = start
-    # Skip "[" if present and whitespace
-    if txt[i] == "[":
-        i += 1
+    i = idx + 1  # skip "["
     objects: list[dict] = []
     n = len(txt)
     while i < n:
-        # Skip whitespace / separators between array items
         while i < n and txt[i] in " \t\r\n,":
             i += 1
         if i >= n or txt[i] == "]":
@@ -1003,8 +1122,7 @@ def _salvage_truncated_json_array(txt: str) -> list[dict] | None:
     return objects if objects else None
 
 
-def _openai_response_finish_info(text: str) -> str:
-    """Small hint message when parsing fails — guesses the likely cause."""
+def _response_tail_hint(text: str) -> str:
     if not text:
         return "empty response"
     tail = text[-80:].replace("\n", " ")
@@ -1016,28 +1134,35 @@ def parse_extraction_response_text(
     captions: list[str],
     all_feature_names: list[str],
     feature_categories: dict[str, str] | None = None,
+    *,
+    finish_reason: str | None = None,
 ) -> tuple[list[dict], dict]:
     """
-    Parse the LLM response (per-caption per-category JSON) into one-hot dicts.
+    Parse the LLM response into per-caption one-hot dicts.
 
-    Expected text format:
-        [
-          {"morphology_color":["red"], "symptoms_dermatological":["itching"]},
-          {"morphology_texture":["scaly"]},
-          ...
-        ]
+    Expected top-level shape (matches the system prompt):
+        {"captions": [ {<cat>:[...], ...}, {...}, ... ]}
 
-    Robustness:
-      • Accepts `{"results":[...]}` / `{"data":[...]}` wrappers.
-      • Accepts a single bare caption object.
-      • Salvages valid prefix objects when the JSON was truncated mid-string
-        (common when the completion hits max_tokens). Only the captions at the
-        tail get the "unknown" fallback row; preceding captions are recovered.
+    Also tolerates alternate wrapper keys (``results``, ``data``, ``outputs``,
+    ``items``), numeric-keyed dicts, and plain arrays when JSON mode is off.
 
-    Returns (results, stats). `stats["success"]` is True only when ALL captions
-    were parsed or salvaged without error.
+    Returns (results, stats). The caller uses ``stats`` to decide how to retry:
+      - stats["success"]    True iff ALL captions were parsed cleanly.
+      - stats["salvaged"]   True iff we recovered a prefix from truncated JSON.
+      - stats["truncated"]  True iff the parse failure looks like mid-string
+                            truncation (either ``finish_reason == 'length'`` or
+                            salvage recovered some objects). Drives bisect.
+      - stats["shape_mismatch"]  True iff the response parsed fully but the
+                            shape didn't match what we asked for. No point in
+                            bisecting — just mark the batch failed.
     """
-    stats: dict = {"success": False, "validation_fixes": 0, "salvaged": False}
+    stats: dict = {
+        "success": False,
+        "validation_fixes": 0,
+        "salvaged": False,
+        "truncated": False,
+        "shape_mismatch": False,
+    }
     fallback_row = {k: 2 for k in all_feature_names}
 
     if feature_categories is None:
@@ -1047,18 +1172,19 @@ def parse_extraction_response_text(
         all_feature_names, feature_categories
     )
 
-    def _finalize(parsed_list: list[dict], *, salvaged: bool) -> tuple[list[dict], dict]:
+    def _finalize(parsed_list: list, *, salvaged: bool) -> tuple[list[dict], dict]:
         results: list[dict] = []
         fixes = 0
         for item in parsed_list:
+            if not isinstance(item, dict):
+                fixes += 1
+                item = {}
             encoding, f = _expand_category_output_to_encoding(
-                item if isinstance(item, dict) else {},
+                item,
                 all_feature_names,
                 feature_categories,
                 category_to_values,
             )
-            if not isinstance(item, dict):
-                f += 1
             fixes += f
             results.append(encoding)
 
@@ -1070,48 +1196,53 @@ def parse_extraction_response_text(
 
         stats["validation_fixes"] = fixes
         stats["salvaged"] = salvaged
-        # Salvaged partial parses still count as "success=False" so the caller
-        # retries or falls back to sync for the missing tail captions, but the
-        # salvaged prefix is preserved in the returned results.
+        # Partial salvage is not a full success — caller will retry the tail
+        # (or accept the partial + unknown rows depending on policy).
         stats["success"] = not salvaged and short == 0
         return results, stats
 
     txt = (text or "").strip()
     txt = re.sub(r"```json\s*|```\s*", "", txt).strip()
 
+    # Path 1: JSON parses — figure out the shape.
     try:
         parsed = json.loads(txt)
     except (json.JSONDecodeError, ValueError, TypeError) as e:
-        salvaged = _salvage_truncated_json_array(txt)
+        # Path 2: JSON broken — try salvage (typical for truncation).
+        salvaged = _salvage_truncated_captions_array(txt)
+        is_truncation = (finish_reason == "length") or bool(salvaged)
+        stats["truncated"] = is_truncation
         if salvaged:
             print(
                 f"    parse_extraction_response_text: {str(e)[:120]} — "
-                f"salvaged {len(salvaged)}/{len(captions)} caption(s) from truncated JSON"
+                f"salvaged {len(salvaged)}/{len(captions)} caption(s) from "
+                f"truncated JSON (finish_reason={finish_reason!r})"
             )
             return _finalize(salvaged, salvaged=True)
         print(
             f"    parse_extraction_response_text: {str(e)[:160]} "
-            f"({_openai_response_finish_info(txt)})"
+            f"(finish_reason={finish_reason!r}, {_response_tail_hint(txt)})"
         )
         return [dict(fallback_row) for _ in captions], stats
 
-    # Tolerate the LLM wrapping the array in a container object.
-    if isinstance(parsed, dict):
-        for key in ("results", "data", "captions", "outputs", "items"):
-            if key in parsed and isinstance(parsed[key], list):
-                parsed = parsed[key]
-                break
-        else:
-            parsed = [parsed]
-
-    if not isinstance(parsed, list):
+    inner = _extract_captions_array(parsed)
+    if inner is None:
+        stats["shape_mismatch"] = True
+        top_keys = list(parsed.keys())[:6] if isinstance(parsed, dict) else None
         print(
-            f"    parse_extraction_response_text: expected JSON array, got "
-            f"{type(parsed).__name__}"
+            f"    parse_extraction_response_text: unexpected JSON shape "
+            f"(type={type(parsed).__name__}, top_keys={top_keys}). "
+            f"Expected {{'captions': [...]}}."
         )
         return [dict(fallback_row) for _ in captions], stats
 
-    return _finalize(parsed, salvaged=False)
+    # If we got fewer items than captions AND the completion hit the token
+    # cap, treat it as truncation (even though JSON parsed cleanly).
+    if len(inner) < len(captions) and finish_reason == "length":
+        stats["truncated"] = True
+        return _finalize(inner, salvaged=True)
+
+    return _finalize(inner, salvaged=False)
 
 
 def _is_valid_idx(val, n: int) -> bool:
@@ -1137,7 +1268,16 @@ def extract_features_batch(
     feature_categories: dict[str, str] | None = None,
 ) -> tuple[list[dict], dict]:
     """
-    Batch LLM call for one chunk of captions (or pre-tagged feature lists).
+    Sync LLM call for one batch of captions (or pre-tagged feature lists), with
+    retry + bisect-on-truncation.
+
+    Failure policy:
+      - finish_reason == "length" (truncated JSON): retry, then bisect smaller.
+      - All other failures (shape mismatch, unparseable garbage, runaway loops):
+        retry up to ``retries`` times. Do NOT bisect — smaller batches would
+        not help because the LLM is misbehaving regardless of size. Return the
+        best salvaged partial if any, else all-unknown rows.
+
     Returns (list of feature dicts aligned to input captions, stats dict).
     """
     if tag_lists is not None:
@@ -1152,18 +1292,31 @@ def extract_features_batch(
     }
 
     best_partial: list[dict] | None = None
+    saw_truncation = False
+    last_failure_kind = "unknown"
 
     for attempt in range(retries):
         try:
             stats["attempts"] = attempt + 1
-            text = call_llm(user_prompt, system_prompt, retries=1)
+            text, meta = call_llm(user_prompt, system_prompt, retries=1)
+            finish_reason = meta.get("finish_reason", "")
             valid_results, pst = parse_extraction_response_text(
-                text, captions, all_feature_names, feature_categories
+                text, captions, all_feature_names, feature_categories,
+                finish_reason=finish_reason,
             )
             stats["validation_fixes"] = pst.get("validation_fixes", 0)
             if pst.get("success"):
                 stats["success"] = True
                 return valid_results, stats
+
+            if pst.get("truncated") or finish_reason == "length":
+                saw_truncation = True
+                last_failure_kind = "truncated"
+            elif pst.get("shape_mismatch"):
+                last_failure_kind = "shape_mismatch"
+            else:
+                last_failure_kind = "parse_error"
+
             # Keep the longest successful prefix across attempts so a consistently
             # truncating batch still returns real data for the recovered captions.
             if pst.get("salvaged"):
@@ -1172,25 +1325,27 @@ def extract_features_batch(
                 time.sleep(2 ** attempt)
         except json.JSONDecodeError as e:
             print(f"    JSON parse error (attempt {attempt+1}): {str(e)[:80]}")
+            last_failure_kind = "parse_error"
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
         except Exception as e:
             err_str = str(e)
             print(f"    LLM attempt {attempt+1} failed: {err_str[:120]}")
+            last_failure_kind = "api_error"
             if attempt < retries - 1:
                 if "429" in err_str or "quota" in err_str.lower():
                     time.sleep(10 * (attempt + 1))
                 else:
                     time.sleep(2 ** attempt)
 
-    # All retries exhausted. If this is a multi-caption batch, bisect and retry
-    # each half independently — most truncation-induced failures are due to one
-    # or two verbose captions, so splitting quickly isolates them.
-    if len(captions) > 1 and tag_lists is None:
+    # All retries exhausted. Bisect ONLY when the root cause was truncation —
+    # splitting a shape-mismatch batch just multiplies wasted calls because
+    # every half will hit the same LLM misbehaviour.
+    if saw_truncation and len(captions) > 1 and tag_lists is None:
         mid = len(captions) // 2
         left_caps, right_caps = captions[:mid], captions[mid:]
         print(
-            f"    Bisecting failed batch ({len(captions)} → "
+            f"    Bisecting TRUNCATED batch ({len(captions)} → "
             f"{len(left_caps)} + {len(right_caps)}) after {retries} attempts"
         )
         left, st_l = extract_features_batch(
@@ -1212,13 +1367,16 @@ def extract_features_batch(
             1 for row in best_partial if all(v == 2 for v in row.values())
         )
         print(
-            f"    ERROR: All {retries} attempts failed. Using salvaged partial: "
-            f"{len(captions) - unknown_count}/{len(captions)} recovered, "
-            f"{unknown_count} fell back to unknown."
+            f"    All {retries} attempts failed ({last_failure_kind}). "
+            f"Using salvaged partial: {len(captions) - unknown_count}/{len(captions)} "
+            f"recovered, {unknown_count} left as unknown."
         )
         return best_partial, stats
 
-    print(f"    ERROR: All {retries} attempts failed. Returning unknown values.")
+    print(
+        f"    ERROR: All {retries} attempts failed ({last_failure_kind}). "
+        f"Returning {len(captions)} unknown rows."
+    )
     fallback = [{k: 2 for k in all_feature_names} for _ in captions]
     return fallback, stats
 
@@ -1235,10 +1393,17 @@ def _run_dedup_openai_batch(
     *,
     caption_to_tags: dict[str, list[str]] | None = None,
     feature_categories: dict[str, str] | None = None,
+    ckpt_save_fn=None,
+    seed_results: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
     """
     Process deduplicated captions via OpenAI Batch API.
+
     Returns {caption_text: {feature_name: value}}.
+
+    Incremental checkpointing: ``ckpt_save_fn(partial_results)`` (if provided)
+    is called after every batch chunk finishes, so a mid-run crash loses at
+    most one chunk's worth of captions.
     """
     jobs: list[dict] = []
     job_batches: dict[str, list[str]] = {}
@@ -1259,54 +1424,88 @@ def _run_dedup_openai_batch(
     global_stats["total_batches"] = len(jobs)
     global_stats["total_api_calls"] = len(jobs)
 
-    mapping, _acc = _run_openai_extraction_batch(jobs)
+    # Accumulator shared between the callback (per chunk) and the final sweep.
+    results: dict[str, dict] = dict(seed_results) if seed_results else {}
 
-    results: dict[str, dict] = {}
-    for cid, batch in job_batches.items():
-        text = mapping.get(cid) or ""
+    def _parse_and_accumulate(cid: str, item_meta: dict) -> bool:
+        """Parse one batch item into per-caption one-hot dicts; returns ok."""
+        batch = job_batches.get(cid, [])
+        if not batch:
+            return True
+        text = item_meta.get("content") or ""
+        finish_reason = item_meta.get("finish_reason") or ""
         batch_results, pst = parse_extraction_response_text(
-            text, batch, all_feature_names, feature_categories
+            text, batch, all_feature_names, feature_categories,
+            finish_reason=finish_reason,
         )
         ok = pst.get("success", False)
         global_stats["total_validation_fixes"] += pst.get("validation_fixes", 0)
 
+        # If parse wasn't a clean success, recover what we can and only retry
+        # the unsalvaged tail via sync. Shape-mismatch failures skip sync retry
+        # entirely because a retry will hit the same misbehaviour.
         if not ok:
-            # If salvage recovered a prefix, keep it and only re-run the unsalvaged
-            # tail captions synchronously. This usually cuts sync-retry cost by
-            # 10-20x for truncation-related failures.
-            tail_start = 0
+            salvaged_prefix = 0
             if pst.get("salvaged"):
                 for idx, row in enumerate(batch_results):
                     if all(v == 2 for v in row.values()):
-                        tail_start = idx
+                        salvaged_prefix = idx
                         break
                 else:
-                    tail_start = len(batch_results)
+                    salvaged_prefix = len(batch_results)
 
-            tail_batch = batch[tail_start:] if tail_start < len(batch) else []
+            is_truncation = pst.get("truncated") or finish_reason == "length"
+            is_shape = pst.get("shape_mismatch")
 
-            if tail_batch:
+            if is_shape and not pst.get("salvaged"):
                 tqdm.write(
-                    f"    Sync fallback for batch {cid} "
-                    f"(salvaged {tail_start}/{len(batch)}, "
-                    f"retrying tail of {len(tail_batch)})"
+                    f"    Shape mismatch for batch {cid} "
+                    f"(finish_reason={finish_reason!r}) — marking failed, "
+                    f"no sync retry (would repeat the same error)."
+                )
+                # batch_results is already full of unknown rows from the parser.
+            elif is_truncation:
+                tail_batch = batch[salvaged_prefix:] if salvaged_prefix < len(batch) else []
+                if tail_batch:
+                    tqdm.write(
+                        f"    Sync fallback for batch {cid} — truncation: "
+                        f"salvaged {salvaged_prefix}/{len(batch)}, "
+                        f"retrying tail of {len(tail_batch)}."
+                    )
+                    batch_tags = (
+                        [caption_to_tags.get(c, []) for c in tail_batch]
+                        if caption_to_tags is not None else None
+                    )
+                    tail_results, st2 = extract_features_batch(
+                        tail_batch, all_feature_names, system_prompt,
+                        tag_lists=batch_tags,
+                        feature_categories=feature_categories,
+                    )
+                    batch_results = batch_results[:salvaged_prefix] + tail_results
+                    ok = st2.get("success", False)
+                    global_stats["total_retries"] += 1
+                    global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
+                else:
+                    ok = True  # full batch salvaged
+            else:
+                # Generic parse error: retry once synchronously, no bisect.
+                tqdm.write(
+                    f"    Sync fallback for batch {cid} — parse error "
+                    f"(finish_reason={finish_reason!r}), retrying full batch."
                 )
                 batch_tags = (
-                    [caption_to_tags.get(c, []) for c in tail_batch]
+                    [caption_to_tags.get(c, []) for c in batch]
                     if caption_to_tags is not None else None
                 )
-                tail_results, st2 = extract_features_batch(
-                    tail_batch, all_feature_names, system_prompt,
+                retry_results, st2 = extract_features_batch(
+                    batch, all_feature_names, system_prompt,
                     tag_lists=batch_tags,
                     feature_categories=feature_categories,
                 )
-                batch_results = batch_results[:tail_start] + tail_results
+                batch_results = retry_results
                 ok = st2.get("success", False)
                 global_stats["total_retries"] += 1
                 global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
-            else:
-                # Full batch already salvaged; treat as success.
-                ok = True
 
         if ok:
             global_stats["successful_batches"] += 1
@@ -1315,6 +1514,59 @@ def _run_dedup_openai_batch(
 
         for cap, feats in zip(batch, batch_results):
             results[cap] = feats
+        return ok
+
+    def _on_chunk_complete(chunk_mapping: dict[str, dict]) -> None:
+        """Called after each Batch API chunk finishes — parse + checkpoint."""
+        for cid, item_meta in chunk_mapping.items():
+            _parse_and_accumulate(cid, item_meta)
+        if ckpt_save_fn is not None:
+            try:
+                ckpt_save_fn(dict(results))
+            except Exception as e:
+                tqdm.write(f"    Checkpoint save failed: {e!r} (continuing)")
+
+    # Parsing happens inside _on_chunk_complete as each chunk finishes, so we
+    # don't use the aggregated mapping here — but it's still returned for
+    # diagnostic parity with earlier versions.
+    _mapping, _acc = _run_openai_extraction_batch(
+        jobs, per_chunk_callback=_on_chunk_complete
+    )
+
+    # Catch any jobs that produced no output at all (batch error, not parsed in
+    # the chunk callback because they never appeared in the chunk mapping).
+    already_processed = {cap for cap in results.keys()}
+    for cid, batch in job_batches.items():
+        for cap in batch:
+            if cap not in already_processed:
+                # This id was never returned by any chunk — retry synchronously.
+                tqdm.write(
+                    f"    Batch {cid} produced no output for at least one caption "
+                    f"— sync fallback for the full batch."
+                )
+                batch_tags = (
+                    [caption_to_tags.get(c, []) for c in batch]
+                    if caption_to_tags is not None else None
+                )
+                retry_results, st2 = extract_features_batch(
+                    batch, all_feature_names, system_prompt,
+                    tag_lists=batch_tags,
+                    feature_categories=feature_categories,
+                )
+                for c, feats in zip(batch, retry_results):
+                    results[c] = feats
+                if st2.get("success"):
+                    global_stats["successful_batches"] += 1
+                else:
+                    global_stats["failed_batches"] += 1
+                global_stats["total_retries"] += 1
+                break  # one sync retry per batch, move on
+
+    if ckpt_save_fn is not None:
+        try:
+            ckpt_save_fn(dict(results))
+        except Exception as e:
+            tqdm.write(f"    Final checkpoint save failed: {e!r}")
 
     return results
 
@@ -1573,6 +1825,8 @@ def run_extraction(csv_path: str, schema_path: str):
                 remaining, all_feature_names, system_prompt, global_stats,
                 caption_to_tags=_tags_arg,
                 feature_categories=feature_categories,
+                ckpt_save_fn=_ckpt_saver,
+                seed_results=dict(caption_features),
             )
         else:
             new_results = _run_dedup_sync(
