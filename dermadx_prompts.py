@@ -14,7 +14,7 @@ Patient reports: {symptoms}
 Note: How do symptoms support or contradict your visual findings?
 
 ## Step 3 — Final Differential (Weighted Synthesis)
-Merge findings. Give 70% confidence weight to visual findings, 30% to symptoms.
+Merge findings. Give 70 percent confidence weight to visual findings, 30% to symptoms.
 If conflict exists, flag it and explain.
 
 ## Step 4 — Recommended Next Steps

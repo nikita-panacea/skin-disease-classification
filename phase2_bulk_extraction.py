@@ -1321,27 +1321,72 @@ Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 
 
 def build_extraction_user_prompt(captions: list[str], *, schema_enforced: bool = False) -> str:
-    """Variable user message with a short count-enforcement header."""
+    """Variable user message with count-enforcement header AND footer.
+
+    Why this prompt is written the way it is
+    ─────────────────────────────────────────
+    We observed a systematic off-by-one: with batch size N, gpt-4o-mini
+    consistently emitted N-1 caption objects and stopped (`finish_reason='stop'`).
+    Root causes identified:
+      1. "numbered [1]..[N]" — the "dot-dot" range operator is **exclusive**
+         in Rust/Python-slices (which the model has seen far more of than
+         Ruby-style inclusive `..`), so the model reads it as "indices
+         1 through N-1" → emits N-1.
+      2. Count enforcement only at the TOP of the prompt. By the time the
+         model has emitted N-1 objects, the "EXACTLY N" line is buried under
+         thousands of tokens of input; closing the array `]}` becomes a
+         stronger attractor than the count directive.
+      3. Few-shot examples show `{}` as valid for hard captions. The model
+         rationalises "the Nth would just be `{}` anyway — close now."
+
+    Fixes applied here:
+      • Replaced `[1]..[N]` with the unambiguous "1 through N inclusive" + an
+        explicit "[N] is the last caption — it MUST be included in your output".
+      • Added a TRAILING reminder right before the model starts generating,
+        so the count is the MOST RECENT context (where gpt-4o-mini pays most
+        attention).
+      • Flagged the final caption inline as `[N] (LAST — MUST BE IN OUTPUT)`
+        so the model can't miss it.
+    """
     n = len(captions)
-    # 1-indexed markers. Models occasionally miscount with [0]..[N-1] and emit
-    # N-1 items (they read "[N-1]" as "only N-1 captions"). 1-indexed matches
-    # natural language and the "EXACTLY N" phrasing consistently.
+    count_clause = (
+        f"INPUT: {n} caption(s), indexed 1 through {n} inclusive (so the last "
+        f"caption is [{n}] and MUST be in your output)."
+    )
     if schema_enforced:
         header = (
-            f"INPUT: {n} caption(s) numbered [1]..[{n}].\n"
+            f"{count_clause}\n"
             f"Emit EXACTLY {n} caption objects in the same order. For each "
             f"object, include every category key (use [] for unmentioned "
             f"categories). Never skip, repeat, or add extras."
         )
     else:
         header = (
-            f"INPUT: {n} caption(s) numbered [1]..[{n}].\n"
+            f"{count_clause}\n"
             f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
             f"order. Emit {{}} for any caption with no extractable features — "
             f"NEVER skip a caption, NEVER repeat a caption, NEVER emit extra items."
         )
-    body = "\n\n".join(f"[{i + 1}] {c}" for i, c in enumerate(captions))
-    return f"{header}\n\n{body}"
+
+    # Flag the final caption inline. Small but effective: the model can't
+    # "round down to N-1" when the Nth caption line literally says LAST.
+    body_lines = []
+    for i, c in enumerate(captions):
+        marker = f"[{i + 1}]" if i + 1 < n else f"[{n}] (LAST — MUST BE IN OUTPUT)"
+        body_lines.append(f"{marker} {c}")
+    body = "\n\n".join(body_lines)
+
+    # Trailing reminder: the model pays more attention to the last few hundred
+    # tokens than to anything earlier. Putting the count requirement here
+    # (after the captions, right before generation begins) is the single most
+    # effective change for suppressing the N-1 stop.
+    footer = (
+        f"\n\n---\n"
+        f"REMEMBER: output MUST contain EXACTLY {n} objects — one for each of "
+        f"captions [1] through [{n}]. Before emitting the closing `]}}`, verify "
+        f"you have written object [{n}]. If not, emit it now."
+    )
+    return f"{header}\n\n{body}{footer}"
 
 
 def build_tagged_system_prompt(
@@ -1452,26 +1497,41 @@ Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 
 
 def build_tagged_user_prompt(tag_lists: list[list[str]], *, schema_enforced: bool = False) -> str:
-    """User message when using pre-tagged feature lists instead of captions."""
+    """User message when using pre-tagged feature lists instead of captions.
+
+    Same off-by-one defences as build_extraction_user_prompt — see that
+    function's docstring for the rationale.
+    """
     n = len(tag_lists)
+    count_clause = (
+        f"INPUT: {n} tag-list(s), indexed 1 through {n} inclusive (so the last "
+        f"list is [{n}] and MUST be in your output)."
+    )
     if schema_enforced:
         header = (
-            f"INPUT: {n} tag-list(s) numbered [1]..[{n}].\n"
+            f"{count_clause}\n"
             f"Emit EXACTLY {n} caption objects in the same order. Include every "
             f"category key in each object (use [] for categories no tag maps to)."
         )
     else:
         header = (
-            f"INPUT: {n} tag-list(s) numbered [1]..[{n}].\n"
+            f"{count_clause}\n"
             f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
             f"order. Emit {{}} for any input with no mappable tags — NEVER skip, "
             f"NEVER repeat, NEVER emit extra items."
         )
-    body = "\n".join(
-        f"[{i + 1}] {', '.join(tags) if tags else '(empty)'}"
-        for i, tags in enumerate(tag_lists)
+    body_lines = []
+    for i, tags in enumerate(tag_lists):
+        marker = f"[{i + 1}]" if i + 1 < n else f"[{n}] (LAST — MUST BE IN OUTPUT)"
+        body_lines.append(f"{marker} {', '.join(tags) if tags else '(empty)'}")
+    body = "\n".join(body_lines)
+    footer = (
+        f"\n\n---\n"
+        f"REMEMBER: output MUST contain EXACTLY {n} objects — one for each of "
+        f"inputs [1] through [{n}]. Before emitting the closing `]}}`, verify "
+        f"you have written object [{n}]. If not, emit it now."
     )
-    return f"{header}\n\n{body}"
+    return f"{header}\n\n{body}{footer}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1879,6 +1939,7 @@ def extract_features_batch(
     feature_categories: dict[str, str] | None = None,
     json_schema: dict | None = None,
     _bisect_depth: int = 0,
+    retry_reminder: str | None = None,
 ) -> tuple[list[dict], dict]:
     """
     Sync LLM call for one batch of captions (or pre-tagged feature lists), with
@@ -1903,10 +1964,21 @@ def extract_features_batch(
     else:
         user_prompt = build_extraction_user_prompt(captions, schema_enforced=schema_enforced)
 
+    # retry_reminder: when a previous tail/truncation retry came back all-2s
+    # (likely model-gave-up on single-caption retry emitting `{"captions":[{}]}`),
+    # the caller passes an explicit reminder that prepends onto the user prompt
+    # forbidding the `{}` shortcut. This is the ONLY case where we modify the
+    # cached-prefix-friendly layout, so keep it as a short prepended note that
+    # doesn't disturb the system prompt cache.
+    if retry_reminder:
+        user_prompt = f"{retry_reminder.strip()}\n\n{user_prompt}"
+
     stats = {
         "attempts": 0,
         "success": False,
         "validation_fixes": 0,
+        "num_nontrivial_prefix": 0,
+        "num_llm_items": 0,
     }
 
     best_partial: list[dict] | None = None
@@ -1928,6 +2000,8 @@ def extract_features_batch(
                 finish_reason=finish_reason,
             )
             stats["validation_fixes"] = pst.get("validation_fixes", 0)
+            stats["num_nontrivial_prefix"] = pst.get("num_nontrivial_prefix", 0)
+            stats["num_llm_items"] = pst.get("num_llm_items", 0)
             if pst.get("success"):
                 stats["success"] = True
                 return valid_results, stats
@@ -2022,6 +2096,12 @@ def extract_features_batch(
             st_l.get("validation_fixes", 0) + st_r.get("validation_fixes", 0)
         )
         stats["success"] = bool(st_l.get("success") and st_r.get("success"))
+        stats["num_nontrivial_prefix"] = (
+            st_l.get("num_nontrivial_prefix", 0) + st_r.get("num_nontrivial_prefix", 0)
+        )
+        stats["num_llm_items"] = (
+            st_l.get("num_llm_items", 0) + st_r.get("num_llm_items", 0)
+        )
         return left + right, stats
 
     if saw_truncation and _bisect_depth >= MAX_BISECT_DEPTH:
@@ -2039,6 +2119,12 @@ def extract_features_batch(
             f"Using salvaged partial: {len(captions) - unknown_count}/{len(captions)} "
             f"recovered, {unknown_count} left as unknown."
         )
+        # Recompute nontrivial count from the partial we're actually returning,
+        # so callers can detect "retry came back all-unknown" pathology.
+        stats["num_nontrivial_prefix"] = sum(
+            1 for row in best_partial if any(v != 2 for v in row.values())
+        )
+        stats["num_llm_items"] = len(best_partial)
         return best_partial, stats
 
     tqdm.write(
@@ -2046,6 +2132,8 @@ def extract_features_batch(
         f"Returning {len(captions)} unknown rows."
     )
     fallback = [{k: 2 for k in all_feature_names} for _ in captions]
+    stats["num_nontrivial_prefix"] = 0
+    stats["num_llm_items"] = 0
     return fallback, stats
 
 
@@ -2202,10 +2290,72 @@ def _run_dedup_openai_batch(
                         feature_categories=feature_categories,
                         json_schema=json_schema,
                     )
-                    batch_results = batch_results[:salvaged_prefix] + tail_results
-                    ok = st2.get("success", False)
                     global_stats["total_retries"] += 1
                     global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
+
+                    # GUARD AGAINST SILENT FAILURE: single-caption (or small)
+                    # tail retries frequently come back as `{"captions":[{}]}`
+                    # (completion ~6-40 tokens) — the model takes the prompt's
+                    # `{}` shortcut and emits nothing. The parser accepts that
+                    # as "success" but all features become 2 (unknown), silently
+                    # losing data. Detect this and retry ONCE with an explicit
+                    # reminder that forbids the `{}` shortcut.
+                    tail_nontriv = st2.get("num_nontrivial_prefix", 0)
+                    tail_has_substance = any(
+                        len((c or "").strip()) >= 15 for c in tail_batch
+                    )
+                    if tail_nontriv == 0 and tail_has_substance:
+                        reminder = (
+                            "RETRY NOTICE: the previous pass for these captions "
+                            "returned an empty `{}` object. That is ONLY valid if "
+                            "the caption truly has NO extractable clinical content. "
+                            "For every caption below, re-read it carefully and "
+                            "emit every category whose value is literally mentioned "
+                            "(e.g. body_location, morphology_color, morphology_texture, "
+                            "demographics, symptoms, duration). Do NOT emit `{}` "
+                            "unless the caption is genuinely devoid of clinical detail."
+                        )
+                        tqdm.write(
+                            f"    Tail retry for {cid} returned all-unknown "
+                            f"({len(tail_batch)} caption(s), likely model-gave-up "
+                            f"on single-caption retry). Re-retrying with explicit "
+                            f"reminder prompt."
+                        )
+                        tail_results2, st3 = extract_features_batch(
+                            tail_batch, all_feature_names, system_prompt,
+                            retries=1,
+                            tag_lists=(
+                                [caption_to_tags.get(c, []) for c in tail_batch]
+                                if caption_to_tags is not None else None
+                            ),
+                            feature_categories=feature_categories,
+                            json_schema=json_schema,
+                            retry_reminder=reminder,
+                        )
+                        tail_nontriv2 = st3.get("num_nontrivial_prefix", 0)
+                        global_stats["total_retries"] += 1
+                        global_stats["total_validation_fixes"] += st3.get("validation_fixes", 0)
+                        if tail_nontriv2 > tail_nontriv:
+                            # Reminder pass produced real features — use it.
+                            tail_results = tail_results2
+                            st2 = st3
+                            tail_nontriv = tail_nontriv2
+                        else:
+                            # Still nothing. Log the captions we're giving up on.
+                            global_stats.setdefault("silent_empty_tail_captions", 0)
+                            global_stats["silent_empty_tail_captions"] += len(tail_batch)
+                            previews = " | ".join(
+                                (c or "")[:60].replace("\n", " ") for c in tail_batch[:3]
+                            )
+                            tqdm.write(
+                                f"    WARNING: tail captions for {cid} marked "
+                                f"all-unknown after reminder retry (model "
+                                f"persistently refuses to extract). "
+                                f"Preview: {previews!r}"
+                            )
+
+                    batch_results = batch_results[:salvaged_prefix] + tail_results
+                    ok = st2.get("success", False)
                 else:
                     ok = True  # full batch salvaged
             else:
@@ -2630,6 +2780,7 @@ def run_extraction(csv_path: str, schema_path: str):
         "total_api_calls": 0,
         "total_retries": 0,
         "total_validation_fixes": 0,
+        "silent_empty_tail_captions": 0,
         "start_time": time.time(),
         "openai_use_batch": bool(LLM_PROVIDER == "openai" and OPENAI_USE_BATCH),
         "openai_prompt_cache_key": OPENAI_PROMPT_CACHE_KEY if LLM_PROVIDER == "openai" else "",
@@ -2711,6 +2862,13 @@ def run_extraction(csv_path: str, schema_path: str):
     print(f"  Total retries: {global_stats['total_retries']:,}")
     print(f"  Validation fixes: {global_stats['total_validation_fixes']:,}")
     print(f"  Failed batches: {global_stats['failed_batches']:,}")
+    silent_empty = global_stats.get("silent_empty_tail_captions", 0)
+    if silent_empty:
+        print(
+            f"  Silent-empty tail captions: {silent_empty:,} "
+            f"(model persistently refused to extract even after reminder retry — "
+            f"these are recorded as all-unknown; check captions.jsonl for context)"
+        )
 
     print("\nReplicating features to all rows (including duplicates)...")
     # Skip per-row dict construction entirely: build the matrix by direct
