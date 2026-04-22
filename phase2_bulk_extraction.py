@@ -137,18 +137,65 @@ OPENAI_BATCH_POLL_SEC = _safe_int_env("OPENAI_BATCH_POLL_SEC", 20, vmin=5)
 OPENAI_BATCH_MAX_REQUESTS = _safe_int_env(
     "OPENAI_BATCH_MAX_REQUESTS", 50_000, vmin=1, vmax=50_000
 )
-OPENAI_BATCH_MAX_ENQUEUED_TOKENS = _safe_int_env(
-    "OPENAI_BATCH_MAX_ENQUEUED_TOKENS", 1_800_000, vmin=100_000
+# ── Concurrency vs. org-level enqueued-token budget ──────────────────────────
+# OpenAI enforces a per-organisation "enqueued token" cap across ALL in-flight
+# batches for the same model. For gpt-4o-mini the most common limit is 2M
+# (Tier 1/2). If your concurrent chunks' token budgets sum above that cap,
+# the 2nd/3rd chunk's `batches.create` call will succeed but the batch job
+# immediately transitions to status='failed' with "Enqueued token limit
+# reached for <model>".
+#
+# We now auto-derive the per-chunk cap from the org cap:
+#     per_chunk_cap = floor((ORG_LIMIT - SAFETY_MARGIN) / CONCURRENCY)
+# so the invariant  concurrency × per_chunk_cap  ≤  org_limit  always holds.
+#
+# If you want to pin a specific per-chunk cap, set OPENAI_BATCH_MAX_ENQUEUED_TOKENS
+# explicitly; we still warn if it would breach the org cap at the chosen
+# concurrency.
+OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG = _safe_int_env(
+    "OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG", 2_000_000, vmin=100_000
 )
+# Concurrency default dropped to 2 (was 3): with a 2M org budget, 2 parallel
+# chunks at ~1M tokens each fits safely; 3 × ~700k works too but chunks too
+# small to amortise Batch-API overhead. Users on higher-tier orgs (≥5M) can
+# bump OPENAI_BATCH_CONCURRENCY to 3-5 for more parallelism.
+OPENAI_BATCH_CONCURRENCY = _safe_int_env("OPENAI_BATCH_CONCURRENCY", 2, vmin=1, vmax=8)
+
+_safety_margin = 100_000  # keep headroom for small estimator-vs-actual drift
+_auto_per_chunk = max(
+    100_000,
+    (OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG - _safety_margin) // OPENAI_BATCH_CONCURRENCY,
+)
+_explicit_per_chunk_env = os.getenv("OPENAI_BATCH_MAX_ENQUEUED_TOKENS", "").strip()
+if _explicit_per_chunk_env:
+    OPENAI_BATCH_MAX_ENQUEUED_TOKENS = _safe_int_env(
+        "OPENAI_BATCH_MAX_ENQUEUED_TOKENS", _auto_per_chunk, vmin=100_000
+    )
+    _budget = OPENAI_BATCH_CONCURRENCY * OPENAI_BATCH_MAX_ENQUEUED_TOKENS
+    if _budget > OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG:
+        print(
+            f"  WARNING: OPENAI_BATCH_CONCURRENCY × OPENAI_BATCH_MAX_ENQUEUED_TOKENS "
+            f"({OPENAI_BATCH_CONCURRENCY} × {OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,} = "
+            f"{_budget:,}) exceeds OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG "
+            f"({OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG:,}). Expect 'Enqueued token "
+            f"limit reached' failures on the 2nd+ concurrent chunk. "
+            f"Recommended: unset OPENAI_BATCH_MAX_ENQUEUED_TOKENS to let the code "
+            f"auto-derive a safe value."
+        )
+else:
+    OPENAI_BATCH_MAX_ENQUEUED_TOKENS = _auto_per_chunk
+
 OPENAI_BATCH_MAX_RETRIES = _safe_int_env("OPENAI_BATCH_MAX_RETRIES", 2, vmin=0, vmax=5)
-# How many Batch-API chunks to have in flight at the same time. The org-wide
-# enqueued-token budget (default 1.8M) still applies across all active
-# batches, so the safe upper bound is
-#     floor(OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG / per-chunk-token-budget).
-# A typical phase-2 chunk is ~400-500K tokens, so 3 concurrent chunks fits
-# under 1.8M. Bumping this is the single biggest wall-clock win for
-# multi-chunk runs (was sequential before).
-OPENAI_BATCH_CONCURRENCY = _safe_int_env("OPENAI_BATCH_CONCURRENCY", 3, vmin=1, vmax=8)
+# When a batch fails BECAUSE of the org enqueue-token cap (not a real error),
+# wait this long before resubmitting. Gives any currently-running batch time
+# to chew through its requests and free up tokens. 4 min is a good default;
+# batches make steady progress once they leave 'validating'.
+OPENAI_BATCH_ENQUEUE_WAIT_SEC = _safe_int_env(
+    "OPENAI_BATCH_ENQUEUE_WAIT_SEC", 240, vmin=30
+)
+OPENAI_BATCH_ENQUEUE_MAX_WAITS = _safe_int_env(
+    "OPENAI_BATCH_ENQUEUE_MAX_WAITS", 6, vmin=1, vmax=20
+)
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 
 # Qwen local server config
@@ -197,6 +244,15 @@ elif LLM_PROVIDER == "openai":
             f"  Batch file limits: ≤{OPENAI_BATCH_MAX_REQUESTS:,} requests/file, "
             f"≤{openai_batch_max_file_bytes() / (1024 * 1024):.0f} MiB UTF-8/file, "
             f"≤{OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,} enqueued tokens/chunk"
+        )
+        _effective_budget = OPENAI_BATCH_CONCURRENCY * OPENAI_BATCH_MAX_ENQUEUED_TOKENS
+        _source = "env-set" if _explicit_per_chunk_env else "auto-derived"
+        print(
+            f"  Batch concurrency: {OPENAI_BATCH_CONCURRENCY} chunk(s) in flight, "
+            f"org enqueue cap={OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG:,}, "
+            f"per-chunk={OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,} ({_source}), "
+            f"peak pending ≈ {_effective_budget:,} "
+            f"({'OK' if _effective_budget <= OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG else 'EXCEEDS org cap — expect enqueue failures'})"
         )
     else:
         print("  OpenAI extraction: synchronous Chat Completions (OPENAI_USE_BATCH=1 for Batch API)")
@@ -522,41 +578,26 @@ def _estimate_openai_phase2_batch_cost_usd(acc: dict[str, int]) -> float:
     return (non_cached / 1e6) * pin + (acc["cached"] / 1e6) * pcached + (acc["completion"] / 1e6) * pout
 
 
-def _run_openai_extraction_batch_chunk(
-    jobs: list[dict], chunk_idx: int
-) -> tuple[dict[str, str], dict[str, int], str, set[str]]:
-    """
-    One Batch API chunk. Returns (mapping, usage_acc, batch_id, failed_custom_ids).
-    Partial results are always collected when an output_file exists.
-    """
-    input_path = CHECKPOINT_DIR / f"openai_batch_extraction_input_{chunk_idx}.jsonl"
-    input_path.parent.mkdir(parents=True, exist_ok=True)
-    nbytes = write_openai_batch_jsonl(input_path, jobs)
+def _batch_error_detail(batch_job) -> str:
+    """Extract the best-effort error message(s) from a failed batch."""
+    errors = getattr(batch_job, "errors", None)
+    if not errors:
+        return ""
+    err_data = getattr(errors, "data", None) or errors
+    if isinstance(err_data, list):
+        return "; ".join(str(getattr(e, "message", e)) for e in err_data[:5])
+    return str(err_data)[:500]
 
-    tqdm.write(
-        f"  Uploading OpenAI batch chunk {chunk_idx}: {len(jobs):,} jobs, "
-        f"{nbytes / (1024 * 1024):.2f} MiB → {input_path.name}"
-    )
-    with open(input_path, "rb") as fp:
-        uploaded = openai_client.files.create(file=fp, purpose="batch")
 
-    batch_job = openai_batches_create_safe(
-        openai_client,
-        input_file_id=uploaded.id,
-        endpoint="/v1/chat/completions",
-        completion_window="24h",
-        metadata={"phase": "phase2_extraction", "chunk": str(chunk_idx)},
-    )
-    tqdm.write(
-        f"  batch_id={batch_job.id}; polling every {OPENAI_BATCH_POLL_SEC}s "
-        "(https://developers.openai.com/api/docs/guides/batch )"
-    )
+def _is_enqueue_limit_failure(err_detail: str) -> bool:
+    """Recognise the 'Enqueued token limit reached for <model>' transient."""
+    lo = err_detail.lower()
+    return "enqueued token limit" in lo or "enqueue token limit" in lo
 
+
+def _poll_until_terminal(batch_job, chunk_idx: int):
+    """Poll a batch until it reaches a terminal state (or the 26h hard cap)."""
     terminal = {"completed", "failed", "expired", "cancelled"}
-    # Hard cap on how long we wait for a single chunk before cancelling. Batch
-    # API gives a 24-hour completion window; we add a 2-hour grace for the
-    # "expired" → partial-output flow, then bail so a stuck chunk can't hang
-    # the whole run indefinitely.
     poll_deadline = time.monotonic() + 26 * 3600
     last_progress_count = -1
     stall_start: float | None = None
@@ -571,18 +612,15 @@ def _run_openai_extraction_batch_chunk(
                 openai_client.batches.cancel(batch_job.id)
             except Exception as cancel_err:
                 tqdm.write(f"    (cancel failed: {cancel_err!r})")
-            # Give the API ~1 poll cycle to finalise the cancel; then move on
-            # with whatever partial output exists.
             time.sleep(OPENAI_BATCH_POLL_SEC)
             batch_job = openai_client.batches.retrieve(batch_job.id)
             break
         batch_job = openai_client.batches.retrieve(batch_job.id)
         rc = batch_job.request_counts
         tqdm.write(
-            f"    status={batch_job.status}  completed={rc.completed}/{rc.total}  failed={rc.failed}"
+            f"    [chunk {chunk_idx}] status={batch_job.status}  "
+            f"completed={rc.completed}/{rc.total}  failed={rc.failed}"
         )
-        # Soft stall detector: if progress hasn't advanced for 30 minutes we
-        # flag a warning (but keep polling until the 26h hard cap).
         total_done = (rc.completed or 0) + (rc.failed or 0)
         now = time.monotonic()
         if total_done != last_progress_count:
@@ -590,10 +628,73 @@ def _run_openai_extraction_batch_chunk(
             stall_start = now
         elif stall_start is not None and now - stall_start > 1800:
             tqdm.write(
-                f"    (no progress in 30 min at {total_done}/{rc.total}; "
-                f"continuing to poll until 26h cap)"
+                f"    (chunk {chunk_idx}: no progress in 30 min at "
+                f"{total_done}/{rc.total}; continuing until 26h cap)"
             )
-            stall_start = now  # rearm
+            stall_start = now
+    return batch_job
+
+
+def _run_openai_extraction_batch_chunk(
+    jobs: list[dict], chunk_idx: int
+) -> tuple[dict[str, str], dict[str, int], str, set[str]]:
+    """
+    One Batch API chunk. Returns (mapping, usage_acc, batch_id, failed_custom_ids).
+    Partial results are always collected when an output_file exists.
+
+    Handles the "Enqueued token limit reached" transient: when another
+    concurrent chunk is still occupying the org-wide token budget, our
+    newly-created batch immediately transitions to 'failed' with that error.
+    We wait OPENAI_BATCH_ENQUEUE_WAIT_SEC and re-submit the SAME input file
+    (no re-upload) up to OPENAI_BATCH_ENQUEUE_MAX_WAITS times.
+    """
+    input_path = CHECKPOINT_DIR / f"openai_batch_extraction_input_{chunk_idx}.jsonl"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    nbytes = write_openai_batch_jsonl(input_path, jobs)
+
+    tqdm.write(
+        f"  Uploading OpenAI batch chunk {chunk_idx}: {len(jobs):,} jobs, "
+        f"{nbytes / (1024 * 1024):.2f} MiB → {input_path.name}"
+    )
+    with open(input_path, "rb") as fp:
+        uploaded = openai_client.files.create(file=fp, purpose="batch")
+
+    batch_job = None
+    for submit_attempt in range(OPENAI_BATCH_ENQUEUE_MAX_WAITS):
+        batch_job = openai_batches_create_safe(
+            openai_client,
+            input_file_id=uploaded.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+            metadata={"phase": "phase2_extraction", "chunk": str(chunk_idx)},
+        )
+        if submit_attempt == 0:
+            tqdm.write(
+                f"  batch_id={batch_job.id} (chunk {chunk_idx}); polling every "
+                f"{OPENAI_BATCH_POLL_SEC}s"
+            )
+        else:
+            tqdm.write(
+                f"  chunk {chunk_idx} resubmitted as batch_id={batch_job.id} "
+                f"(retry {submit_attempt}/{OPENAI_BATCH_ENQUEUE_MAX_WAITS - 1})"
+            )
+
+        batch_job = _poll_until_terminal(batch_job, chunk_idx)
+
+        # If it failed specifically from the org-level enqueue cap, wait for
+        # the concurrent batch(es) to chew through their tokens, then retry.
+        if batch_job.status == "failed" and batch_job.output_file_id is None:
+            err_detail = _batch_error_detail(batch_job)
+            if _is_enqueue_limit_failure(err_detail):
+                waited = OPENAI_BATCH_ENQUEUE_WAIT_SEC * (1 + submit_attempt // 2)
+                tqdm.write(
+                    f"  chunk {chunk_idx}: enqueue-token cap hit "
+                    f"('{err_detail[:120]}'). Waiting {waited}s for other "
+                    f"chunks to free budget, then resubmitting."
+                )
+                time.sleep(waited)
+                continue  # resubmit the same uploaded file
+        break  # non-enqueue failure OR success
 
     has_output = batch_job.output_file_id is not None
 
@@ -607,21 +708,15 @@ def _run_openai_extraction_batch_chunk(
             f"No output_file_id for batch status='completed' — nothing to parse."
         )
     elif not has_output:
-        errors = getattr(batch_job, "errors", None)
-        err_detail = ""
-        if errors:
-            err_data = getattr(errors, "data", None) or errors
-            if isinstance(err_data, list):
-                err_detail = "; ".join(
-                    str(getattr(e, "message", e)) for e in err_data[:5]
-                )
-            else:
-                err_detail = str(err_data)[:500]
+        err_detail = _batch_error_detail(batch_job)
         hint = ""
-        if "enqueued token limit" in err_detail.lower() or "token limit" in err_detail.lower():
+        if _is_enqueue_limit_failure(err_detail):
             hint = (
-                f" Lower OPENAI_BATCH_MAX_ENQUEUED_TOKENS "
-                f"(currently {OPENAI_BATCH_MAX_ENQUEUED_TOKENS:,}) to split into smaller chunks."
+                f" Still hitting the org enqueue cap after "
+                f"{OPENAI_BATCH_ENQUEUE_MAX_WAITS} resubmits. "
+                f"Lower OPENAI_BATCH_CONCURRENCY (currently "
+                f"{OPENAI_BATCH_CONCURRENCY}) and/or set "
+                f"OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG to your actual org cap."
             )
         raise RuntimeError(
             f"OpenAI batch ended with status={batch_job.status!r} and no output file. "
