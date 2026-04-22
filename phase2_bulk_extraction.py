@@ -267,7 +267,17 @@ SCHEMA_PATH      = "feature_schema.json"
 OUTPUT_CSV       = "derm1m_features.csv"
 STATS_FILE       = "extraction_stats.json"
 CHECKPOINT_DIR   = Path("checkpoints")
-LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 10, vmin=1)
+# LLM batch size: the number of captions packed into ONE LLM request.
+# gpt-4o-mini has a persistent "close the array one item early" failure mode
+# in json_object mode — we've seen ~5-10% of 10-caption batches emit exactly
+# 9 objects and stop with finish_reason='stop'. Dropping to 6 roughly halves
+# the incidence (fewer items → less counting drift) and, more importantly,
+# when it DOES happen the wasted context is smaller and the sync-retry for
+# the tail covers only 1 caption. Each batch costs a bit more per-caption
+# at N=6 vs N=10 (prompt overhead amortises less), but the correctness win
+# dominates for this model. Bump back to 10 only if you switch to a model
+# that doesn't show the pathology (e.g. gpt-4.1-mini).
+LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 6, vmin=1)
 MAX_RETRIES      = 5
 
 TAGGED_CSV_PATH  = Path("discovery_outputs/caption_features_tagged.csv")
@@ -1720,6 +1730,7 @@ def parse_extraction_response_text(
     def _finalize(parsed_list: list, *, salvaged: bool) -> tuple[list[dict], dict]:
         results: list[dict] = []
         fixes = 0
+        nontrivial_prefix = 0  # items in the LLM's prefix with ≥1 extracted value
         for item in parsed_list:
             if not isinstance(item, dict):
                 fixes += 1
@@ -1733,6 +1744,13 @@ def parse_extraction_response_text(
             )
             fixes += f
             results.append(encoding)
+            # Count any 0 or 1 (anchored present/absent) — all-2 rows are
+            # either legitimately uninformative captions OR the "model gave
+            # up and emitted {}" failure mode. We can't tell them apart for
+            # any single caption, but the PATTERN (every prefix item all-2)
+            # is a reliable signal of the latter.
+            if isinstance(item, dict) and any(v != 2 for v in encoding.values()):
+                nontrivial_prefix += 1
 
         num_llm_items = len(results)
         short = len(captions) - num_llm_items
@@ -1748,6 +1766,7 @@ def parse_extraction_response_text(
         # callers can slice precisely without sniffing all-2 rows (which can
         # be a legitimate "everything unknown" caption in the new semantics).
         stats["num_llm_items"] = num_llm_items
+        stats["num_nontrivial_prefix"] = nontrivial_prefix
 
         stats["validation_fixes"] = fixes
         stats["salvaged"] = salvaged
@@ -2107,11 +2126,24 @@ def _run_dedup_openai_batch(
 
             is_truncation = pst.get("truncated") or finish_reason == "length"
             is_shape = pst.get("shape_mismatch")
-            # In the batch-fallback path we're already retrying something the
-            # Batch API had a full completion window for. Keep the sync retry
-            # tight (2 attempts) so one bad chunk can't explode into thousands
-            # of extra API calls.
             sync_retries = 2
+
+            # "Model gave up" detection: the Batch API said finish_reason='stop'
+            # (not 'length' → not real truncation) AND the short prefix it did
+            # emit is mostly {} objects that decode to all-unknown. This is
+            # the 9/10 early-stop pattern with gpt-4o-mini: the model closes
+            # the array early with empty objects. Trusting those empty rows
+            # means 9 out of 10 captions in the batch get written as all-2
+            # (unknown) when real features were extractable. We must redo
+            # the WHOLE batch synchronously, not just the tail.
+            nontrivial_prefix = pst.get("num_nontrivial_prefix", salvaged_prefix)
+            is_all_empty_salvage = (
+                is_truncation
+                and finish_reason == "stop"
+                and salvaged_prefix > 0
+                and salvaged_prefix < len(batch)
+                and nontrivial_prefix == 0
+            )
 
             if is_shape and not pst.get("salvaged"):
                 tqdm.write(
@@ -2120,12 +2152,35 @@ def _run_dedup_openai_batch(
                     f"no sync retry (would repeat the same error)."
                 )
                 # batch_results is already full of unknown rows from the parser.
+            elif is_all_empty_salvage:
+                tqdm.write(
+                    f"    Model-gave-up pattern for batch {cid}: "
+                    f"{salvaged_prefix}/{len(batch)} emitted but ALL empty "
+                    f"(finish_reason='stop'). Discarding prefix and "
+                    f"retrying ENTIRE batch synchronously (sync retries={sync_retries})."
+                )
+                batch_tags = (
+                    [caption_to_tags.get(c, []) for c in batch]
+                    if caption_to_tags is not None else None
+                )
+                retry_results, st2 = extract_features_batch(
+                    batch, all_feature_names, system_prompt,
+                    retries=sync_retries,
+                    tag_lists=batch_tags,
+                    feature_categories=feature_categories,
+                    json_schema=json_schema,
+                )
+                batch_results = retry_results
+                ok = st2.get("success", False)
+                global_stats["total_retries"] += 1
+                global_stats["total_validation_fixes"] += st2.get("validation_fixes", 0)
             elif is_truncation:
                 tail_batch = batch[salvaged_prefix:] if salvaged_prefix < len(batch) else []
                 if tail_batch:
                     tqdm.write(
                         f"    Sync fallback for batch {cid} — truncation: "
-                        f"salvaged {salvaged_prefix}/{len(batch)}, "
+                        f"salvaged {salvaged_prefix}/{len(batch)} "
+                        f"(nontrivial={nontrivial_prefix}), "
                         f"retrying tail of {len(tail_batch)}."
                     )
                     batch_tags = (
