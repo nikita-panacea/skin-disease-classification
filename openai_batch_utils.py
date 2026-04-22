@@ -13,16 +13,24 @@ import json
 import os
 from typing import Any
 
-# Conservative chars/token ratio. Plain English averages ~4, but
-# keyword-dense / medical / punctuation-heavy text (our case) tokenizes
-# closer to ~3.5. Using 3.5 makes the estimate hug (slightly over) the
-# tokenizer, preventing silent undercount against OpenAI's enqueued cap.
-CHARS_PER_TOKEN_ESTIMATE = 3.5
+# Conservative chars/token ratio. Plain English averages ~4.0, but
+# our content is keyword-dense medical text with:
+#   - many punctuation characters (commas, brackets, colons, slashes)
+#   - proper nouns and Latin-derived medical terms that split into 2-3
+#     subword tokens each
+#   - numeric tokens (ages, dates, measurements)
+# Empirically this tokenizes at ~2.8-3.0 chars/token per the cl100k tokenizer.
+# Using 3.0 intentionally makes our estimator err ON the HIGH side of OpenAI's
+# real token count — the whole point of the estimator is to prevent the
+# batch splitter from overpacking a chunk past the org enqueue cap.
+# A few percent of "wasted" chunk budget is vastly preferable to repeated
+# "Enqueued token limit reached" upload failures and 4-minute backoffs.
+CHARS_PER_TOKEN_ESTIMATE = 3.0
 
 # Per-request framing overhead OpenAI reserves on top of raw message
-# content (role markers, JSON envelope, stop tokens). Empirically ~20-30
-# tokens; 30 keeps a safety margin.
-PER_REQUEST_OVERHEAD_TOKENS = 30
+# content (role markers, JSON envelope, stop tokens, batch wrapper).
+# Empirically ~30-50 tokens; 40 keeps a comfortable margin.
+PER_REQUEST_OVERHEAD_TOKENS = 40
 
 
 def estimate_job_enqueued_tokens(job: dict[str, Any]) -> int:
