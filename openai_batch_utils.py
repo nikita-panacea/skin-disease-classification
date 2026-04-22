@@ -13,7 +13,16 @@ import json
 import os
 from typing import Any
 
-CHARS_PER_TOKEN_ESTIMATE = 4
+# Conservative chars/token ratio. Plain English averages ~4, but
+# keyword-dense / medical / punctuation-heavy text (our case) tokenizes
+# closer to ~3.5. Using 3.5 makes the estimate hug (slightly over) the
+# tokenizer, preventing silent undercount against OpenAI's enqueued cap.
+CHARS_PER_TOKEN_ESTIMATE = 3.5
+
+# Per-request framing overhead OpenAI reserves on top of raw message
+# content (role markers, JSON envelope, stop tokens). Empirically ~20-30
+# tokens; 30 keeps a safety margin.
+PER_REQUEST_OVERHEAD_TOKENS = 30
 
 
 def estimate_job_enqueued_tokens(job: dict[str, Any]) -> int:
@@ -21,6 +30,10 @@ def estimate_job_enqueued_tokens(job: dict[str, Any]) -> int:
     Estimate the number of tokens OpenAI reserves for a single batch request.
     OpenAI counts input tokens + max_tokens (output reservation) against the
     org-level enqueued token limit.
+
+    This estimator intentionally rounds UP and applies a per-request framing
+    overhead so the splitter never packs more into a chunk than OpenAI
+    counts against the cap.
     """
     body = job.get("body", {})
     max_tokens = body.get("max_tokens", 4096)
@@ -35,7 +48,8 @@ def estimate_job_enqueued_tokens(job: dict[str, Any]) -> int:
                 if isinstance(part, dict):
                     text_chars += len(part.get("text", ""))
 
-    input_tokens = text_chars // CHARS_PER_TOKEN_ESTIMATE + 50
+    # Ceiling division on floats to avoid undercount vs real tokenizer.
+    input_tokens = int(text_chars / CHARS_PER_TOKEN_ESTIMATE + 0.9999) + PER_REQUEST_OVERHEAD_TOKENS
     return input_tokens + max_tokens
 
 

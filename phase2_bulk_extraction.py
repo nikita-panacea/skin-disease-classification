@@ -161,7 +161,15 @@ OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG = _safe_int_env(
 # bump OPENAI_BATCH_CONCURRENCY to 3-5 for more parallelism.
 OPENAI_BATCH_CONCURRENCY = _safe_int_env("OPENAI_BATCH_CONCURRENCY", 2, vmin=1, vmax=8)
 
-_safety_margin = 100_000  # keep headroom for small estimator-vs-actual drift
+# Safety margin covers two realities:
+#   1) Our char→token estimator can drift a few percent vs OpenAI's real
+#      tokenizer (especially on keyword-dense medical text).
+#   2) OpenAI's accounting includes small per-request framing overhead that
+#      may not be perfectly captured by estimate_job_enqueued_tokens.
+# Use 15% of the org cap (minimum 200k) as headroom so two concurrent
+# chunks packed to their per-chunk cap still leave a comfortable buffer
+# before the real enqueue limit.
+_safety_margin = max(200_000, OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG // 7)  # ≈14%
 _auto_per_chunk = max(
     100_000,
     (OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG - _safety_margin) // OPENAI_BATCH_CONCURRENCY,
