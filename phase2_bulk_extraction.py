@@ -78,14 +78,22 @@ LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "openai")
 
 OPENAI_USE_BATCH = os.getenv("OPENAI_USE_BATCH", "").strip().lower() in ("1", "true", "yes")
 OPENAI_JSON_RESPONSE = os.getenv("OPENAI_JSON_RESPONSE", "1").lower() in ("1", "true", "yes")
-# When enabled (default), send a strict json_schema response_format so the
-# model CANNOT emit wrong shapes, unknown categories, or unknown values.
-# This prevents the short-response / looped-response failure modes where the
-# model would skip captions or repeat outputs and break parsing.
-OPENAI_USE_JSON_SCHEMA = os.getenv("OPENAI_USE_JSON_SCHEMA", "1").lower() in ("1", "true", "yes")
+# Strict JSON schema (response_format=json_schema, strict=True) sounds great
+# on paper — the server refuses any wrong shape or unknown value — but on
+# gpt-4o-mini with our 21-required-category shape it triggers a well-known
+# early-stop pathology: because every inner object is dominated by "[]" keys,
+# the constrained decoder puts high probability on the outer "]" closer and
+# the model emits 1, 12, 13, or 14 items out of 15 with finish_reason='stop'.
+# That cascades into huge numbers of sync-fallback retries and bisects.
+#
+# Default is OFF. The json_object mode + our few-shot-hardened prompt gives
+# the same accuracy without the early-stop failure mode. Re-enable the strict
+# schema only if you're on a model/version you've verified doesn't exhibit
+# the short-stop behaviour.
+OPENAI_USE_JSON_SCHEMA = os.getenv("OPENAI_USE_JSON_SCHEMA", "0").lower() in ("1", "true", "yes")
 OPENAI_PROMPT_CACHE_KEY = os.getenv(
     "OPENAI_PROMPT_CACHE_KEY",
-    "phase2_extraction_v5_fewshot",
+    "phase2_extraction_v6_jsonobj",
 ).strip()
 OPENAI_PROMPT_CACHE_RETENTION = os.getenv("OPENAI_PROMPT_CACHE_RETENTION", "").strip()
 
@@ -133,6 +141,14 @@ OPENAI_BATCH_MAX_ENQUEUED_TOKENS = _safe_int_env(
     "OPENAI_BATCH_MAX_ENQUEUED_TOKENS", 1_800_000, vmin=100_000
 )
 OPENAI_BATCH_MAX_RETRIES = _safe_int_env("OPENAI_BATCH_MAX_RETRIES", 2, vmin=0, vmax=5)
+# How many Batch-API chunks to have in flight at the same time. The org-wide
+# enqueued-token budget (default 1.8M) still applies across all active
+# batches, so the safe upper bound is
+#     floor(OPENAI_BATCH_MAX_ENQUEUED_TOKENS_ORG / per-chunk-token-budget).
+# A typical phase-2 chunk is ~400-500K tokens, so 3 concurrent chunks fits
+# under 1.8M. Bumping this is the single biggest wall-clock win for
+# multi-chunk runs (was sequential before).
+OPENAI_BATCH_CONCURRENCY = _safe_int_env("OPENAI_BATCH_CONCURRENCY", 3, vmin=1, vmax=8)
 OPENAI_LOG_USAGE = os.getenv("OPENAI_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 
 # Qwen local server config
@@ -195,7 +211,7 @@ SCHEMA_PATH      = "feature_schema.json"
 OUTPUT_CSV       = "derm1m_features.csv"
 STATS_FILE       = "extraction_stats.json"
 CHECKPOINT_DIR   = Path("checkpoints")
-LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 15, vmin=1)
+LLM_BATCH_SIZE   = _safe_int_env("LLM_BATCH_SIZE", 10, vmin=1)
 MAX_RETRIES      = 5
 
 TAGGED_CSV_PATH  = Path("discovery_outputs/caption_features_tagged.csv")
@@ -233,7 +249,10 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int,
         "total_cost_usd": round(total, 4),
         "batch_api_cost_usd": round(total * 0.5, 4),
     }
-RATE_LIMIT_SLEEP = 0.1 if LLM_PROVIDER == "qwen" else 0.5
+# OpenAI rate limits are generous (gpt-4o-mini: 10k RPM, 200M TPM on tier 2);
+# a blanket 0.5s sleep between every sync batch wastes ~8 min per 1000 batches.
+# Qwen local needs a small pace to avoid overwhelming the server.
+RATE_LIMIT_SLEEP = 0.1 if LLM_PROVIDER == "qwen" else 0.0
 DEDUP_CKPT_FILE  = "dedup_caption_features_v2.json"
 
 CHECKPOINT_DIR.mkdir(exist_ok=True)
@@ -254,10 +273,28 @@ def _openai_apply_prompt_caching(create_kw: dict, cache_key: str) -> None:
         create_kw["prompt_cache_retention"] = OPENAI_PROMPT_CACHE_RETENTION
 
 
+def _estimate_max_output_tokens(n_captions: int, *, schema_enforced: bool) -> int:
+    """
+    Budget ``max_tokens`` proportionally to the number of captions in the
+    request. A fixed 8192 is wasteful for small batches AND lets a looping
+    model burn the full budget. Typical per-caption output:
+      • json_object (sparse)    ~= 40-80 tokens
+      • strict schema (all keys) ~= 180-220 tokens (21 required categories)
+    We add a flat safety pad of 200 tokens, and cap at 8192 (gpt-4o-mini
+    allows 16384 but we never need near that for N<=25).
+    """
+    per_cap = 220 if schema_enforced else 90
+    pad = 200
+    est = per_cap * max(1, n_captions) + pad
+    return max(512, min(8192, est))
+
+
 def _openai_extraction_chat_body(
     system_prompt: str,
     user_prompt: str,
     json_schema: dict | None = None,
+    *,
+    n_captions: int | None = None,
 ) -> dict:
     """Chat body for extraction: static system first, variable captions last (prompt caching).
 
@@ -265,7 +302,13 @@ def _openai_extraction_chat_body(
     `response_format={"type":"json_schema", "strict":True, ...}` so OpenAI
     enforces the output shape server-side. This eliminates short-response and
     wrong-shape failure modes that cause sync-fallback cascades.
+
+    ``max_tokens`` is sized to the expected output for ``n_captions``. Passing
+    None defaults to the current LLM_BATCH_SIZE, matching the old behaviour.
     """
+    schema_enforced = bool(OPENAI_USE_JSON_SCHEMA and json_schema is not None)
+    if n_captions is None:
+        n_captions = LLM_BATCH_SIZE
     body: dict = {
         "model": MODEL_NAME,
         "messages": [
@@ -273,10 +316,11 @@ def _openai_extraction_chat_body(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
-        # 8192 gives headroom for ~15 captions × ~21 categories each without truncation.
-        # gpt-4o-mini caps at 16384 output tokens; raise further if you see completion=8192
-        # with truncated JSON in logs.
-        "max_tokens": 8192,
+        # Sized to the batch. Prevents a looping model from burning the full
+        # 8192-token budget for a 3-caption batch that only ever needed ~500.
+        "max_tokens": _estimate_max_output_tokens(
+            n_captions, schema_enforced=schema_enforced
+        ),
         "stream": False,
     }
     if OPENAI_USE_JSON_SCHEMA and json_schema is not None:
@@ -601,6 +645,15 @@ def _run_openai_extraction_batch_chunk(
             f"{len(failed_ids)} failed [{err_breakdown or 'see error_file'}]."
         )
 
+    # Clean up the local input JSONL: each chunk is 5-50 MiB and a 100-chunk
+    # run was leaving multi-GB of stale files in checkpoints/. Keep the file
+    # only when the batch didn't complete cleanly (aids post-mortem).
+    if batch_job.status == "completed" and not failed_ids:
+        try:
+            input_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     return mapping, acc, batch_job.id, failed_ids
 
 
@@ -611,13 +664,19 @@ def _run_openai_extraction_batch(
 ) -> tuple[dict[str, dict], dict[str, int]]:
     """
     Splits by request count, file size, AND enqueued-token limit.
-    Chunks run sequentially. Failed items are retried in new batch rounds
-    (up to OPENAI_BATCH_MAX_RETRIES) before the caller falls back to sync.
+
+    Chunks are dispatched CONCURRENTLY (up to ``OPENAI_BATCH_CONCURRENCY``
+    at a time, default 3). Each chunk polls OpenAI independently — this is
+    the key wall-clock fix: a 40-chunk run used to wait for each 4-8 hour
+    chunk sequentially (>1 day); now 3 chunks share the 1.8M-token org
+    budget and finish in ~1/3 the time.
+
+    Failed items are retried in new rounds up to OPENAI_BATCH_MAX_RETRIES
+    before the caller falls back to sync.
 
     If ``per_chunk_callback`` is provided, it is invoked after every chunk
-    completes with the *incremental* mapping for that chunk
-    ({custom_id: {"content","finish_reason","completion_tokens"}}). This lets
-    the caller persist progress so a crash mid-run loses at most one chunk.
+    completes with that chunk's mapping. Called from the main thread under
+    a lock so the callback's checkpoint writes stay safe.
 
     Returns the combined mapping (same per-id dict shape as each chunk) plus
     total usage accounting across all rounds.
@@ -625,15 +684,40 @@ def _run_openai_extraction_batch(
     if not jobs:
         return {}, {"prompt": 0, "completion": 0, "cached": 0}
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     max_r = OPENAI_BATCH_MAX_REQUESTS
     file_cap = openai_batch_max_file_bytes()
     token_cap = OPENAI_BATCH_MAX_ENQUEUED_TOKENS
+    concurrency = max(1, OPENAI_BATCH_CONCURRENCY)
 
     jobs_by_id = {j["custom_id"]: j for j in jobs}
     combined: dict[str, dict] = {}
     acc_total = {"prompt": 0, "completion": 0, "cached": 0}
     pending_jobs = list(jobs)
     chunk_counter = 0
+    # Two locks, separate concerns:
+    #   state_lock  — protects the small accumulator dicts (combined, acc_total,
+    #                 all_failed_ids). Held for microseconds per chunk.
+    #   callback_lock — serialises callback invocations (parse + sync retries +
+    #                 checkpoint I/O). Separate from state_lock so slow
+    #                 callbacks DO NOT block other chunks' state updates.
+    # Previously a single lock wrapped both, which meant a 5-minute sync-retry
+    # callback on chunk N blocked chunks N+1..N+k from recording their
+    # results too. That alone cancelled most of the concurrency gain.
+    state_lock = threading.Lock()
+    callback_lock = threading.Lock()
+
+    def _run_one_chunk(chunk: list[dict], ci: int) -> tuple[int, dict, dict, set[str], str | None]:
+        """Execute one chunk; errors are converted to an 'all-failed' result."""
+        try:
+            m, a, _bid, failed = _run_openai_extraction_batch_chunk(chunk, ci)
+            return ci, m, a, failed, None
+        except Exception as chunk_err:  # noqa: BLE001
+            return ci, {}, {"prompt": 0, "completion": 0, "cached": 0}, \
+                   {j["custom_id"] for j in chunk}, \
+                   f"{type(chunk_err).__name__}: {str(chunk_err)[:200]}"
 
     for round_num in range(1 + OPENAI_BATCH_MAX_RETRIES):
         if not pending_jobs:
@@ -647,51 +731,57 @@ def _run_openai_extraction_batch(
         n_chunks = len(chunks)
 
         round_label = f"round {round_num}" if round_num > 0 else "initial"
-        if n_chunks > 1 or round_num > 0:
-            tqdm.write(
-                f"  Batch {round_label}: {len(pending_jobs):,} requests "
-                f"(~{total_est_tokens:,} est. tokens) → "
-                f"{n_chunks} chunk(s) "
-                f"(≤{max_r:,} lines, ≤{file_cap / (1024 * 1024):.0f} MiB, "
-                f"≤{token_cap:,} enqueued tokens/chunk)."
-            )
+        tqdm.write(
+            f"  Batch {round_label}: {len(pending_jobs):,} requests "
+            f"(~{total_est_tokens:,} est. tokens) → {n_chunks} chunk(s) "
+            f"with concurrency={concurrency} "
+            f"(≤{max_r:,} lines, ≤{file_cap / (1024 * 1024):.0f} MiB, "
+            f"≤{token_cap:,} enqueued tokens/chunk)."
+        )
 
         all_failed_ids: set[str] = set()
-        for ci, chunk in enumerate(chunks):
-            try:
-                m, a, _bid, failed = _run_openai_extraction_batch_chunk(
-                    chunk, chunk_counter
-                )
-            except Exception as chunk_err:
-                # A single chunk's Batch-API upload or poll errored out (network
-                # glitch, token-limit rejection, no output file, etc.). Instead
-                # of aborting the whole pipeline, mark every job in this chunk
-                # as failed so it goes into the next retry round or falls
-                # through to the sync fallback. This is the single biggest
-                # robustness win for long runs with ~30+ chunks.
-                chunk_counter += 1
-                failed_in_chunk = {j["custom_id"] for j in chunk}
-                tqdm.write(
-                    f"  Batch chunk failed ({type(chunk_err).__name__}: "
-                    f"{str(chunk_err)[:200]}); {len(failed_in_chunk)} job(s) "
-                    f"will be retried or routed to sync fallback."
-                )
-                all_failed_ids.update(failed_in_chunk)
-                continue
-            chunk_counter += 1
-            combined.update(m)
-            for k in acc_total:
-                acc_total[k] += a[k]
-            all_failed_ids.update(failed)
 
-            if per_chunk_callback is not None and m:
-                try:
-                    per_chunk_callback(m)
-                except Exception as cb_err:
+        # Pre-assign stable chunk indices so on-disk input files don't collide.
+        chunk_tasks: list[tuple[int, list[dict]]] = []
+        for chunk in chunks:
+            chunk_tasks.append((chunk_counter, chunk))
+            chunk_counter += 1
+
+        # Fan chunks out on a thread pool. The API client (openai_client) is
+        # safe to share across threads; each poll loop is independent.
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_run_one_chunk, c, ci): ci for ci, c in chunk_tasks}
+            for fut in as_completed(futures):
+                ci, m, a, failed, err = fut.result()
+
+                if err is not None:
                     tqdm.write(
-                        f"    per_chunk_callback raised: {cb_err!r} "
-                        f"(continuing; data already in mapping)"
+                        f"  Batch chunk {ci} failed ({err}); "
+                        f"{len(failed)} job(s) will be retried or routed to sync fallback."
                     )
+
+                # Fast state update: hold state_lock for only a few operations.
+                with state_lock:
+                    combined.update(m)
+                    for k in acc_total:
+                        acc_total[k] += a.get(k, 0)
+                    all_failed_ids.update(failed)
+
+                # Callback (parse + sync retries + checkpoint I/O) runs OUTSIDE
+                # state_lock under callback_lock. This lets other chunks keep
+                # recording their state updates in parallel while one chunk's
+                # slow sync-fallback work is in progress. Callbacks still
+                # serialise between themselves (the callback mutates the
+                # shared `results` dict and writes the checkpoint file).
+                if per_chunk_callback is not None and m:
+                    with callback_lock:
+                        try:
+                            per_chunk_callback(m)
+                        except Exception as cb_err:  # noqa: BLE001
+                            tqdm.write(
+                                f"    per_chunk_callback raised: {cb_err!r} "
+                                f"(continuing; data already in mapping)"
+                            )
 
         if not all_failed_ids:
             break
@@ -726,6 +816,7 @@ def call_llm(
     *,
     openai_prompt_cache_key: str | None = None,
     json_schema: dict | None = None,
+    n_captions: int | None = None,
 ) -> tuple[str, dict]:
     """
     Generic LLM caller that works for Gemini, OpenAI, and Qwen (local).
@@ -749,14 +840,18 @@ def call_llm(
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
 
+                schema_enforced = bool(OPENAI_USE_JSON_SCHEMA and json_schema is not None)
+                mt = _estimate_max_output_tokens(
+                    n_captions if n_captions is not None else LLM_BATCH_SIZE,
+                    schema_enforced=schema_enforced,
+                )
                 create_kw = dict(
                     model=MODEL_NAME,
                     messages=messages,
                     temperature=0.1,
-                    # Match the Batch API body exactly so behavior is consistent
-                    # across paths. A looping model still costs real money at
-                    # 15k tokens, so we cap here at 8192.
-                    max_tokens=8192,
+                    # Sized to request. Caps runaway-loop cost at
+                    # ~0.22 * n_captions + 200 tokens vs. a flat 8192.
+                    max_tokens=mt,
                     stream=False,
                 )
                 if OPENAI_USE_JSON_SCHEMA and json_schema is not None:
@@ -1115,21 +1210,24 @@ Return ONLY the JSON object {{"captions":[...]}} — nothing else.
 def build_extraction_user_prompt(captions: list[str], *, schema_enforced: bool = False) -> str:
     """Variable user message with a short count-enforcement header."""
     n = len(captions)
+    # 1-indexed markers. Models occasionally miscount with [0]..[N-1] and emit
+    # N-1 items (they read "[N-1]" as "only N-1 captions"). 1-indexed matches
+    # natural language and the "EXACTLY N" phrasing consistently.
     if schema_enforced:
         header = (
-            f"INPUT: {n} caption(s) indexed [0]..[{n - 1}].\n"
+            f"INPUT: {n} caption(s) numbered [1]..[{n}].\n"
             f"Emit EXACTLY {n} caption objects in the same order. For each "
             f"object, include every category key (use [] for unmentioned "
             f"categories). Never skip, repeat, or add extras."
         )
     else:
         header = (
-            f"INPUT: {n} caption(s) indexed [0]..[{n - 1}].\n"
+            f"INPUT: {n} caption(s) numbered [1]..[{n}].\n"
             f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
-            f"order. Emit {{}} for any caption that has no extractable features — "
+            f"order. Emit {{}} for any caption with no extractable features — "
             f"NEVER skip a caption, NEVER repeat a caption, NEVER emit extra items."
         )
-    body = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(captions))
+    body = "\n\n".join(f"[{i + 1}] {c}" for i, c in enumerate(captions))
     return f"{header}\n\n{body}"
 
 
@@ -1245,19 +1343,19 @@ def build_tagged_user_prompt(tag_lists: list[list[str]], *, schema_enforced: boo
     n = len(tag_lists)
     if schema_enforced:
         header = (
-            f"INPUT: {n} tag-list(s) indexed [0]..[{n - 1}].\n"
+            f"INPUT: {n} tag-list(s) numbered [1]..[{n}].\n"
             f"Emit EXACTLY {n} caption objects in the same order. Include every "
             f"category key in each object (use [] for categories no tag maps to)."
         )
     else:
         header = (
-            f"INPUT: {n} tag-list(s) indexed [0]..[{n - 1}].\n"
+            f"INPUT: {n} tag-list(s) numbered [1]..[{n}].\n"
             f"Your 'captions' array MUST contain EXACTLY {n} objects in the same "
             f"order. Emit {{}} for any input with no mappable tags — NEVER skip, "
             f"NEVER repeat, NEVER emit extra items."
         )
     body = "\n".join(
-        f"[{i}] {', '.join(tags) if tags else '(empty)'}"
+        f"[{i + 1}] {', '.join(tags) if tags else '(empty)'}"
         for i, tags in enumerate(tag_lists)
     )
     return f"{header}\n\n{body}"
@@ -1280,7 +1378,12 @@ def _build_category_to_features_map(
     all_feature_names: list[str],
     feature_categories: dict[str, str],
 ) -> dict[str, set[str]]:
-    """Map category -> set of canonical value suffixes (e.g. 'red', 'forearm')."""
+    """Map category -> set of canonical value suffixes (e.g. 'red', 'forearm').
+
+    Values are NOT lowercased here: downstream `_expand_category_output_to_encoding`
+    does a case-normalised membership test against a lookup that matches by
+    lowercased key, so preserving the original casing here is fine.
+    """
     by_cat: dict[str, set[str]] = defaultdict(set)
     for name in all_feature_names:
         cat = feature_categories.get(name, "other")
@@ -1349,15 +1452,23 @@ def _expand_category_output_to_encoding(
                 continue
 
         valid_set = category_to_values[cat]
+        # Case-insensitive lookup: build a lowercase→canonical map for the
+        # category so models emitting "Forearm" match a schema "forearm" and
+        # vice-versa. Tiny cost since valid_set is 5-50 values.
+        canon_lc = {v.lower(): v for v in valid_set}
         recognized: list[str] = []
         for v in vals:
             s = str(v).strip().lower().replace(" ", "_")
+            if not s:
+                fixes += 1
+                continue
             # Tolerate "morphology_color_red" style → strip category prefix.
-            prefix = cat + "_"
-            if s.startswith(prefix) and s[len(prefix):] in valid_set:
+            prefix = (cat + "_").lower()
+            if s.startswith(prefix) and s[len(prefix):] in canon_lc:
                 s = s[len(prefix):]
-            if s in valid_set:
-                recognized.append(s)
+            canon = canon_lc.get(s)
+            if canon is not None:
+                recognized.append(canon)
             else:
                 fixes += 1
 
@@ -1531,7 +1642,11 @@ def parse_extraction_response_text(
         num_llm_items = len(results)
         short = len(captions) - num_llm_items
         if short > 0:
-            results.extend([dict(fallback_row)] * short)
+            # CRITICAL: use a list comprehension — NOT `[dict(fallback_row)] * short`.
+            # The `* short` form puts `short` references to the SAME dict in the
+            # list, so any later mutation of one row silently corrupts all
+            # padded rows. A comprehension gives independent dicts.
+            results.extend(dict(fallback_row) for _ in range(short))
             fixes += short
         results = results[: len(captions)]
         # Record how many rows actually came from the LLM (pre-padding) so
@@ -1675,12 +1790,15 @@ def extract_features_batch(
     best_partial: list[dict] | None = None
     saw_truncation = False
     last_failure_kind = "unknown"
+    last_short_n: int | None = None
+    short_repeat_count = 0
 
     for attempt in range(retries):
         try:
             stats["attempts"] = attempt + 1
             text, meta = call_llm(
                 user_prompt, system_prompt, retries=1, json_schema=json_schema,
+                n_captions=len(captions),
             )
             finish_reason = meta.get("finish_reason", "")
             valid_results, pst = parse_extraction_response_text(
@@ -1704,6 +1822,28 @@ def extract_features_batch(
             # truncating batch still returns real data for the recovered captions.
             if pst.get("salvaged"):
                 best_partial = valid_results
+
+            # Early-bisect heuristic: when the model keeps stopping at the same
+            # prefix length across attempts (e.g. 14/15, then 14/15 again), a
+            # third retry will almost certainly produce the same short output.
+            # Break out of the retry loop and go straight to bisection — this
+            # saves ~1 API call per truncated batch and cuts end-to-end time
+            # noticeably when hundreds of batches truncate the same way.
+            cur_short_n = pst.get("num_llm_items")
+            if (
+                saw_truncation
+                and cur_short_n is not None
+                and cur_short_n == last_short_n
+                and len(captions) > 1
+                and tag_lists is None
+            ):
+                short_repeat_count += 1
+                if short_repeat_count >= 1:  # saw same short-count twice → bisect now
+                    break
+            else:
+                short_repeat_count = 0
+            last_short_n = cur_short_n
+
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
         except json.JSONDecodeError as e:
@@ -1733,19 +1873,27 @@ def extract_features_batch(
     ):
         mid = len(captions) // 2
         left_caps, right_caps = captions[:mid], captions[mid:]
+        # Decay retries on bisect. The first bisect already used `retries`
+        # attempts on the parent; each child is half the size so far less
+        # likely to truncate again. Using the same `retries` at every depth
+        # makes worst-case `retries * 2^MAX_BISECT_DEPTH` API calls for one
+        # pathological batch (5 * 16 = 80 calls). Decay to 2 attempts per
+        # half after the first split keeps it bounded at ~O(N) calls.
+        child_retries = 2 if _bisect_depth >= 0 else retries
         tqdm.write(
             f"    Bisecting TRUNCATED batch ({len(captions)} → "
             f"{len(left_caps)} + {len(right_caps)}) after {retries} attempts "
-            f"(depth {_bisect_depth + 1}/{MAX_BISECT_DEPTH})"
+            f"(depth {_bisect_depth + 1}/{MAX_BISECT_DEPTH}, "
+            f"child_retries={child_retries})"
         )
         left, st_l = extract_features_batch(
             left_caps, all_feature_names, system_prompt,
-            retries=retries, feature_categories=feature_categories,
+            retries=child_retries, feature_categories=feature_categories,
             json_schema=json_schema, _bisect_depth=_bisect_depth + 1,
         )
         right, st_r = extract_features_batch(
             right_caps, all_feature_names, system_prompt,
-            retries=retries, feature_categories=feature_categories,
+            retries=child_retries, feature_categories=feature_categories,
             json_schema=json_schema, _bisect_depth=_bisect_depth + 1,
         )
         stats["validation_fixes"] += (
@@ -1821,6 +1969,7 @@ def _run_dedup_openai_batch(
                 "custom_id": cid,
                 "body": _openai_extraction_chat_body(
                     system_prompt, user_prompt, json_schema=json_schema,
+                    n_captions=len(batch),
                 ),
             }
         )
@@ -1933,15 +2082,29 @@ def _run_dedup_openai_batch(
             results[cap] = feats
         return ok
 
+    # Checkpoint throttling: the checkpoint file is the full dedup result dict
+    # (~20-50 MB JSON for 70K captions × 300 features). Writing it after
+    # EVERY chunk made I/O a bottleneck — and since the callback is now
+    # under callback_lock, a 5-second write also blocks the next chunk's
+    # parse work. We throttle to "at most one save every N seconds" and
+    # always do a final save at the end. Worst-case data loss: one interval.
+    ckpt_min_interval_s = _safe_int_env("OPENAI_CKPT_MIN_INTERVAL_SEC", 120, vmin=0)
+    _last_ckpt_time = [0.0]
+
     def _on_chunk_complete(chunk_mapping: dict[str, dict]) -> None:
         """Called after each Batch API chunk finishes — parse + checkpoint."""
         for cid, item_meta in chunk_mapping.items():
             _parse_and_accumulate(cid, item_meta)
-        if ckpt_save_fn is not None:
-            try:
-                ckpt_save_fn(dict(results))
-            except Exception as e:
-                tqdm.write(f"    Checkpoint save failed: {e!r} (continuing)")
+        if ckpt_save_fn is None:
+            return
+        now = time.monotonic()
+        if now - _last_ckpt_time[0] < ckpt_min_interval_s:
+            return
+        try:
+            ckpt_save_fn(dict(results))
+            _last_ckpt_time[0] = now
+        except Exception as e:
+            tqdm.write(f"    Checkpoint save failed: {e!r} (continuing)")
 
     # Parsing happens inside _on_chunk_complete as each chunk finishes, so we
     # don't use the aggregated mapping here — but it's still returned for
@@ -2243,7 +2406,8 @@ def run_extraction(csv_path: str, schema_path: str):
                 json.dumps(extraction_json_schema, sort_keys=True).encode("utf-8")
             ).hexdigest()[:10]
             global OPENAI_PROMPT_CACHE_KEY  # noqa: PLW0603
-            if OPENAI_PROMPT_CACHE_KEY:
+            # Guard against re-entrant runs double-appending the same hash.
+            if OPENAI_PROMPT_CACHE_KEY and not OPENAI_PROMPT_CACHE_KEY.endswith(f"_{schema_hash}"):
                 OPENAI_PROMPT_CACHE_KEY = f"{OPENAI_PROMPT_CACHE_KEY}_{schema_hash}"
                 print(f"  Effective prompt-cache key: {OPENAI_PROMPT_CACHE_KEY!r}")
         except Exception as e:
@@ -2391,15 +2555,28 @@ def run_extraction(csv_path: str, schema_path: str):
     print(f"  Failed batches: {global_stats['failed_batches']:,}")
 
     print("\nReplicating features to all rows (including duplicates)...")
-    fallback_row = {k: 2 for k in all_feature_names}
-    feature_rows: list[dict] = []
-    for cap in stripped:
-        if cap and cap in caption_features:
-            feature_rows.append(caption_features[cap])
-        else:
-            feature_rows.append(fallback_row)
+    # Skip per-row dict construction entirely: build the matrix by direct
+    # column-wise assembly. This is ~20× faster than pd.DataFrame(list[dict])
+    # on 180K rows × 300 cols and avoids the `append(fallback_row)` shared-
+    # reference footgun where every empty row pointed to the same dict.
+    fallback_vec = np.full(len(all_feature_names), 2, dtype=np.int8)
+    matrix = np.empty((len(stripped), len(all_feature_names)), dtype=np.int8)
+    # Fast path: many rows share the same caption → cache the built vector.
+    vec_cache: dict[str, np.ndarray] = {}
+    for r, cap in enumerate(stripped):
+        if not cap or cap not in caption_features:
+            matrix[r] = fallback_vec
+            continue
+        vec = vec_cache.get(cap)
+        if vec is None:
+            feats = caption_features[cap]
+            vec = np.array(
+                [feats.get(name, 2) for name in all_feature_names], dtype=np.int8
+            )
+            vec_cache[cap] = vec
+        matrix[r] = vec
 
-    features_df = pd.DataFrame(feature_rows, columns=all_feature_names)
+    features_df = pd.DataFrame(matrix, columns=all_feature_names)
 
     # ── Combine with original columns and save ────────────────────────────────
     print("Creating output CSV...")
@@ -2410,11 +2587,10 @@ def run_extraction(csv_path: str, schema_path: str):
         axis=1,
     )
 
-    for col in all_feature_names:
-        if col in final_df.columns:
-            final_df[col] = pd.to_numeric(final_df[col], errors="coerce")
-            final_df[col] = final_df[col].fillna(2).astype(int)
-            final_df[col] = final_df[col].clip(0, 2)
+    # Values are already int8 in {0,1,2} from the matrix build above, so
+    # the per-column coerce/fillna/clip pass is redundant — skipping it
+    # saves ~10-15 s on a 180K×300 frame. Leave as int8 for CSV efficiency
+    # (CSV serialisation writes the same digits regardless of dtype).
 
     # Write the final CSV atomically so a crash mid-serialisation can't leave
     # a partially-written 10 GB file that later tools would treat as valid.

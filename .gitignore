@@ -4,3 +4,6 @@ SCIN-dataset/
 *SCIN-dataset/
 *.json
 __pycache__/
+DermLIP-classifier-ckpt/
+*.pt
+*.pth
