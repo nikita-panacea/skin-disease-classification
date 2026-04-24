@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-CKPT = Path("dedup_caption_features_v2.json")
+CKPT = Path("checkpoints/dedup_caption_features_v2.json")
 
 with CKPT.open(encoding="utf-8") as f:
     data = json.load(f)
